@@ -1,6 +1,6 @@
 # ORBIT — Core Database & Storage Engine (Section 1)
 
-ORBIT is a high-performance, crash-resilient, persistent Key-Value database storage engine written in Go. Section 1 delivers a completely standalone storage node implementing Write-Ahead Logging (WAL), an in-memory Memtable, automatic crash recovery, lifecycle-coordinated graceful drain, and an HTTP REST API.
+ORBIT is a high-performance, crash-resilient, persistent Key-Value database storage engine written in Go. Section 1 delivers a completely standalone storage node implementing Write-Ahead Logging (WAL), an in-memory Memtable, automatic crash recovery, lifecycle-coordinated graceful drain, process-level exclusive locking, and an HTTP REST API.
 
 ---
 
@@ -49,35 +49,36 @@ Before modifying the in-memory state (`Memtable`), ORBIT **first** writes the mu
    - Thread-safe read/write operations using `sync.RWMutex` (concurrent non-blocking reads).
    - O(1) average lookup and deletion performance.
 
-2. **Write-Ahead Log (`internal/wal/wal.go`, `record.go`)**:
-   - Append-only log file format with JSON Lines (`.log`).
-   - **Schema Versioning & Integrity**: Versioned records (`version: 1`) equipped with **CRC32-IEEE checksums** to catch bitrot, unauthorized edits, and corrupted records.
-   - **Committed Sequence Counter**: Mutex-protected committed sequence counter that advances strictly after a successful `fsync` to disk.
-   - **Streaming Recovery (O(1) Memory)**: Records stream one-by-one via `HandlerFunc`, eliminating massive historical memory spikes on startup and avoiding redundant scans.
+2. **Write-Ahead Log (`internal/wal/wal.go`, `record.go`, `lock_*.go`)**:
+   - **Exclusive Process-Level Lock**: Uses OS-level file locking (`<walPath>.lock` via `LockFileEx` on Windows, `flock` on Unix) preventing multiple processes from concurrently mutating the same data directory.
+   - **Schema Versioning & Length-Prefixed Checksums**: Versioned records (`version: 1`) with unambiguous length-prefixed **CRC32-IEEE checksums** eliminating field boundary ambiguity.
+   - **Committed Sequence Counter & Overflow Check**: Mutex-protected counter that advances strictly after a successful `fsync`, protected against `MaxUint64` overflow.
+   - **Streaming Recovery (O(1) Memory)**: Records stream one-by-one via `HandlerFunc`, eliminating startup memory spikes and redundant scans.
    - **Failure Poisoning**: Any disk write or sync failure marks the log poisoned, halting further writes into an uncertain state.
-   - **Strict Sequence Progression**: Enforces contiguous $1 \rightarrow 2 \rightarrow 3$ sequences during replay; sequence gaps or duplicates halt recovery.
-   - **Strict Record & Field Validation**: Rejects unknown operations, empty keys, unknown JSON fields, or malformed records.
-   - **Strict Corruption Detection**: Rejects blank newline-delimited lines; truncates incomplete trailing writes left by crashes mid-write back to the clean record boundary.
+   - **Strict Invariants**: Enforces contiguous $1 \rightarrow 2 \rightarrow 3$ sequences, rejects trailing JSON tokens on record lines, and rejects blank lines.
+   - **Truncation of Incomplete Writes**: Truncates partial trailing writes from crash mid-write back to the clean record boundary.
    - Deletions recorded as tombstones (`OperationDelete`).
 
 3. **Storage Engine & Raft Integration Boundary (`internal/storage/engine.go`)**:
-   - **Consensus Application Boundary**: Exposes `ApplyCommitted(CommittedCommand)` separating consensus concerns (**Raft log index**, **Raft term**) from local physical **WAL sequence numbers**.
-   - **Commit Idempotency**: Tracks `lastAppliedIndex` to ensure duplicate consensus entries are safe, idempotent no-ops.
+   - **Consensus Application Boundary**: Exposes `ApplyCommitted(CommittedCommand)` separating consensus metadata (**Raft log index**, **Raft term**) from local physical **WAL sequence numbers**.
+   - **Durable Progress & Gap Enforcement**: Persists `RaftIndex` and `RaftTerm` into WAL records so `lastAppliedIndex` survives restarts. Enforces strictly contiguous sequential application (`lastAppliedIndex + 1`), rejecting index gaps (`ErrRaftIndexGap`).
+   - **Commit Idempotency**: Duplicate consensus entries are safe, idempotent no-ops.
    - Coordinates WAL and Memtable mutations atomically under `writeMu`.
-   - Self-healing startup: single-pass streaming WAL replay on boot reconstructs the Memtable before accepting traffic.
+   - Self-healing startup: single-pass streaming WAL replay on boot reconstructs the Memtable and restores consensus progress.
    - Shutdown tracking: returns `ErrClosed` if mutations are attempted after shutdown.
 
 4. **Database Operations Layer (`internal/database/`)**:
    - Exposes clean `Set`, `Get`, `Delete`, `ApplyCommitted`, `Health` methods.
    - **Standard KV Semantics**: Empty values (`""`) are fully valid; rejects only blank keys.
    - **Lifecycle Coordination**: Uses `sync.RWMutex` so `Close()` waits for all active in-flight operations to complete before closing the storage engine.
+   - **Sticky Shutdown Errors**: Preserves close failures across retries.
    - Sentinel errors (`ErrKeyNotFound`, `ErrEmptyKey`, `ErrClosed`).
    - Defines the `StorageEngine` interface, creating a decoupled contract for Section 2 (Raft consensus) integration.
 
 5. **HTTP REST API (`internal/api/`, `cmd/orbit/main.go`)**:
    - Native Go 1.22+ routing with method matching and path parameters.
-   - Strict input validation: 1MB body limit, rejection of unknown JSON fields and trailing payloads.
-   - **Phased Graceful Shutdown**: Stops the HTTP server and drains active HTTP requests first before flushing and closing the database.
+   - Strict input validation: 1MB body limit (returns `413 Request Entity Too Large`), rejection of unknown JSON fields and trailing payloads.
+   - **Phased Graceful Shutdown**: Drains active requests within 5s, forcibly terminates lingering sockets on timeout with `server.Close()`, and coordinates cleanup without `log.Fatalf` in goroutines.
    - **Diagnostic Health Check (`/health`)**: Reports process status, storage engine health (detecting poisoned WALs), write availability, and cluster role.
 
 ---
@@ -96,7 +97,7 @@ Before modifying the in-memory state (`Memtable`), ORBIT **first** writes the mu
 ## Running and Verifying
 
 ### 1. Run All Automated Tests
-Includes unit tests, durability restart simulations, monotonic sequence checks, concurrency stress tests, Raft apply tests, and partial write crash tests with race detection:
+Includes unit tests, durability restart simulations, monotonic sequence checks, concurrency stress tests, Raft apply and gap tests, exclusive process locking tests, and partial write crash tests with race detection:
 ```bash
 go test ./tests/... -v -race
 ```

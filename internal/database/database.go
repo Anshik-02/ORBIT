@@ -21,14 +21,15 @@ type StorageEngine interface {
 //
 // Lifecycle Coordination:
 //   - Uses a lifecycle `closeMu sync.RWMutex`.
-//   - In-flight operations (Set, Get, Delete, Health, ApplyCommitted) acquire `closeMu.RLock()`.
-//   - Close() acquires `closeMu.Lock()`, which guarantees that every in-flight
-//     operation initiated before Close() has completely finished executing
-//     before the underlying storage engine is closed and Close() returns.
+//   - In-flight operations acquire `closeMu.RLock()`.
+//   - Close() acquires `closeMu.Lock()`, ensuring all in-flight operations have
+//     completely finished before the underlying storage engine is closed.
+//   - Preserves sticky close error if engine.Close() fails, allowing callers to detect failures.
 type Database struct {
-	engine  StorageEngine
-	closeMu sync.RWMutex
-	closed  bool
+	engine   StorageEngine
+	closeMu  sync.RWMutex
+	closed   bool
+	closeErr error // records sticky error if engine.Close() fails
 }
 
 // NewDatabase wraps a StorageEngine in a Database.
@@ -40,15 +41,15 @@ func NewDatabase(engine StorageEngine) *Database {
 //  1. Acquires closeMu.Lock(), blocking until all active operations finish.
 //  2. Sets closed = true so future operations are rejected.
 //  3. Flushes and closes the underlying storage engine.
-//
-// Idempotent: safe to call multiple times concurrently.
+//  4. Preserves any close failure so repeated calls return the error.
 func (db *Database) Close() error {
 	db.closeMu.Lock()
 	defer db.closeMu.Unlock()
 
 	if db.closed {
-		return nil
+		return db.closeErr
 	}
 	db.closed = true
-	return db.engine.Close()
+	db.closeErr = db.engine.Close()
+	return db.closeErr
 }

@@ -114,8 +114,8 @@ func TestAPIRejectsOversizedBody(t *testing.T) {
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusRequestEntityTooLarge && rec.Code != http.StatusBadRequest {
-		t.Errorf("expected status 413 or 400 for oversized payload, got %d", rec.Code)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("expected status 413 for oversized payload, got %d", rec.Code)
 	}
 }
 

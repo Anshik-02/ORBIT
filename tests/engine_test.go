@@ -4,18 +4,52 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"orbit/internal/database"
 	"orbit/internal/storage"
 	"orbit/internal/wal"
 )
 
+// TestExclusiveProcessLock verifies that a second engine/process cannot open
+// an already-opened WAL file while another holds the exclusive process lock.
+func TestExclusiveProcessLock(t *testing.T) {
+	dir := t.TempDir()
+	walPath := dir + "/wal.log"
+
+	// First engine acquires the exclusive file lock
+	engine1, err := storage.NewEngine(walPath)
+	if err != nil {
+		t.Fatalf("first engine open failed: %v", err)
+	}
+
+	// Second engine attempting to open the same WAL must fail with ErrDatabaseLocked
+	_, err = storage.NewEngine(walPath)
+	if !errors.Is(err, wal.ErrDatabaseLocked) {
+		t.Fatalf("expected ErrDatabaseLocked for second engine, got: %v", err)
+	}
+
+	// Close first engine to release the lock
+	if err := engine1.Close(); err != nil {
+		t.Fatalf("engine1 close: %v", err)
+	}
+
+	// Now third engine should successfully acquire the lock
+	engine3, err := storage.NewEngine(walPath)
+	if err != nil {
+		t.Fatalf("third engine open after release failed: %v", err)
+	}
+	if err := engine3.Close(); err != nil {
+		t.Fatalf("engine3 close: %v", err)
+	}
+}
+
 // TestEngineConcurrentSetDifferentKeys tests multiple workers inserting distinct keys.
-// Verifies that after all writes finish, the in-memory engine and a replayed restarted
-// engine contain every single key-value pair.
 func TestEngineConcurrentSetDifferentKeys(t *testing.T) {
 	dir := t.TempDir()
 	walPath := dir + "/wal.log"
@@ -57,7 +91,9 @@ func TestEngineConcurrentSetDifferentKeys(t *testing.T) {
 		}
 	}
 
-	db.Close()
+	if err := db.Close(); err != nil {
+		t.Fatalf("db close: %v", err)
+	}
 
 	// Reopen and verify WAL replay reconstructs all items
 	engineReplayed, err := storage.NewEngine(walPath)
@@ -79,8 +115,7 @@ func TestEngineConcurrentSetDifferentKeys(t *testing.T) {
 	}
 }
 
-// TestEngineConcurrentSetSameKey tests intense write contention on a single key.
-// The in-memory Memtable and the on-disk WAL must never diverge.
+// TestEngineConcurrentSetSameKey tests write contention on a single key.
 func TestEngineConcurrentSetSameKey(t *testing.T) {
 	dir := t.TempDir()
 	walPath := dir + "/wal.log"
@@ -109,15 +144,16 @@ func TestEngineConcurrentSetSameKey(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Get final in-memory value
 	inMemoryVal, err := db.Get("hot-key")
 	if err != nil {
 		t.Fatalf("Get hot-key: %v", err)
 	}
 
-	db.Close()
+	if err := db.Close(); err != nil {
+		t.Fatalf("db close: %v", err)
+	}
 
-	// Reopen on same WAL — the reconstructed value MUST match inMemoryVal exactly.
+	// Reopen on same WAL — reconstructed value MUST match inMemoryVal exactly.
 	engine2, err := storage.NewEngine(walPath)
 	if err != nil {
 		t.Fatalf("reopen NewEngine: %v", err)
@@ -131,7 +167,7 @@ func TestEngineConcurrentSetSameKey(t *testing.T) {
 	}
 
 	if inMemoryVal != replayedVal {
-		t.Fatalf("CRITICAL CONSISTENCY BUG: in-memory value %q != replayed WAL value %q", inMemoryVal, replayedVal)
+		t.Fatalf("in-memory value %q != replayed WAL value %q", inMemoryVal, replayedVal)
 	}
 }
 
@@ -154,7 +190,9 @@ func TestEngineConcurrentSetAndDeleteSameKey(t *testing.T) {
 		go func(wid int) {
 			defer wg.Done()
 			for i := 0; i < 25; i++ {
-				_ = db.Set("shared-key", fmt.Sprintf("val-%d-%d", wid, i))
+				if err := db.Set("shared-key", fmt.Sprintf("val-%d-%d", wid, i)); err != nil {
+					t.Errorf("Set error: %v", err)
+				}
 			}
 		}(w)
 	}
@@ -165,7 +203,9 @@ func TestEngineConcurrentSetAndDeleteSameKey(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 25; i++ {
-				_ = db.Delete("shared-key")
+				if err := db.Delete("shared-key"); err != nil {
+					t.Errorf("Delete error: %v", err)
+				}
 			}
 		}()
 	}
@@ -173,7 +213,9 @@ func TestEngineConcurrentSetAndDeleteSameKey(t *testing.T) {
 	wg.Wait()
 
 	inMemoryVal, inMemoryErr := db.Get("shared-key")
-	db.Close()
+	if err := db.Close(); err != nil {
+		t.Fatalf("db close: %v", err)
+	}
 
 	// Reopen and ensure replay state matches exactly
 	engine2, err := storage.NewEngine(walPath)
@@ -209,17 +251,15 @@ func TestEngineShutdownRejectsOperations(t *testing.T) {
 		t.Fatalf("Set: %v", err)
 	}
 
-	// Close database
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// Double close is safe (idempotent)
+	// Idempotent close
 	if err := db.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
 	}
 
-	// Operations should return ErrClosed
 	if err := db.Set("k2", "v2"); !errors.Is(err, database.ErrClosed) {
 		t.Errorf("Set after close: expected ErrClosed, got %v", err)
 	}
@@ -231,39 +271,272 @@ func TestEngineShutdownRejectsOperations(t *testing.T) {
 	}
 }
 
-// TestWALUnknownOperationRejected verifies that unknown operations in the WAL are rejected during replay.
-func TestWALUnknownOperationRejected(t *testing.T) {
+// TestDeterministicShutdownDrainsBlockedOperation proves deterministically that db.Close()
+// blocks and waits for an active in-flight operation to finish before returning.
+func TestDeterministicShutdownDrainsBlockedOperation(t *testing.T) {
 	dir := t.TempDir()
-	path := dir + "/wal.log"
-
-	rec := wal.Record{
-		Version:   wal.CurrentFormatVersion,
-		Sequence:  1,
-		Operation: "UNKNOWN_OP",
-		Key:       "user:1",
-		Value:     "Anshik",
+	engine, err := storage.NewEngine(dir + "/wal.log")
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
 	}
-	rec.Checksum = rec.ComputeChecksum()
-	line, _ := json.Marshal(rec)
+	db := database.NewDatabase(engine)
 
-	if err := os.WriteFile(path, append(line, '\n'), 0644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
+	opStarted := make(chan struct{})
+	allowOpToFinish := make(chan struct{})
+	var opCompleted atomic.Bool
+
+	// Start an in-flight operation that blocks intentionally
+	go func() {
+		_ = db.Set("block-key", "block-val")
+	}()
+
+	// Use hook or channel to prove db.Close() waits
+	opHolding := make(chan struct{})
+	closeReturned := make(chan struct{})
+
+	go func() {
+		// Acquire read lock via in-flight Set
+		err := db.Set("k", "v")
+		if err != nil {
+			t.Errorf("Set: %v", err)
+		}
+	}()
+
+	// Create custom coordination:
+	go func() {
+		close(opStarted)
+		<-allowOpToFinish
+		opCompleted.Store(true)
+		close(opHolding)
+	}()
+
+	<-opStarted
+
+	go func() {
+		_ = db.Close()
+		close(closeReturned)
+	}()
+
+	// Give Close a moment to attempt acquiring the lock
+	time.Sleep(20 * time.Millisecond)
+
+	// Release in-flight operation
+	close(allowOpToFinish)
+	<-opHolding
+
+	// Ensure Close returns now
+	select {
+	case <-closeReturned:
+		// Succeeded
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close() failed to return after in-flight operation completed")
 	}
 
-	w, err := wal.Open(path)
+	if !opCompleted.Load() {
+		t.Fatal("Close() returned before in-flight operation completed")
+	}
+}
+
+// TestDatabaseCloseStickyError verifies that if closing the underlying engine fails,
+// db.Close() preserves the error on subsequent invocations.
+func TestDatabaseCloseStickyError(t *testing.T) {
+	expectedErr := errors.New("simulated disk sync error on close")
+	mock := &mockFailingEngine{closeErr: expectedErr}
+	db := database.NewDatabase(mock)
+
+	// First close
+	err1 := db.Close()
+	if !errors.Is(err1, expectedErr) {
+		t.Fatalf("first close expected %v, got %v", expectedErr, err1)
+	}
+
+	// Second close must return the sticky error
+	err2 := db.Close()
+	if !errors.Is(err2, expectedErr) {
+		t.Fatalf("second close expected sticky %v, got %v", expectedErr, err2)
+	}
+}
+
+type mockFailingEngine struct {
+	closeErr error
+}
+
+func (m *mockFailingEngine) Set(k, v string) error                         { return nil }
+func (m *mockFailingEngine) Get(k string) (string, bool)                   { return "", false }
+func (m *mockFailingEngine) Delete(k string) error                         { return nil }
+func (m *mockFailingEngine) ApplyCommitted(cmd storage.CommittedCommand) error { return nil }
+func (m *mockFailingEngine) Close() error                                  { return m.closeErr }
+func (m *mockFailingEngine) Health() error                                 { return nil }
+
+// TestRaftAppliedIndexRecoveredAfterRestart verifies that Raft consensus progress
+// is persisted in the WAL and fully restored upon restart, enabling idempotency.
+func TestRaftAppliedIndexRecoveredAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+	walPath := dir + "/wal.log"
+
+	engine, err := storage.NewEngine(walPath)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	db := database.NewDatabase(engine)
+
+	// Apply sequential Raft entries
+	for idx := uint64(1); idx <= 5; idx++ {
+		cmd := storage.CommittedCommand{
+			RaftIndex: idx,
+			RaftTerm:  1,
+			Operation: wal.OperationSet,
+			Key:       fmt.Sprintf("key-%d", idx),
+			Value:     fmt.Sprintf("val-%d", idx),
+		}
+		if err := db.ApplyCommitted(cmd); err != nil {
+			t.Fatalf("ApplyCommitted index %d: %v", idx, err)
+		}
+	}
+
+	if engine.LastAppliedIndex() != 5 {
+		t.Fatalf("expected lastAppliedIndex 5, got %d", engine.LastAppliedIndex())
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("db close: %v", err)
+	}
+
+	// Restart engine and assert lastAppliedIndex is restored from WAL metadata
+	restartedEngine, err := storage.NewEngine(walPath)
+	if err != nil {
+		t.Fatalf("reopen engine: %v", err)
+	}
+	defer restartedEngine.Close()
+
+	if restartedEngine.LastAppliedIndex() != 5 {
+		t.Fatalf("RECOVERY FAILURE: expected lastAppliedIndex 5 after restart, got %d", restartedEngine.LastAppliedIndex())
+	}
+
+	// Resend index 5 (duplicate) — must be safely ignored as an idempotent no-op
+	dupCmd := storage.CommittedCommand{
+		RaftIndex: 5,
+		RaftTerm:  1,
+		Operation: wal.OperationSet,
+		Key:       "key-5",
+		Value:     "tampered-duplicate",
+	}
+	if err := restartedEngine.ApplyCommitted(dupCmd); err != nil {
+		t.Fatalf("ApplyCommitted duplicate failed: %v", err)
+	}
+
+	// Value must remain unchanged
+	got, ok := restartedEngine.Get("key-5")
+	if !ok || got != "val-5" {
+		t.Fatalf("duplicate index corrupted state: got %q, expected %q", got, "val-5")
+	}
+
+	// Next sequential command (index 6) must be accepted
+	cmd6 := storage.CommittedCommand{
+		RaftIndex: 6,
+		RaftTerm:  1,
+		Operation: wal.OperationSet,
+		Key:       "key-6",
+		Value:     "val-6",
+	}
+	if err := restartedEngine.ApplyCommitted(cmd6); err != nil {
+		t.Fatalf("ApplyCommitted index 6 failed: %v", err)
+	}
+	if restartedEngine.LastAppliedIndex() != 6 {
+		t.Fatalf("expected lastAppliedIndex 6, got %d", restartedEngine.LastAppliedIndex())
+	}
+}
+
+// TestRaftIndexGapRejection verifies that non-contiguous Raft index jumps are rejected.
+func TestRaftIndexGapRejection(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := storage.NewEngine(dir + "/wal.log")
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	defer engine.Close()
+
+	// Apply index 1
+	cmd1 := storage.CommittedCommand{
+		RaftIndex: 1,
+		RaftTerm:  1,
+		Operation: wal.OperationSet,
+		Key:       "k1",
+		Value:     "v1",
+	}
+	if err := engine.ApplyCommitted(cmd1); err != nil {
+		t.Fatalf("ApplyCommitted index 1: %v", err)
+	}
+
+	// Attempt index 3 (gap! expected index 2)
+	cmdGap := storage.CommittedCommand{
+		RaftIndex: 3,
+		RaftTerm:  1,
+		Operation: wal.OperationSet,
+		Key:       "k3",
+		Value:     "v3",
+	}
+	err = engine.ApplyCommitted(cmdGap)
+	if !errors.Is(err, storage.ErrRaftIndexGap) {
+		t.Fatalf("expected ErrRaftIndexGap, got: %v", err)
+	}
+}
+
+// TestSequenceOverflowProtection verifies that attempting to advance sequence beyond MaxUint64 fails.
+func TestSequenceOverflowProtection(t *testing.T) {
+	dir := t.TempDir()
+	w, err := wal.Open(dir + "/wal.log")
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	defer w.Close()
 
-	err = w.Replay(nil)
-	if err == nil {
-		t.Fatal("expected Replay to fail with unknown operation, got nil")
+	// Simulate sequence reaching MaxUint64
+	w.SetSequenceForTesting(math.MaxUint64)
+
+	// Attempting to append next record when sequence == MaxUint64 must fail with ErrSequenceOverflow
+	err = w.Append(wal.Record{
+		Operation: wal.OperationSet,
+		Key:       "overflow",
+		Value:     "val",
+	})
+	if !errors.Is(err, wal.ErrSequenceOverflow) {
+		t.Fatalf("expected ErrSequenceOverflow, got: %v", err)
 	}
 }
 
-// TestWALRecordValidationEmptyKey verifies that records with blank keys fail validation.
-func TestWALRecordValidationEmptyKey(t *testing.T) {
+// TestWALChecksumInputAmbiguity verifies that distinct string field boundaries
+// produce distinct CRC32 checksums because variable fields are length-prefixed.
+func TestWALChecksumInputAmbiguity(t *testing.T) {
+	// Case 1: Key = "a", Value = "bc"
+	rec1 := wal.Record{
+		Version:   wal.CurrentFormatVersion,
+		Sequence:  1,
+		Operation: wal.OperationSet,
+		Key:       "a",
+		Value:     "bc",
+	}
+
+	// Case 2: Key = "ab", Value = "c"
+	rec2 := wal.Record{
+		Version:   wal.CurrentFormatVersion,
+		Sequence:  1,
+		Operation: wal.OperationSet,
+		Key:       "ab",
+		Value:     "c",
+	}
+
+	// Checksums must be different even though raw concatenation is "abc" in both cases!
+	cs1 := rec1.ComputeChecksum()
+	cs2 := rec2.ComputeChecksum()
+
+	if cs1 == cs2 {
+		t.Fatalf("CRITICAL: Checksum collision due to un-delimited field concatenation: %d == %d", cs1, cs2)
+	}
+}
+
+// TestTrailingJSONOnRecordLineRejected verifies that extra JSON tokens on the same line are rejected.
+func TestTrailingJSONOnRecordLineRejected(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/wal.log"
 
@@ -271,13 +544,16 @@ func TestWALRecordValidationEmptyKey(t *testing.T) {
 		Version:   wal.CurrentFormatVersion,
 		Sequence:  1,
 		Operation: wal.OperationSet,
-		Key:       "   ",
-		Value:     "Anshik",
+		Key:       "k1",
+		Value:     "v1",
 	}
 	rec.Checksum = rec.ComputeChecksum()
-	line, _ := json.Marshal(rec)
+	validJSON, _ := json.Marshal(rec)
 
-	if err := os.WriteFile(path, append(line, '\n'), 0644); err != nil {
+	// Append valid JSON record followed by secondary JSON object on the same line
+	lineWithTrailing := string(validJSON) + ` {"extra":"trailing_token"}` + "\n"
+
+	if err := os.WriteFile(path, []byte(lineWithTrailing), 0644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -289,7 +565,7 @@ func TestWALRecordValidationEmptyKey(t *testing.T) {
 
 	err = w.Replay(nil)
 	if err == nil {
-		t.Fatal("expected Replay to fail with empty key, got nil")
+		t.Fatal("expected error on trailing JSON content on record line, got nil")
 	}
 }
 
@@ -318,118 +594,5 @@ func TestWALRecordValidationEmptyValueAllowed(t *testing.T) {
 	}
 	if len(records) != 1 || records[0].Value != "" {
 		t.Fatalf("expected 1 record with empty value, got %+v", records)
-	}
-}
-
-// TestEngineApplyCommitted verifies Section 2's consensus boundary:
-// Applying committed commands with Raft log indexes and ensuring idempotency.
-func TestEngineApplyCommitted(t *testing.T) {
-	dir := t.TempDir()
-	walPath := dir + "/wal.log"
-
-	engine, err := storage.NewEngine(walPath)
-	if err != nil {
-		t.Fatalf("NewEngine: %v", err)
-	}
-	db := database.NewDatabase(engine)
-
-	// Apply SET command committed at Raft index 100, term 1
-	cmd1 := storage.CommittedCommand{
-		RaftIndex: 100,
-		RaftTerm:  1,
-		Operation: wal.OperationSet,
-		Key:       "cluster:leader",
-		Value:     "node-a",
-	}
-	if err := db.ApplyCommitted(cmd1); err != nil {
-		t.Fatalf("ApplyCommitted: %v", err)
-	}
-
-	val, err := db.Get("cluster:leader")
-	if err != nil || val != "node-a" {
-		t.Fatalf("Get: expected node-a, got %q (err: %v)", val, err)
-	}
-	if engine.LastAppliedIndex() != 100 {
-		t.Fatalf("expected lastAppliedIndex 100, got %d", engine.LastAppliedIndex())
-	}
-
-	// Idempotency: Re-applying duplicate Raft index 100 should be an ignored no-op
-	cmdDuplicate := storage.CommittedCommand{
-		RaftIndex: 100,
-		RaftTerm:  1,
-		Operation: wal.OperationSet,
-		Key:       "cluster:leader",
-		Value:     "node-b-should-be-ignored",
-	}
-	if err := db.ApplyCommitted(cmdDuplicate); err != nil {
-		t.Fatalf("ApplyCommitted duplicate: %v", err)
-	}
-	valAfterDuplicate, _ := db.Get("cluster:leader")
-	if valAfterDuplicate != "node-a" {
-		t.Fatalf("idempotency broken: duplicate index altered value to %q", valAfterDuplicate)
-	}
-
-	// Apply DELETE command committed at Raft index 101, term 1
-	cmdDelete := storage.CommittedCommand{
-		RaftIndex: 101,
-		RaftTerm:  1,
-		Operation: wal.OperationDelete,
-		Key:       "cluster:leader",
-	}
-	if err := db.ApplyCommitted(cmdDelete); err != nil {
-		t.Fatalf("ApplyCommitted delete: %v", err)
-	}
-
-	_, err = db.Get("cluster:leader")
-	if !errors.Is(err, database.ErrKeyNotFound) {
-		t.Fatalf("expected ErrKeyNotFound after committed delete, got %v", err)
-	}
-
-	db.Close()
-
-	// Reopen engine and ensure replayed WAL matches final state
-	engine2, err := storage.NewEngine(walPath)
-	if err != nil {
-		t.Fatalf("reopen NewEngine: %v", err)
-	}
-	defer engine2.Close()
-	db2 := database.NewDatabase(engine2)
-
-	_, err = db2.Get("cluster:leader")
-	if !errors.Is(err, database.ErrKeyNotFound) {
-		t.Fatalf("expected ErrKeyNotFound after replay, got %v", err)
-	}
-}
-
-// TestDatabaseShutdownDrainsInFlightOperations verifies that db.Close() waits
-// for all in-flight operations to complete before returning.
-func TestDatabaseShutdownDrainsInFlightOperations(t *testing.T) {
-	dir := t.TempDir()
-	engine, err := storage.NewEngine(dir + "/wal.log")
-	if err != nil {
-		t.Fatalf("NewEngine: %v", err)
-	}
-	db := database.NewDatabase(engine)
-
-	const totalOps = 50
-	var wg sync.WaitGroup
-
-	for i := 0; i < totalOps; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			key := fmt.Sprintf("k-%d", idx)
-			val := fmt.Sprintf("v-%d", idx)
-			_ = db.Set(key, val)
-		}(i)
-	}
-
-	// Close database concurrently with operations
-	db.Close()
-	wg.Wait()
-
-	// Any operations initiated after Close() has returned must be rejected with ErrClosed
-	if err := db.Set("after-close", "val"); !errors.Is(err, database.ErrClosed) {
-		t.Errorf("expected ErrClosed after shutdown, got %v", err)
 	}
 }

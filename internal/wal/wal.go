@@ -7,14 +7,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"sync"
 )
 
 // Sentinel WAL errors.
 var (
-	ErrWALClosed   = errors.New("wal: log is closed")
-	ErrWALPoisoned = errors.New("wal: log is poisoned due to previous write or sync failure")
+	ErrWALClosed        = errors.New("wal: log is closed")
+	ErrWALPoisoned      = errors.New("wal: log is poisoned due to previous write or sync failure")
+	ErrDatabaseLocked   = errors.New("wal: database directory or file is already locked by another process")
+	ErrSequenceOverflow = errors.New("wal: sequence number overflow")
 )
 
 // HandlerFunc is called sequentially for each valid record replayed from the WAL.
@@ -26,16 +29,17 @@ type HandlerFunc func(Record) error
 // Every mutation (SET / DELETE) is appended here and synced to disk BEFORE
 // the in-memory Memtable is updated.
 //
-// Invariants & Streaming Replay:
+// Invariants, Concurrency, and Process Locks:
+//   - An exclusive OS file lock (<path>.lock) ensures only ONE process can open
+//     a node's WAL at any given time.
 //   - Sequence numbers and checksums are computed under `mu.Lock()`.
+//   - An overflow check protects sequence number wrap-around.
 //   - The committed sequence counter is advanced ONLY after the record
 //     has been successfully flushed and fsynced to physical disk.
-//   - Replay is streaming: records are validated and passed to a HandlerFunc
-//     one-by-one, keeping memory consumption strictly O(1) regardless of WAL size.
-//   - Startup eliminates redundant double-scans: Open() prepares the handle,
-//     and NewEngine() performs a single streaming recovery pass.
+//   - Replay is streaming with strict O(1) memory and verifies trailing-content cleanliness.
 type Log struct {
 	file     *os.File
+	lockFile *os.File
 	writer   *bufio.Writer
 	sequence uint64     // highest committed sequence number on disk
 	mu       sync.Mutex // protects appends, replaying, poisoning, and close
@@ -44,17 +48,33 @@ type Log struct {
 }
 
 // Open opens (or creates) the WAL file at the given path.
-// The file is opened in read/write mode. Startup recovery is decoupled
-// so callers can perform a single streaming pass to reconstruct state.
+// Acquires an exclusive, process-level file lock (<path>.lock) to prevent
+// multiple ORBIT nodes or processes from interfering with the same data directory.
 func Open(path string) (*Log, error) {
+	// 1. Acquire process-level exclusive lock on <path>.lock
+	lockPath := path + ".lock"
+	lFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("wal: open lock file %q: %w", lockPath, err)
+	}
+
+	if err := lockFile(lFile); err != nil {
+		lFile.Close()
+		return nil, err
+	}
+
+	// 2. Open WAL file in read/write mode
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
+		unlockFile(lFile)
+		lFile.Close()
 		return nil, fmt.Errorf("wal: open file %q: %w", path, err)
 	}
 
 	return &Log{
-		file:   f,
-		writer: bufio.NewWriter(f),
+		file:     f,
+		lockFile: lFile,
+		writer:   bufio.NewWriter(f),
 	}, nil
 }
 
@@ -65,14 +85,14 @@ func (l *Log) Sequence() uint64 {
 	return l.sequence
 }
 
+// SetSequenceForTesting allows test suites to set the sequence counter directly.
+func (l *Log) SetSequenceForTesting(seq uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.sequence = seq
+}
+
 // Append writes a Record to the WAL in a thread-safe manner.
-//
-// Durability & Integrity:
-//  1. Sets Version to CurrentFormatVersion.
-//  2. Assigns `nextSeq = sequence + 1`.
-//  3. Computes the CRC32 payload checksum.
-//  4. Writes, flushes, and fsyncs to physical disk.
-//  5. Advances committed sequence counter only after disk sync succeeds.
 func (l *Log) Append(r Record) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -82,6 +102,12 @@ func (l *Log) Append(r Record) error {
 	}
 	if l.err != nil {
 		return fmt.Errorf("%w: %v", ErrWALPoisoned, l.err)
+	}
+
+	// Sequence overflow protection
+	if l.sequence == math.MaxUint64 {
+		l.err = ErrSequenceOverflow
+		return ErrSequenceOverflow
 	}
 
 	nextSeq := l.sequence + 1
@@ -123,14 +149,6 @@ func (l *Log) Append(r Record) error {
 }
 
 // Replay streams, validates, and applies each record in the WAL one-by-one.
-//
-// Streaming Performance:
-//   - Memory consumption is strictly O(1) — records are processed individually.
-//   - Unknown JSON fields are strictly rejected.
-//   - Blank records and sequence gaps are strictly rejected as corruption.
-//   - Incomplete final records without a newline (crash mid-write) are truncated
-//     back to the clean record boundary.
-//   - Updates the committed sequence counter and sets the file pointer for appending.
 func (l *Log) Replay(handler HandlerFunc) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -177,13 +195,19 @@ func (l *Log) Replay(handler HandlerFunc) error {
 					return fmt.Errorf("wal: corrupt record at offset %d: %w", currentOffset, err)
 				}
 
+				// Strict trailing content check: ensure no secondary JSON token exists on the same line
+				var trailing json.RawMessage
+				if err := dec.Decode(&trailing); err != io.EOF {
+					return fmt.Errorf("wal: corrupt record at offset %d: unexpected trailing content on record line", currentOffset)
+				}
+
 				// Sequence validation: contiguous progression (1, 2, 3...)
 				expectedSeq := lastReplayedSeq + 1
 				if r.Sequence != expectedSeq {
 					return fmt.Errorf("wal: non-contiguous sequence at offset %d: got %d, expected %d", currentOffset, r.Sequence, expectedSeq)
 				}
 
-				// Format versioning, operations, and CRC32 checksum validation
+				// Format versioning, operations, and length-prefixed CRC32 checksum validation
 				if err := r.Validate(); err != nil {
 					return fmt.Errorf("wal: invalid record at offset %d (seq %d): %w", currentOffset, r.Sequence, err)
 				}
@@ -267,7 +291,7 @@ func (l *Log) Health() error {
 	return nil
 }
 
-// Close flushes remaining buffers and closes the WAL file cleanly.
+// Close flushes remaining buffers, closes the WAL file, and releases the process lock.
 func (l *Log) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -283,11 +307,21 @@ func (l *Log) Close() error {
 	}
 
 	closeErr := l.file.Close()
+
+	var unlockErr error
+	if l.lockFile != nil {
+		unlockErr = unlockFile(l.lockFile)
+		l.lockFile.Close()
+	}
+
 	if flushErr != nil {
 		return fmt.Errorf("wal: flush on close: %w", flushErr)
 	}
 	if closeErr != nil {
 		return fmt.Errorf("wal: close file: %w", closeErr)
+	}
+	if unlockErr != nil {
+		return fmt.Errorf("wal: unlock on close: %w", unlockErr)
 	}
 	return nil
 }

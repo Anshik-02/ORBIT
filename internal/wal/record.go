@@ -30,27 +30,58 @@ var (
 //
 // Schema Versioning & Integrity:
 //   - Version: Allows schema evolution (e.g. adding Raft terms/indexes, transaction IDs).
-//   - Checksum: CRC32 checksum over the record contents to detect subtle bitrot or corruption.
+//   - RaftIndex & RaftTerm: Persists distributed consensus metadata so applied index is durable.
+//   - Checksum: CRC32-IEEE checksum over unambiguously length-prefixed payload fields.
 type Record struct {
 	Version   uint32 `json:"version"`
 	Sequence  uint64 `json:"sequence"`
+	RaftIndex uint64 `json:"raft_index,omitempty"`
+	RaftTerm  uint64 `json:"raft_term,omitempty"`
 	Operation string `json:"operation"`
 	Key       string `json:"key"`
 	Value     string `json:"value,omitempty"`
 	Checksum  uint32 `json:"checksum"`
 }
 
-// ComputeChecksum computes a CRC32-IEEE checksum over the record's payload fields:
-// Version, Sequence, Operation, Key, and Value.
+// ComputeChecksum computes a CRC32-IEEE checksum over unambiguous length-prefixed payload fields:
+// Version, Sequence, RaftIndex, RaftTerm, Operation, Key, and Value.
+// Length prefixing variable-length strings eliminates boundary collision ambiguity.
 func (r Record) ComputeChecksum() uint32 {
 	h := crc32.NewIEEE()
-	var b [12]byte
-	binary.BigEndian.PutUint32(b[0:4], r.Version)
-	binary.BigEndian.PutUint64(b[4:12], r.Sequence)
-	h.Write(b[:])
+
+	var numBuf [8]byte
+
+	// Version (uint32)
+	binary.BigEndian.PutUint32(numBuf[:4], r.Version)
+	h.Write(numBuf[:4])
+
+	// Sequence (uint64)
+	binary.BigEndian.PutUint64(numBuf[:], r.Sequence)
+	h.Write(numBuf[:])
+
+	// RaftIndex (uint64)
+	binary.BigEndian.PutUint64(numBuf[:], r.RaftIndex)
+	h.Write(numBuf[:])
+
+	// RaftTerm (uint64)
+	binary.BigEndian.PutUint64(numBuf[:], r.RaftTerm)
+	h.Write(numBuf[:])
+
+	// Length-prefixed Operation
+	binary.BigEndian.PutUint32(numBuf[:4], uint32(len(r.Operation)))
+	h.Write(numBuf[:4])
 	h.Write([]byte(r.Operation))
+
+	// Length-prefixed Key
+	binary.BigEndian.PutUint32(numBuf[:4], uint32(len(r.Key)))
+	h.Write(numBuf[:4])
 	h.Write([]byte(r.Key))
+
+	// Length-prefixed Value
+	binary.BigEndian.PutUint32(numBuf[:4], uint32(len(r.Value)))
+	h.Write(numBuf[:4])
 	h.Write([]byte(r.Value))
+
 	return h.Sum32()
 }
 

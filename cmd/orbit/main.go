@@ -29,8 +29,8 @@ func main() {
 	}
 
 	// --- Boot the storage engine ---
-	// Opens WAL, validates sequence continuity, replays existing records,
-	// and reconstructs the Memtable before accepting any requests.
+	// Acquires exclusive process lock, validates sequences, replays WAL records,
+	// and restores consensus progress before accepting requests.
 	engine, err := storage.NewEngine(walPath)
 	if err != nil {
 		log.Fatalf("failed to start storage engine: %v", err)
@@ -52,6 +52,9 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
+	// Channel to capture critical server listener startup errors
+	serverErrCh := make(chan error, 1)
+
 	// Setup OS signal listener for graceful termination
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -67,27 +70,33 @@ func main() {
 		fmt.Println("\nPress Ctrl+C to stop.")
 
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("server error: %v", err)
+			serverErrCh <- err
 		}
 	}()
 
-	// Block main thread until OS shutdown signal arrives
-	sig := <-quit
-	fmt.Printf("\nReceived signal %v. Initiating graceful shutdown...\n", sig)
+	// Wait for OS shutdown signal OR unexpected server failure
+	select {
+	case sig := <-quit:
+		fmt.Printf("\nReceived signal %v. Initiating graceful shutdown...\n", sig)
+	case err := <-serverErrCh:
+		log.Printf("\nHTTP server failed: %v. Initiating emergency shutdown...\n", err)
+	}
 
-	// Phase 1: Shutdown HTTP server first.
-	// This stops accepting new connections and gives active requests up to 5s to complete.
+	// Phase 1: Graceful drain of HTTP server within 5s
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	if err := server.Shutdown(ctx); err != nil {
-		log.Printf("warning: HTTP server shutdown error (some requests may have timed out): %v", err)
+		log.Printf("warning: HTTP graceful drain failed (%v); forcing immediate socket termination", err)
+		// Force close policy: terminate all connections immediately when graceful shutdown fails
+		if closeErr := server.Close(); closeErr != nil {
+			log.Printf("warning: server force-close error: %v", closeErr)
+		}
 	} else {
 		fmt.Println("HTTP server stopped accepting connections and drained.")
 	}
 
-	// Phase 2: Now that all HTTP handlers have exited, safely flush and close the database.
-	// This guarantees that no active HTTP handler attempts to write to a closed WAL.
+	// Phase 2: Now that all HTTP handlers have exited, safely flush and close the database
 	fmt.Println("Flushing WAL and closing storage engine...")
 	if err := db.Close(); err != nil {
 		log.Printf("warning: database close error: %v", err)

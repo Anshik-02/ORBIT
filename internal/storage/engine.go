@@ -11,7 +11,8 @@ import (
 
 // Sentinel errors.
 var (
-	ErrClosed = errors.New("storage: engine is closed")
+	ErrClosed       = errors.New("storage: engine is closed")
+	ErrRaftIndexGap = errors.New("storage: raft index gap detected")
 )
 
 // CommittedCommand represents an entry that has reached majority consensus
@@ -33,11 +34,11 @@ type CommittedCommand struct {
 // Engine is the core storage component of ORBIT.
 //
 // Invariants & Concurrency:
+//   - Exclusive OS-level file locking prevents multiple processes on the same data.
 //   - Mutations (ApplyCommitted, Set, Delete) serialize through `writeMu`.
 //   - Read operations (Get) are non-blocking and concurrent via Memtable RLock.
-//   - Startup recovery uses a single streaming replay pass to rebuild the Memtable.
-//   - Standalone Set and Delete operations execute through ApplyCommitted, establishing
-//     the exact integration boundary for Section 2 (Raft).
+//   - Single-pass streaming WAL replay on boot reconstructs Memtable AND restores lastAppliedIndex.
+//   - Enforces contiguous sequential application for consensus commands (no gaps allowed).
 type Engine struct {
 	memtable         *Memtable
 	wal              *wal.Log
@@ -47,7 +48,7 @@ type Engine struct {
 }
 
 // NewEngine opens the WAL at walPath, executes a single streaming replay pass
-// to reconstruct the Memtable, and returns a ready-to-use Engine.
+// to reconstruct the Memtable and consensus metadata, and returns a ready-to-use Engine.
 func NewEngine(walPath string) (*Engine, error) {
 	w, err := wal.Open(walPath)
 	if err != nil {
@@ -59,7 +60,7 @@ func NewEngine(walPath string) (*Engine, error) {
 		wal:      w,
 	}
 
-	// Single streaming replay pass: populates Memtable and verifies WAL integrity
+	// Single streaming replay pass: populates Memtable and recovers consensus progress
 	if err := engine.recover(); err != nil {
 		w.Close()
 		return nil, fmt.Errorf("storage: recovery failed: %w", err)
@@ -68,7 +69,7 @@ func NewEngine(walPath string) (*Engine, error) {
 	return engine, nil
 }
 
-// recover streams all WAL records directly into the Memtable.
+// recover streams all WAL records directly into the Memtable and restores lastAppliedIndex.
 // Memory overhead is strictly O(1) regardless of WAL size.
 func (e *Engine) recover() error {
 	return e.wal.Replay(func(r wal.Record) error {
@@ -80,15 +81,21 @@ func (e *Engine) recover() error {
 		default:
 			return fmt.Errorf("storage: unexpected operation %q during recovery (seq %d)", r.Operation, r.Sequence)
 		}
+
+		// Restore highest applied Raft index from persisted consensus metadata
+		if r.RaftIndex > e.lastAppliedIndex {
+			e.lastAppliedIndex = r.RaftIndex
+		}
 		return nil
 	})
 }
 
 // ApplyCommitted applies an entry that has reached quorum commit in the cluster.
 //
-// Idempotency:
-// If a command with RaftIndex <= lastAppliedIndex is received (e.g. during replay
-// or leadership change), it is safely recognized as an already-applied duplicate.
+// Invariants enforced:
+//  1. Idempotency: duplicate commands (RaftIndex <= lastAppliedIndex) are safe no-ops.
+//  2. Contiguity: incoming RaftIndex must strictly equal lastAppliedIndex + 1 (no gaps).
+//  3. Durability: RaftIndex and RaftTerm are persisted in the WAL record.
 func (e *Engine) ApplyCommitted(cmd CommittedCommand) error {
 	if e.closed.Load() {
 		return ErrClosed
@@ -101,21 +108,34 @@ func (e *Engine) ApplyCommitted(cmd CommittedCommand) error {
 		return ErrClosed
 	}
 
-	// Idempotency check: duplicate consensus commands are safe no-ops
-	if cmd.RaftIndex != 0 && cmd.RaftIndex <= e.lastAppliedIndex {
-		return nil
+	// Consensus index validation for Raft commands
+	if cmd.RaftIndex != 0 {
+		// Idempotency: ignore duplicate or already-committed commands
+		if cmd.RaftIndex <= e.lastAppliedIndex {
+			return nil
+		}
+
+		// Contiguity check: incoming index must be strictly contiguous
+		expectedIndex := e.lastAppliedIndex + 1
+		if cmd.RaftIndex != expectedIndex {
+			return fmt.Errorf("%w: incoming %d, expected %d", ErrRaftIndexGap, cmd.RaftIndex, expectedIndex)
+		}
 	}
 
 	var rec wal.Record
 	switch cmd.Operation {
 	case wal.OperationSet:
 		rec = wal.Record{
+			RaftIndex: cmd.RaftIndex,
+			RaftTerm:  cmd.RaftTerm,
 			Operation: wal.OperationSet,
 			Key:       cmd.Key,
 			Value:     cmd.Value,
 		}
 	case wal.OperationDelete:
 		rec = wal.Record{
+			RaftIndex: cmd.RaftIndex,
+			RaftTerm:  cmd.RaftTerm,
 			Operation: wal.OperationDelete,
 			Key:       cmd.Key,
 		}
@@ -123,9 +143,10 @@ func (e *Engine) ApplyCommitted(cmd CommittedCommand) error {
 		return fmt.Errorf("storage: unsupported committed operation %q", cmd.Operation)
 	}
 
-	// Persist to local WAL
+	// Persist to local WAL (persists consensus metadata with checksum)
 	if err := e.wal.Append(rec); err != nil {
-		return fmt.Errorf("storage: wal append committed (op %q, key %q): %w", cmd.Operation, cmd.Key, err)
+		return fmt.Errorf("storage: wal append committed (op %q, key %q, raft_idx %d): %w",
+			cmd.Operation, cmd.Key, cmd.RaftIndex, err)
 	}
 
 	// Update local Memtable
@@ -147,6 +168,14 @@ func (e *Engine) LastAppliedIndex() uint64 {
 	e.writeMu.Lock()
 	defer e.writeMu.Unlock()
 	return e.lastAppliedIndex
+}
+
+// SetLastAppliedIndex explicitly sets the applied Raft index baseline, e.g. when restoring
+// from a consensus snapshot in Section 2.
+func (e *Engine) SetLastAppliedIndex(index uint64) {
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	e.lastAppliedIndex = index
 }
 
 // Set stores key -> value in the database.
@@ -185,7 +214,7 @@ func (e *Engine) Health() error {
 	return e.wal.Health()
 }
 
-// Close safely flushes the WAL and shuts down the storage engine.
+// Close safely flushes the WAL, closes file handles, and releases the exclusive process lock.
 // Idempotent: multiple calls return nil.
 func (e *Engine) Close() error {
 	e.writeMu.Lock()

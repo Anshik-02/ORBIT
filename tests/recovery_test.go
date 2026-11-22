@@ -27,10 +27,18 @@ func TestRecoveryAfterRestart(t *testing.T) {
 	}
 	db1 := database.NewDatabase(engine1)
 
-	db1.Set("user:1", "Anshik")
-	db1.Set("user:2", "Rahul")
-	db1.Set("user:3", "Kunal")
-	db1.Delete("user:2") // tombstone
+	if err := db1.Set("user:1", "Anshik"); err != nil {
+		t.Fatalf("Set user:1: %v", err)
+	}
+	if err := db1.Set("user:2", "Rahul"); err != nil {
+		t.Fatalf("Set user:2: %v", err)
+	}
+	if err := db1.Set("user:3", "Kunal"); err != nil {
+		t.Fatalf("Set user:3: %v", err)
+	}
+	if err := db1.Delete("user:2"); err != nil {
+		t.Fatalf("Delete user:2: %v", err)
+	}
 
 	if err := db1.Close(); err != nil {
 		t.Fatalf("close db1: %v", err)
@@ -76,9 +84,13 @@ func TestRecoveryOverwrite(t *testing.T) {
 
 	// Write the same key 5 times.
 	for _, v := range []string{"v1", "v2", "v3", "v4", "v5"} {
-		db1.Set("config:mode", v)
+		if err := db1.Set("config:mode", v); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
 	}
-	db1.Close()
+	if err := db1.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
 
 	// Reopen — only the last value should survive.
 	engine2, err := storage.NewEngine(walPath)
@@ -116,18 +128,28 @@ func TestRecoveryEmptyWAL(t *testing.T) {
 
 // TestRecoverySequencesContinueAfterRestart verifies that sequence numbers
 // do not reset to 1 after a restart — they continue from the last known value.
-// This matters for correctness in distributed scenarios (Section 2).
 func TestRecoverySequencesContinueAfterRestart(t *testing.T) {
 	dir := t.TempDir()
 	walPath := dir + "/wal.log"
 
 	// First session: write 3 records (sequences 1, 2, 3).
-	engine1, _ := storage.NewEngine(walPath)
+	engine1, err := storage.NewEngine(walPath)
+	if err != nil {
+		t.Fatalf("engine1: %v", err)
+	}
 	db1 := database.NewDatabase(engine1)
-	db1.Set("a", "1")
-	db1.Set("b", "2")
-	db1.Set("c", "3")
-	db1.Close()
+	if err := db1.Set("a", "1"); err != nil {
+		t.Fatalf("Set a: %v", err)
+	}
+	if err := db1.Set("b", "2"); err != nil {
+		t.Fatalf("Set b: %v", err)
+	}
+	if err := db1.Set("c", "3"); err != nil {
+		t.Fatalf("Set c: %v", err)
+	}
+	if err := db1.Close(); err != nil {
+		t.Fatalf("db1 close: %v", err)
+	}
 
 	// Second session: write 1 more record — it must get sequence 4, not 1.
 	engine2, err := storage.NewEngine(walPath)
@@ -135,24 +157,24 @@ func TestRecoverySequencesContinueAfterRestart(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	db2 := database.NewDatabase(engine2)
-	db2.Set("d", "4")
-	db2.Close()
+	if err := db2.Set("d", "4"); err != nil {
+		t.Fatalf("Set d: %v", err)
+	}
+	if err := db2.Close(); err != nil {
+		t.Fatalf("db2 close: %v", err)
+	}
 
-	// Read back the raw WAL and verify the last sequence is 4.
+	// Third session: read back without overlapping open engines.
 	engine3, err := storage.NewEngine(walPath)
 	if err != nil {
 		t.Fatalf("third open: %v", err)
 	}
-	defer database.NewDatabase(engine3).Close()
-
-	// If sequences reset, we'd have duplicate seq=1. The WAL Replay in
-	// Open() already validated the file; we just confirm d=4 is present.
-	engine4, _ := storage.NewEngine(walPath)
-	db4 := database.NewDatabase(engine4)
-	defer db4.Close()
-
-	got, err := db4.Get("d")
+	db3 := database.NewDatabase(engine3)
+	got, err := db3.Get("d")
 	if err != nil || got != "4" {
-		t.Errorf("key d after double restart: expected 4, got %q (err: %v)", got, err)
+		t.Errorf("key d after restart: expected 4, got %q (err: %v)", got, err)
+	}
+	if err := db3.Close(); err != nil {
+		t.Fatalf("db3 close: %v", err)
 	}
 }
