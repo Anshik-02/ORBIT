@@ -1,6 +1,6 @@
 # ORBIT — Core Database & Storage Engine (Section 1)
 
-ORBIT is a high-performance, crash-resilient, persistent Key-Value database storage engine written in Go. Section 1 delivers a completely standalone storage node implementing Write-Ahead Logging (WAL), an in-memory Memtable, automatic crash recovery, and an HTTP REST API.
+ORBIT is a high-performance, crash-resilient, persistent Key-Value database storage engine written in Go. Section 1 delivers a completely standalone storage node implementing Write-Ahead Logging (WAL), an in-memory Memtable, automatic crash recovery, lifecycle-coordinated graceful drain, and an HTTP REST API.
 
 ---
 
@@ -10,7 +10,7 @@ ORBIT is a high-performance, crash-resilient, persistent Key-Value database stor
                       +-------------------+
                       |    HTTP Client    |
                       +---------+---------+
-                                |  (GET / POST / DELETE)
+                                |  (GET / POST / DELETE / HEALTH)
                                 v
                       +-------------------+
                       |   HTTP API Layer  |
@@ -51,25 +51,30 @@ Before modifying the in-memory state (`Memtable`), ORBIT **first** writes the mu
 
 2. **Write-Ahead Log (`internal/wal/wal.go`, `record.go`)**:
    - Append-only log file format with JSON Lines (`.log`).
-   - Monotonically increasing atomic sequence numbering (`sync/atomic`).
-   - Synchronous flush and `fsync` on every mutation to guarantee crash durability.
+   - **Committed Sequence Counter**: Mutex-protected committed sequence counter that advances strictly after a successful `fsync` to disk.
+   - **Failure Poisoning**: Any disk write or sync failure marks the log poisoned, halting further writes into an uncertain state.
+   - **Strict Sequence Progression**: Enforces contiguous $1 \rightarrow 2 \rightarrow 3$ sequences during replay; sequence gaps or duplicates halt recovery.
+   - **Strict Record Validation**: Rejects unknown operations, empty keys, or malformed fields during replay.
+   - **Strict Corruption Detection**: Rejects blank newline-delimited lines; truncates incomplete trailing writes left by crashes mid-write back to the clean record boundary.
    - Deletions recorded as tombstones (`OperationDelete`).
-   - Resilient crash recovery handling: ignores incomplete/truncated final writes while catching corrupted entries.
 
 3. **Storage Engine & Crash Recovery (`internal/storage/engine.go`)**:
-   - Coordinates WAL and Memtable operations seamlessly.
+   - Coordinates WAL and Memtable mutations atomically under `writeMu`.
    - Self-healing startup: automatically replays the WAL on boot to reconstruct the Memtable before accepting traffic.
+   - Shutdown tracking: returns `ErrClosed` if mutations are attempted after shutdown.
 
 4. **Database Operations Layer (`internal/database/`)**:
-   - Exposes clean `Set`, `Get`, `Delete` methods.
+   - Exposes clean `Set`, `Get`, `Delete`, `Health` methods.
    - Input validation (rejects blank keys/values).
-   - Idiomatic Go sentinel errors (`ErrKeyNotFound`, `ErrEmptyKey`, `ErrEmptyValue`).
+   - **Lifecycle Coordination**: Uses `sync.RWMutex` so `Close()` waits for all active in-flight operations to complete before closing the storage engine.
+   - Sentinel errors (`ErrKeyNotFound`, `ErrEmptyKey`, `ErrEmptyValue`, `ErrClosed`).
    - Defines the `StorageEngine` interface, creating a decoupled contract for Section 2 (Raft consensus) integration.
 
 5. **HTTP REST API (`internal/api/`, `cmd/orbit/main.go`)**:
    - Native Go 1.22+ routing with method matching and path parameters.
-   - Graceful shutdown listening for `SIGINT` / `SIGTERM` signals.
-   - Health check endpoint at `/health`.
+   - Strict input validation: 1MB body limit, rejection of unknown JSON fields and trailing payloads.
+   - **Phased Graceful Shutdown**: Stops the HTTP server and drains active HTTP requests first before flushing and closing the database.
+   - **Diagnostic Health Check (`/health`)**: Reports process status, storage engine health (detecting poisoned WALs), write availability, and cluster role.
 
 ---
 
@@ -77,7 +82,7 @@ Before modifying the in-memory state (`Memtable`), ORBIT **first** writes the mu
 
 | Method | Endpoint | Request Body | Success Code | Description |
 |---|---|---|---|---|
-| `GET` | `/health` | _None_ | `200 OK` | Node health & status check |
+| `GET` | `/health` | _None_ | `200 OK` | Diagnostic health & readiness check |
 | `POST` | `/api/v1/kv` | `{"key": "user:1", "value": "Anshik"}` | `201 Created` | Store a key-value pair |
 | `GET` | `/api/v1/kv/{key}` | _None_ | `200 OK` | Retrieve value for key |
 | `DELETE` | `/api/v1/kv/{key}` | _None_ | `200 OK` | Delete key (tombstone) |
@@ -87,9 +92,9 @@ Before modifying the in-memory state (`Memtable`), ORBIT **first** writes the mu
 ## Running and Verifying
 
 ### 1. Run All Automated Tests
-Includes unit tests, durability restart simulations, monotonic sequence checks, and partial write crash tests with race detection:
+Includes unit tests, durability restart simulations, monotonic sequence checks, concurrency stress tests, and partial write crash tests with race detection:
 ```bash
-go test ./tests/... -v
+go test ./tests/... -v -race
 ```
 
 ### 2. Start the ORBIT Server

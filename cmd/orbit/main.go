@@ -29,26 +29,15 @@ func main() {
 	}
 
 	// --- Boot the storage engine ---
-	// This opens the WAL, replays any existing records, and reconstructs
-	// the Memtable. The database is in a consistent state before we accept
-	// any HTTP requests.
+	// Opens WAL, validates sequence continuity, replays existing records,
+	// and reconstructs the Memtable before accepting any requests.
 	engine, err := storage.NewEngine(walPath)
 	if err != nil {
 		log.Fatalf("failed to start storage engine: %v", err)
 	}
 
 	// --- Wrap engine in the database layer ---
-	// The database layer adds validation and clean error types.
-	// The API layer talks to the database, never to the engine directly.
 	db := database.NewDatabase(engine)
-
-	defer func() {
-		fmt.Println("\nShutting down ORBIT...")
-		if err := db.Close(); err != nil {
-			log.Printf("warning: db close error: %v", err)
-		}
-		fmt.Println("WAL flushed. Goodbye.")
-	}()
 
 	// --- Wire up HTTP routes ---
 	mux := http.NewServeMux()
@@ -63,28 +52,48 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	// --- Graceful shutdown on Ctrl+C / SIGTERM ---
+	// Setup OS signal listener for graceful termination
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
+	// Start HTTP server in a background goroutine
 	go func() {
-		<-quit
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		server.Shutdown(ctx)
+		fmt.Printf("Storage engine ready. WAL: %s\n", walPath)
+		fmt.Printf("HTTP API listening on http://localhost%s\n\n", port)
+		fmt.Println("  POST   http://localhost:2525/api/v1/kv")
+		fmt.Println("  GET    http://localhost:2525/api/v1/kv/{key}")
+		fmt.Println("  DELETE http://localhost:2525/api/v1/kv/{key}")
+		fmt.Println("  GET    http://localhost:2525/health")
+		fmt.Println("\nPress Ctrl+C to stop.")
+
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server error: %v", err)
+		}
 	}()
 
-	fmt.Printf("Storage engine ready. WAL: %s\n", walPath)
-	fmt.Printf("HTTP API listening on http://localhost%s\n", port)
-	fmt.Println()
-	fmt.Println("  POST   http://localhost:2525/api/v1/kv")
-	fmt.Println("  GET    http://localhost:2525/api/v1/kv/{key}")
-	fmt.Println("  DELETE http://localhost:2525/api/v1/kv/{key}")
-	fmt.Println("  GET    http://localhost:2525/health")
-	fmt.Println()
-	fmt.Println("Press Ctrl+C to stop.")
+	// Block main thread until OS shutdown signal arrives
+	sig := <-quit
+	fmt.Printf("\nReceived signal %v. Initiating graceful shutdown...\n", sig)
 
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("server error: %v", err)
+	// Phase 1: Shutdown HTTP server first.
+	// This stops accepting new connections and gives active requests up to 5s to complete.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("warning: HTTP server shutdown error (some requests may have timed out): %v", err)
+	} else {
+		fmt.Println("HTTP server stopped accepting connections and drained.")
 	}
+
+	// Phase 2: Now that all HTTP handlers have exited, safely flush and close the database.
+	// This guarantees that no active HTTP handler attempts to write to a closed WAL.
+	fmt.Println("Flushing WAL and closing storage engine...")
+	if err := db.Close(); err != nil {
+		log.Printf("warning: database close error: %v", err)
+	} else {
+		fmt.Println("WAL synced and storage engine closed cleanly.")
+	}
+
+	fmt.Println("ORBIT shutdown complete. Goodbye.")
 }
