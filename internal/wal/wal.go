@@ -9,28 +9,32 @@ import (
 	"io"
 	"os"
 	"sync"
-	"sync/atomic"
+)
+
+// Sentinel WAL errors.
+var (
+	ErrWALClosed   = errors.New("wal: log is closed")
+	ErrWALPoisoned = errors.New("wal: log is poisoned due to previous write or sync failure")
 )
 
 // Log is the Write-Ahead Log.
 //
 // Every mutation (SET / DELETE) is appended here and synced to disk BEFORE
-// the in-memory Memtable is updated. This guarantees that if the process
-// crashes between the two steps, we can reconstruct the correct state on
-// the next startup by replaying the log.
+// the in-memory Memtable is updated.
 //
-// File format: JSON Lines — one JSON-encoded Record per line.
-//
-// Concurrency & Safety:
-//   - An internal sync.Mutex (mu) protects all file writes, buffer flushes,
-//     and disk syncs from concurrent goroutines.
-//   - Replay validates contiguous sequence numbers (1, 2, 3, ...) and
-//     truncates any incomplete trailing records left by crash mid-write.
+// Sequence Allocation & Durability Invariant:
+//   - Sequence numbers are computed under `mu.Lock()`.
+//   - The committed sequence counter is advanced ONLY after the complete record
+//     has been successfully flushed and fsynced to physical disk.
+//   - Any write or sync failure marks the log as poisoned (`err != nil`),
+//     preventing any subsequent writes from being accepted into an uncertain state.
 type Log struct {
 	file     *os.File
 	writer   *bufio.Writer
-	sequence atomic.Uint64 // current sequence number
-	mu       sync.Mutex    // protects concurrent appends, replaying, and file close
+	sequence uint64     // highest committed sequence number on disk
+	mu       sync.Mutex // protects appends, replaying, poisoning, and close
+	closed   bool
+	err      error // sticky failure; once set, WAL is poisoned and rejects writes
 }
 
 // Open opens (or creates) the WAL file at the given path.
@@ -48,8 +52,8 @@ func Open(path string) (*Log, error) {
 		writer: bufio.NewWriter(f),
 	}
 
-	// Replay existing records to validate sequence continuity and
-	// clean up any partial writes before new writes arrive.
+	// Replay existing records to validate sequence continuity, record integrity,
+	// and clean up any partial writes before new writes arrive.
 	records, err := log.Replay()
 	if err != nil {
 		f.Close()
@@ -57,7 +61,7 @@ func Open(path string) (*Log, error) {
 	}
 
 	if len(records) > 0 {
-		log.sequence.Store(records[len(records)-1].Sequence)
+		log.sequence = records[len(records)-1].Sequence
 	}
 
 	return log, nil
@@ -65,20 +69,24 @@ func Open(path string) (*Log, error) {
 
 // Append writes a Record to the WAL in a thread-safe manner.
 //
-// Durability guarantee:
-//  1. The sequence number is allocated monotonically.
-//  2. The record is serialized and written to the buffered writer.
-//  3. The buffer is flushed to the OS.
-//  4. os.File.Sync() is called to flush data to persistent physical disk.
-//
-// The internal mutex guarantees no interleaved writes or race conditions
-// when multiple concurrent requests issue writes.
+// Sequence guarantee:
+//  1. Assigns `nextSeq = sequence + 1`.
+//  2. Serializes, writes, flushes, and fsyncs to physical disk.
+//  3. Advances `sequence = nextSeq` ONLY after `file.Sync()` succeeds.
+//  4. If write or sync fails, WAL is marked poisoned and all subsequent appends fail.
 func (l *Log) Append(r Record) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	// Assign the next sequence number monotonically.
-	r.Sequence = l.sequence.Add(1)
+	if l.closed {
+		return ErrWALClosed
+	}
+	if l.err != nil {
+		return fmt.Errorf("%w: %v", ErrWALPoisoned, l.err)
+	}
+
+	nextSeq := l.sequence + 1
+	r.Sequence = nextSeq
 
 	// Encode record as JSON.
 	line, err := json.Marshal(r)
@@ -88,36 +96,50 @@ func (l *Log) Append(r Record) error {
 
 	// Write record followed by newline.
 	if _, err := l.writer.Write(line); err != nil {
-		return fmt.Errorf("wal: write record: %w", err)
+		l.err = fmt.Errorf("write record: %w", err)
+		return l.err
 	}
 	if err := l.writer.WriteByte('\n'); err != nil {
-		return fmt.Errorf("wal: write newline: %w", err)
+		l.err = fmt.Errorf("write newline: %w", err)
+		return l.err
 	}
 
-	// Flush buffer to OS page cache, then sync to physical disk.
+	// Flush buffer to OS page cache.
 	if err := l.writer.Flush(); err != nil {
-		return fmt.Errorf("wal: flush buffer: %w", err)
-	}
-	if err := l.file.Sync(); err != nil {
-		return fmt.Errorf("wal: sync to disk: %w", err)
+		l.err = fmt.Errorf("flush buffer: %w", err)
+		return l.err
 	}
 
+	// Fsync to physical disk.
+	if err := l.file.Sync(); err != nil {
+		l.err = fmt.Errorf("sync disk: %w", err)
+		return l.err
+	}
+
+	// Advance sequence number only after complete, successful durability sync.
+	l.sequence = nextSeq
 	return nil
 }
 
 // Replay reads, validates, and replays all records in the WAL.
 //
-// Rules enforced:
+// Validation rules enforced:
 //  1. Sequence validation: Records must form a contiguous progression:
 //     1 -> 2 -> 3 -> ... (gaps or duplicates are rejected as corrupted).
-//  2. Complete records: Any record with a terminating newline that fails
-//     JSON parsing is treated as real corruption and returns an error.
-//  3. Partial write recovery: An incomplete final record without a newline
+//  2. Operation & Field validation: Only SET and DELETE are allowed; keys
+//     and values must be non-empty where required.
+//  3. Complete records: Any record with a terminating newline that fails
+//     JSON parsing or validation is treated as corruption and halts replay.
+//  4. Partial write recovery: An incomplete final record without a newline
 //     (from a crash mid-write) is permitted; the file is truncated back
-//     to the last valid record boundary so dirty trailing data is removed.
+//     to the last valid record boundary.
 func (l *Log) Replay() ([]Record, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
+	if l.closed {
+		return nil, ErrWALClosed
+	}
 
 	// Ensure any buffered data is flushed first.
 	if err := l.writer.Flush(); err != nil {
@@ -164,12 +186,16 @@ func (l *Log) Replay() ([]Record, error) {
 					return nil, fmt.Errorf("wal: non-contiguous sequence at offset %d: got %d, expected %d", currentOffset, r.Sequence, expectedSeq)
 				}
 
+				// Record integrity & operation validation
+				if err := r.Validate(); err != nil {
+					return nil, fmt.Errorf("wal: invalid record at offset %d (seq %d): %w", currentOffset, r.Sequence, err)
+				}
+
 				records = append(records, r)
 				currentOffset += lineLen
 				lastValidOffset = currentOffset
 			} else {
-				// Incomplete trailing record without a terminating newline (crash mid-write).
-				// We stop scanning and will truncate back to lastValidOffset.
+				// Incomplete trailing record without newline (crash mid-write).
 				break
 			}
 		}
@@ -214,11 +240,22 @@ func (l *Log) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if err := l.writer.Flush(); err != nil {
-		return fmt.Errorf("wal: flush on close: %w", err)
+	if l.closed {
+		return nil
 	}
-	if err := l.file.Close(); err != nil {
-		return fmt.Errorf("wal: close file: %w", err)
+	l.closed = true
+
+	var flushErr error
+	if l.err == nil {
+		flushErr = l.writer.Flush()
+	}
+
+	closeErr := l.file.Close()
+	if flushErr != nil {
+		return fmt.Errorf("wal: flush on close: %w", flushErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("wal: close file: %w", closeErr)
 	}
 	return nil
 }

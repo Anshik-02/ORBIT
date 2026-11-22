@@ -1,10 +1,17 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"orbit/internal/wal"
+)
+
+// Sentinel errors.
+var (
+	ErrClosed = errors.New("storage: engine is closed")
 )
 
 // Engine is the core storage component of ORBIT.
@@ -14,20 +21,16 @@ import (
 //     mutation to disk before it touches in-memory state.
 //   - Memtable: an in-memory map that serves all read requests at O(1).
 //
-// The invariant Engine enforces:
-//
-//	[writeMu.Lock] -> WAL append + sync -> Memtable update -> [writeMu.Unlock]
-//
-// Concurrency Model:
-//   - All write operations (Set / Delete) serialize through `writeMu`.
-//     This ensures that the order operations appear in the WAL strictly
-//     matches the order they mutate the Memtable.
-//   - Read operations (Get) only touch the Memtable with a shared RLock,
-//     allowing highly concurrent, non-blocking reads.
+// Invariants & Concurrency:
+//   - Operations check `closed` state and return ErrClosed if shut down.
+//   - All mutations serialize through `writeMu`:
+//     [writeMu.Lock] -> WAL append + sync -> Memtable update -> [writeMu.Unlock]
+//   - Reads (Get) are concurrent and non-blocking using Memtable RLock.
 type Engine struct {
 	memtable *Memtable
 	wal      *wal.Log
-	writeMu  sync.Mutex // serializes WAL append + Memtable update transaction
+	writeMu  sync.Mutex  // serializes WAL append + Memtable update transaction
+	closed   atomic.Bool // tracks shutdown state
 }
 
 // NewEngine opens the WAL at walPath, replays it to reconstruct the
@@ -53,6 +56,7 @@ func NewEngine(walPath string) (*Engine, error) {
 }
 
 // recover replays all WAL records into the Memtable.
+// Any unknown operation or invalid record is rejected with an error.
 func (e *Engine) recover() error {
 	records, err := e.wal.Replay()
 	if err != nil {
@@ -66,7 +70,7 @@ func (e *Engine) recover() error {
 		case wal.OperationDelete:
 			e.memtable.Delete(r.Key)
 		default:
-			// Forward compatibility: ignore unknown operations
+			return fmt.Errorf("storage: unexpected operation %q during recovery (seq %d)", r.Operation, r.Sequence)
 		}
 	}
 
@@ -74,14 +78,17 @@ func (e *Engine) recover() error {
 }
 
 // Set stores key -> value in the database.
-//
-// Serialized through writeMu:
-//  1. Append SET record to WAL and sync to physical disk.
-//  2. Update the Memtable.
-// Both steps complete atomically with respect to other writes.
 func (e *Engine) Set(key, value string) error {
+	if e.closed.Load() {
+		return ErrClosed
+	}
+
 	e.writeMu.Lock()
 	defer e.writeMu.Unlock()
+
+	if e.closed.Load() {
+		return ErrClosed
+	}
 
 	record := wal.Record{
 		Operation: wal.OperationSet,
@@ -98,19 +105,26 @@ func (e *Engine) Set(key, value string) error {
 }
 
 // Get retrieves the value for key.
-// Concurrent and non-blocking: accesses the Memtable via RLock.
+// Returns ("", false) if closed or key is not found.
 func (e *Engine) Get(key string) (string, bool) {
+	if e.closed.Load() {
+		return "", false
+	}
 	return e.memtable.Get(key)
 }
 
 // Delete removes key from the database.
-//
-// Serialized through writeMu:
-//  1. Append DELETE tombstone record to WAL and sync to physical disk.
-//  2. Remove key from the Memtable.
 func (e *Engine) Delete(key string) error {
+	if e.closed.Load() {
+		return ErrClosed
+	}
+
 	e.writeMu.Lock()
 	defer e.writeMu.Unlock()
+
+	if e.closed.Load() {
+		return ErrClosed
+	}
 
 	record := wal.Record{
 		Operation: wal.OperationDelete,
@@ -125,10 +139,15 @@ func (e *Engine) Delete(key string) error {
 	return nil
 }
 
-// Close flushes and closes the WAL.
+// Close safely flushes the WAL and shuts down the storage engine.
+// Idempotent: multiple calls return nil.
 func (e *Engine) Close() error {
 	e.writeMu.Lock()
 	defer e.writeMu.Unlock()
+
+	if e.closed.Swap(true) {
+		return nil
+	}
 
 	if err := e.wal.Close(); err != nil {
 		return fmt.Errorf("storage: close wal: %w", err)

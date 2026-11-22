@@ -59,12 +59,6 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 // --- Handlers ---
 
 // HandleSet handles POST /api/v1/kv
-//
-// Robustness checks:
-//   - Request body limited to 1MB.
-//   - Unknown JSON fields rejected.
-//   - Trailing JSON tokens/values rejected.
-//   - Internal storage errors logged on server and obscured from clients.
 func (h *Handler) HandleSet(w http.ResponseWriter, r *http.Request) {
 	// Limit request body size
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
@@ -96,6 +90,8 @@ func (h *Handler) HandleSet(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "key must not be empty")
 		case errors.Is(err, database.ErrEmptyValue):
 			writeError(w, http.StatusBadRequest, "value must not be empty")
+		case errors.Is(err, database.ErrClosed):
+			writeError(w, http.StatusServiceUnavailable, "database is closed")
 		default:
 			log.Printf("[ERROR] storage failure on SET: %v", err)
 			writeError(w, http.StatusInternalServerError, "internal storage error")
@@ -117,6 +113,8 @@ func (h *Handler) HandleGet(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "key must not be empty")
 		case errors.Is(err, database.ErrKeyNotFound):
 			writeError(w, http.StatusNotFound, "key not found")
+		case errors.Is(err, database.ErrClosed):
+			writeError(w, http.StatusServiceUnavailable, "database is closed")
 		default:
 			log.Printf("[ERROR] storage failure on GET (%q): %v", key, err)
 			writeError(w, http.StatusInternalServerError, "internal storage error")
@@ -135,6 +133,8 @@ func (h *Handler) HandleDelete(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, database.ErrEmptyKey):
 			writeError(w, http.StatusBadRequest, "key must not be empty")
+		case errors.Is(err, database.ErrClosed):
+			writeError(w, http.StatusServiceUnavailable, "database is closed")
 		default:
 			log.Printf("[ERROR] storage failure on DELETE (%q): %v", key, err)
 			writeError(w, http.StatusInternalServerError, "internal storage error")
