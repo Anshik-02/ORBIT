@@ -1,0 +1,11 @@
+# Persistent data files — never commit WAL logs or database state
+data/
+
+# Go build artifacts
+*.exe
+*.test
+*.out
+
+# Go workspace
+go.work
+go.work.sum
