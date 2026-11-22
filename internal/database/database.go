@@ -1,12 +1,18 @@
 package database
 
-import "sync"
+import (
+	"sync"
+
+	"orbit/internal/storage"
+)
 
 // StorageEngine is the interface that the Database layer talks to.
+// Exposes both client operations and the consensus application boundary.
 type StorageEngine interface {
 	Set(key, value string) error
 	Get(key string) (string, bool)
 	Delete(key string) error
+	ApplyCommitted(cmd storage.CommittedCommand) error
 	Close() error
 	Health() error
 }
@@ -15,7 +21,7 @@ type StorageEngine interface {
 //
 // Lifecycle Coordination:
 //   - Uses a lifecycle `closeMu sync.RWMutex`.
-//   - In-flight operations (Set, Get, Delete, Health) acquire `closeMu.RLock()`.
+//   - In-flight operations (Set, Get, Delete, Health, ApplyCommitted) acquire `closeMu.RLock()`.
 //   - Close() acquires `closeMu.Lock()`, which guarantees that every in-flight
 //     operation initiated before Close() has completely finished executing
 //     before the underlying storage engine is closed and Close() returns.

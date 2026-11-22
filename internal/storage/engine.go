@@ -14,27 +14,40 @@ var (
 	ErrClosed = errors.New("storage: engine is closed")
 )
 
-// Engine is the core storage component of ORBIT.
+// CommittedCommand represents an entry that has reached majority consensus
+// (e.g. via Raft in Section 2) and is ready to be committed to local storage.
 //
-// It coordinates two sub-systems:
-//   - WAL (Write-Ahead Log): guarantees durability by recording every
-//     mutation to disk before it touches in-memory state.
-//   - Memtable: an in-memory map that serves all read requests at O(1).
-//
-// Invariants & Concurrency:
-//   - Operations check `closed` state and return ErrClosed if shut down.
-//   - All mutations serialize through `writeMu`:
-//     [writeMu.Lock] -> WAL append + sync -> Memtable update -> [writeMu.Unlock]
-//   - Reads (Get) are concurrent and non-blocking using Memtable RLock.
-type Engine struct {
-	memtable *Memtable
-	wal      *wal.Log
-	writeMu  sync.Mutex  // serializes WAL append + Memtable update transaction
-	closed   atomic.Bool // tracks shutdown state
+// Architectural Decoupling:
+//   - RaftIndex: Consensus log position across the distributed cluster.
+//   - RaftTerm:  The election term when the leader proposed this entry.
+//   - WAL Sequence: The physical local node's append-only sequence number.
+// These concepts are strictly decoupled.
+type CommittedCommand struct {
+	RaftIndex uint64 // consensus replicated log index (0 for standalone mode)
+	RaftTerm  uint64 // consensus term
+	Operation string // wal.OperationSet or wal.OperationDelete
+	Key       string
+	Value     string
 }
 
-// NewEngine opens the WAL at walPath, replays it to reconstruct the
-// Memtable, and returns a ready-to-use Engine.
+// Engine is the core storage component of ORBIT.
+//
+// Invariants & Concurrency:
+//   - Mutations (ApplyCommitted, Set, Delete) serialize through `writeMu`.
+//   - Read operations (Get) are non-blocking and concurrent via Memtable RLock.
+//   - Startup recovery uses a single streaming replay pass to rebuild the Memtable.
+//   - Standalone Set and Delete operations execute through ApplyCommitted, establishing
+//     the exact integration boundary for Section 2 (Raft).
+type Engine struct {
+	memtable         *Memtable
+	wal              *wal.Log
+	writeMu          sync.Mutex  // serializes WAL append + Memtable update transaction
+	closed           atomic.Bool // tracks shutdown state
+	lastAppliedIndex uint64      // highest applied Raft index for idempotency
+}
+
+// NewEngine opens the WAL at walPath, executes a single streaming replay pass
+// to reconstruct the Memtable, and returns a ready-to-use Engine.
 func NewEngine(walPath string) (*Engine, error) {
 	w, err := wal.Open(walPath)
 	if err != nil {
@@ -46,7 +59,7 @@ func NewEngine(walPath string) (*Engine, error) {
 		wal:      w,
 	}
 
-	// Replay WAL to restore state
+	// Single streaming replay pass: populates Memtable and verifies WAL integrity
 	if err := engine.recover(); err != nil {
 		w.Close()
 		return nil, fmt.Errorf("storage: recovery failed: %w", err)
@@ -55,15 +68,10 @@ func NewEngine(walPath string) (*Engine, error) {
 	return engine, nil
 }
 
-// recover replays all WAL records into the Memtable.
-// Any unknown operation or invalid record is rejected with an error.
+// recover streams all WAL records directly into the Memtable.
+// Memory overhead is strictly O(1) regardless of WAL size.
 func (e *Engine) recover() error {
-	records, err := e.wal.Replay()
-	if err != nil {
-		return err
-	}
-
-	for _, r := range records {
+	return e.wal.Replay(func(r wal.Record) error {
 		switch r.Operation {
 		case wal.OperationSet:
 			e.memtable.Set(r.Key, r.Value)
@@ -72,13 +80,16 @@ func (e *Engine) recover() error {
 		default:
 			return fmt.Errorf("storage: unexpected operation %q during recovery (seq %d)", r.Operation, r.Sequence)
 		}
-	}
-
-	return nil
+		return nil
+	})
 }
 
-// Set stores key -> value in the database.
-func (e *Engine) Set(key, value string) error {
+// ApplyCommitted applies an entry that has reached quorum commit in the cluster.
+//
+// Idempotency:
+// If a command with RaftIndex <= lastAppliedIndex is received (e.g. during replay
+// or leadership change), it is safely recognized as an already-applied duplicate.
+func (e *Engine) ApplyCommitted(cmd CommittedCommand) error {
 	if e.closed.Load() {
 		return ErrClosed
 	}
@@ -90,18 +101,62 @@ func (e *Engine) Set(key, value string) error {
 		return ErrClosed
 	}
 
-	record := wal.Record{
+	// Idempotency check: duplicate consensus commands are safe no-ops
+	if cmd.RaftIndex != 0 && cmd.RaftIndex <= e.lastAppliedIndex {
+		return nil
+	}
+
+	var rec wal.Record
+	switch cmd.Operation {
+	case wal.OperationSet:
+		rec = wal.Record{
+			Operation: wal.OperationSet,
+			Key:       cmd.Key,
+			Value:     cmd.Value,
+		}
+	case wal.OperationDelete:
+		rec = wal.Record{
+			Operation: wal.OperationDelete,
+			Key:       cmd.Key,
+		}
+	default:
+		return fmt.Errorf("storage: unsupported committed operation %q", cmd.Operation)
+	}
+
+	// Persist to local WAL
+	if err := e.wal.Append(rec); err != nil {
+		return fmt.Errorf("storage: wal append committed (op %q, key %q): %w", cmd.Operation, cmd.Key, err)
+	}
+
+	// Update local Memtable
+	if cmd.Operation == wal.OperationSet {
+		e.memtable.Set(cmd.Key, cmd.Value)
+	} else {
+		e.memtable.Delete(cmd.Key)
+	}
+
+	if cmd.RaftIndex > 0 {
+		e.lastAppliedIndex = cmd.RaftIndex
+	}
+
+	return nil
+}
+
+// LastAppliedIndex returns the highest committed consensus index applied to this engine.
+func (e *Engine) LastAppliedIndex() uint64 {
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	return e.lastAppliedIndex
+}
+
+// Set stores key -> value in the database.
+// In standalone mode, this routes through ApplyCommitted with RaftIndex=0.
+func (e *Engine) Set(key, value string) error {
+	return e.ApplyCommitted(CommittedCommand{
 		Operation: wal.OperationSet,
 		Key:       key,
 		Value:     value,
-	}
-
-	if err := e.wal.Append(record); err != nil {
-		return fmt.Errorf("storage: wal append (SET %q): %w", key, err)
-	}
-
-	e.memtable.Set(key, value)
-	return nil
+	})
 }
 
 // Get retrieves the value for key.
@@ -114,29 +169,12 @@ func (e *Engine) Get(key string) (string, bool) {
 }
 
 // Delete removes key from the database.
+// In standalone mode, this routes through ApplyCommitted with RaftIndex=0.
 func (e *Engine) Delete(key string) error {
-	if e.closed.Load() {
-		return ErrClosed
-	}
-
-	e.writeMu.Lock()
-	defer e.writeMu.Unlock()
-
-	if e.closed.Load() {
-		return ErrClosed
-	}
-
-	record := wal.Record{
+	return e.ApplyCommitted(CommittedCommand{
 		Operation: wal.OperationDelete,
 		Key:       key,
-	}
-
-	if err := e.wal.Append(record); err != nil {
-		return fmt.Errorf("storage: wal append (DELETE %q): %w", key, err)
-	}
-
-	e.memtable.Delete(key)
-	return nil
+	})
 }
 
 // Health checks whether the storage engine is open and its WAL is unpoisoned.

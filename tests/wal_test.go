@@ -1,6 +1,8 @@
 package tests
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -10,7 +12,7 @@ import (
 )
 
 // TestWALAppendAndReplay verifies that records written to the WAL
-// can be read back correctly in sequence order.
+// can be read back correctly in sequence order with valid checksums.
 func TestWALAppendAndReplay(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/wal.log"
@@ -33,9 +35,9 @@ func TestWALAppendAndReplay(t *testing.T) {
 		}
 	}
 
-	got, err := w.Replay()
+	got, err := w.ReadAll()
 	if err != nil {
-		t.Fatalf("Replay: %v", err)
+		t.Fatalf("ReadAll: %v", err)
 	}
 
 	if len(got) != len(records) {
@@ -43,6 +45,9 @@ func TestWALAppendAndReplay(t *testing.T) {
 	}
 
 	for i, r := range got {
+		if r.Version != wal.CurrentFormatVersion {
+			t.Errorf("record[%d]: version = %d, want %d", i, r.Version, wal.CurrentFormatVersion)
+		}
 		if r.Operation != records[i].Operation {
 			t.Errorf("record[%d]: operation = %q, want %q", i, r.Operation, records[i].Operation)
 		}
@@ -51,6 +56,9 @@ func TestWALAppendAndReplay(t *testing.T) {
 		}
 		if r.Value != records[i].Value {
 			t.Errorf("record[%d]: value = %q, want %q", i, r.Value, records[i].Value)
+		}
+		if r.Checksum != r.ComputeChecksum() {
+			t.Errorf("record[%d]: invalid checksum", i)
 		}
 	}
 }
@@ -71,9 +79,9 @@ func TestWALSequenceIsMonotonic(t *testing.T) {
 		}
 	}
 
-	records, err := w.Replay()
+	records, err := w.ReadAll()
 	if err != nil {
-		t.Fatalf("Replay: %v", err)
+		t.Fatalf("ReadAll: %v", err)
 	}
 
 	for i := 1; i < len(records); i++ {
@@ -121,9 +129,18 @@ func TestWALPartialWrite(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/wal.log"
 
-	// Write a valid record followed by an incomplete line (no newline).
-	validLine := `{"sequence":1,"operation":"SET","key":"user:1","value":"Anshik"}` + "\n"
-	truncatedLine := `{"sequence":2,"operation":"SET","key":"use`
+	rec1 := wal.Record{
+		Version:   wal.CurrentFormatVersion,
+		Sequence:  1,
+		Operation: wal.OperationSet,
+		Key:       "user:1",
+		Value:     "Anshik",
+	}
+	rec1.Checksum = rec1.ComputeChecksum()
+	line1, _ := json.Marshal(rec1)
+	validLine := string(line1) + "\n"
+
+	truncatedLine := `{"version":1,"sequence":2,"operation":"SET","key":"use`
 
 	if err := os.WriteFile(path, []byte(validLine+truncatedLine), 0644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
@@ -135,9 +152,9 @@ func TestWALPartialWrite(t *testing.T) {
 	}
 	defer w.Close()
 
-	records, err := w.Replay()
+	records, err := w.ReadAll()
 	if err != nil {
-		t.Fatalf("Replay failed on partial line: %v", err)
+		t.Fatalf("ReadAll failed on partial line: %v", err)
 	}
 
 	if len(records) != 1 {
@@ -157,21 +174,118 @@ func TestWALPartialWrite(t *testing.T) {
 	}
 }
 
+// TestWALChecksumMismatchDetected verifies that bitrot or corrupted values are detected.
+func TestWALChecksumMismatchDetected(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/wal.log"
+
+	rec := wal.Record{
+		Version:   wal.CurrentFormatVersion,
+		Sequence:  1,
+		Operation: wal.OperationSet,
+		Key:       "k1",
+		Value:     "v1",
+	}
+	rec.Checksum = 9999999 // deliberate incorrect checksum
+
+	line, _ := json.Marshal(rec)
+	if err := os.WriteFile(path, append(line, '\n'), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	w, err := wal.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer w.Close()
+
+	_, err = w.ReadAll()
+	if !errors.Is(err, wal.ErrChecksumMismatch) {
+		t.Fatalf("expected ErrChecksumMismatch, got %v", err)
+	}
+}
+
+// TestWALUnsupportedVersionRejected verifies that records with unknown versions are rejected.
+func TestWALUnsupportedVersionRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/wal.log"
+
+	rec := wal.Record{
+		Version:   99, // unsupported future/past schema version
+		Sequence:  1,
+		Operation: wal.OperationSet,
+		Key:       "k1",
+		Value:     "v1",
+	}
+	rec.Checksum = rec.ComputeChecksum()
+
+	line, _ := json.Marshal(rec)
+	if err := os.WriteFile(path, append(line, '\n'), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	w, err := wal.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer w.Close()
+
+	_, err = w.ReadAll()
+	if !errors.Is(err, wal.ErrUnsupportedVersion) {
+		t.Fatalf("expected ErrUnsupportedVersion, got %v", err)
+	}
+}
+
+// TestWALUnknownJSONFieldsRejected verifies that unexpected JSON fields trigger corruption rejection.
+func TestWALUnknownJSONFieldsRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/wal.log"
+
+	content := `{"version":1,"sequence":1,"operation":"SET","key":"k1","value":"v1","unexpected":"field","checksum":123}` + "\n"
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	w, err := wal.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer w.Close()
+
+	_, err = w.ReadAll()
+	if err == nil {
+		t.Fatal("expected error on unknown JSON fields, got nil")
+	}
+}
+
 // TestWALSequenceGapDetected verifies that non-contiguous sequences (e.g. 1 -> 3)
 // are detected as corruptions during replay.
 func TestWALSequenceGapDetected(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/wal.log"
 
-	// Sequence 1 followed by sequence 3 (gap!)
-	content := `{"sequence":1,"operation":"SET","key":"k1","value":"v1"}` + "\n" +
-		`{"sequence":3,"operation":"SET","key":"k2","value":"v2"}` + "\n"
+	rec1 := wal.Record{Version: wal.CurrentFormatVersion, Sequence: 1, Operation: wal.OperationSet, Key: "k1", Value: "v1"}
+	rec1.Checksum = rec1.ComputeChecksum()
+	line1, _ := json.Marshal(rec1)
 
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+	rec2 := wal.Record{Version: wal.CurrentFormatVersion, Sequence: 3, Operation: wal.OperationSet, Key: "k2", Value: "v2"}
+	rec2.Checksum = rec2.ComputeChecksum()
+	line2, _ := json.Marshal(rec2)
+
+	content := append(line1, '\n')
+	content = append(content, append(line2, '\n')...)
+
+	if err := os.WriteFile(path, content, 0644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	_, err := wal.Open(path)
+	w, err := wal.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer w.Close()
+
+	_, err = w.ReadAll()
 	if err == nil {
 		t.Fatal("expected error on sequence gap, got nil")
 	}
@@ -182,14 +296,28 @@ func TestWALSequenceDuplicateDetected(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/wal.log"
 
-	content := `{"sequence":1,"operation":"SET","key":"k1","value":"v1"}` + "\n" +
-		`{"sequence":1,"operation":"SET","key":"k2","value":"v2"}` + "\n"
+	rec1 := wal.Record{Version: wal.CurrentFormatVersion, Sequence: 1, Operation: wal.OperationSet, Key: "k1", Value: "v1"}
+	rec1.Checksum = rec1.ComputeChecksum()
+	line1, _ := json.Marshal(rec1)
 
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+	rec2 := wal.Record{Version: wal.CurrentFormatVersion, Sequence: 1, Operation: wal.OperationSet, Key: "k2", Value: "v2"}
+	rec2.Checksum = rec2.ComputeChecksum()
+	line2, _ := json.Marshal(rec2)
+
+	content := append(line1, '\n')
+	content = append(content, append(line2, '\n')...)
+
+	if err := os.WriteFile(path, content, 0644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	_, err := wal.Open(path)
+	w, err := wal.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer w.Close()
+
+	_, err = w.ReadAll()
 	if err == nil {
 		t.Fatal("expected error on duplicate sequence, got nil")
 	}
@@ -201,16 +329,48 @@ func TestWALCorruptRecordRejected(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/wal.log"
 
-	content := `{"sequence":1,"operation":"SET","key":"k1","value":"v1"}` + "\n" +
-		`{"corrupted": not-a-json}` + "\n"
-
+	content := `{"corrupted": not-a-json}` + "\n"
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	_, err := wal.Open(path)
+	w, err := wal.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer w.Close()
+
+	_, err = w.ReadAll()
 	if err == nil {
 		t.Fatal("expected error on corrupt record, got nil")
+	}
+}
+
+// TestWALBlankLineRejected verifies that blank records are rejected as corruption.
+func TestWALBlankLineRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/wal.log"
+
+	rec1 := wal.Record{Version: wal.CurrentFormatVersion, Sequence: 1, Operation: wal.OperationSet, Key: "k1", Value: "v1"}
+	rec1.Checksum = rec1.ComputeChecksum()
+	line1, _ := json.Marshal(rec1)
+
+	content := append(line1, '\n')
+	content = append(content, '\n') // blank record
+
+	if err := os.WriteFile(path, content, 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	w, err := wal.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer w.Close()
+
+	_, err = w.ReadAll()
+	if err == nil {
+		t.Fatal("expected error on blank line corruption, got nil")
 	}
 }
 
@@ -247,10 +407,10 @@ func TestWALConcurrentAppends(t *testing.T) {
 
 	wg.Wait()
 
-	// Replay and verify all records are present with contiguous sequences
-	records, err := w.Replay()
+	// Stream and verify all records are present with contiguous sequences
+	records, err := w.ReadAll()
 	if err != nil {
-		t.Fatalf("Replay after concurrent writes failed: %v", err)
+		t.Fatalf("ReadAll after concurrent writes failed: %v", err)
 	}
 
 	expectedTotal := numGoroutines * writesPerGoroutine
@@ -263,21 +423,8 @@ func TestWALConcurrentAppends(t *testing.T) {
 		if r.Sequence != expectedSeq {
 			t.Errorf("record[%d]: sequence = %d, want %d", i, r.Sequence, expectedSeq)
 		}
-	}
-}
-
-// TestWALBlankLineRejected verifies that blank records are rejected as corruption.
-func TestWALBlankLineRejected(t *testing.T) {
-	dir := t.TempDir()
-	path := dir + "/wal.log"
-
-	content := `{"sequence":1,"operation":"SET","key":"k1","value":"v1"}` + "\n\n"
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-
-	_, err := wal.Open(path)
-	if err == nil {
-		t.Fatal("expected Open to fail with blank line corruption, got nil")
+		if r.Checksum != r.ComputeChecksum() {
+			t.Errorf("record[%d]: checksum mismatch", i)
+		}
 	}
 }

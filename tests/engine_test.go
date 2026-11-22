@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -235,14 +236,29 @@ func TestWALUnknownOperationRejected(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/wal.log"
 
-	content := `{"sequence":1,"operation":"UNKNOWN_OP","key":"user:1","value":"Anshik"}` + "\n"
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+	rec := wal.Record{
+		Version:   wal.CurrentFormatVersion,
+		Sequence:  1,
+		Operation: "UNKNOWN_OP",
+		Key:       "user:1",
+		Value:     "Anshik",
+	}
+	rec.Checksum = rec.ComputeChecksum()
+	line, _ := json.Marshal(rec)
+
+	if err := os.WriteFile(path, append(line, '\n'), 0644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	_, err := wal.Open(path)
+	w, err := wal.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer w.Close()
+
+	err = w.Replay(nil)
 	if err == nil {
-		t.Fatal("expected Open to fail with unknown operation, got nil")
+		t.Fatal("expected Replay to fail with unknown operation, got nil")
 	}
 }
 
@@ -251,30 +267,137 @@ func TestWALRecordValidationEmptyKey(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/wal.log"
 
-	content := `{"sequence":1,"operation":"SET","key":"   ","value":"Anshik"}` + "\n"
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+	rec := wal.Record{
+		Version:   wal.CurrentFormatVersion,
+		Sequence:  1,
+		Operation: wal.OperationSet,
+		Key:       "   ",
+		Value:     "Anshik",
+	}
+	rec.Checksum = rec.ComputeChecksum()
+	line, _ := json.Marshal(rec)
+
+	if err := os.WriteFile(path, append(line, '\n'), 0644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	_, err := wal.Open(path)
+	w, err := wal.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer w.Close()
+
+	err = w.Replay(nil)
 	if err == nil {
-		t.Fatal("expected Open to fail with empty key, got nil")
+		t.Fatal("expected Replay to fail with empty key, got nil")
 	}
 }
 
-// TestWALRecordValidationEmptySetValue verifies that SET records with empty value fail validation.
-func TestWALRecordValidationEmptySetValue(t *testing.T) {
+// TestWALRecordValidationEmptyValueAllowed verifies that SET records with empty value are valid in the WAL.
+func TestWALRecordValidationEmptyValueAllowed(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/wal.log"
 
-	content := `{"sequence":1,"operation":"SET","key":"user:1","value":""}` + "\n"
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
+	w, err := wal.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer w.Close()
+
+	if err := w.Append(wal.Record{
+		Operation: wal.OperationSet,
+		Key:       "key:empty",
+		Value:     "",
+	}); err != nil {
+		t.Fatalf("Append with empty value failed: %v", err)
 	}
 
-	_, err := wal.Open(path)
-	if err == nil {
-		t.Fatal("expected Open to fail with empty value for SET, got nil")
+	records, err := w.ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll failed: %v", err)
+	}
+	if len(records) != 1 || records[0].Value != "" {
+		t.Fatalf("expected 1 record with empty value, got %+v", records)
+	}
+}
+
+// TestEngineApplyCommitted verifies Section 2's consensus boundary:
+// Applying committed commands with Raft log indexes and ensuring idempotency.
+func TestEngineApplyCommitted(t *testing.T) {
+	dir := t.TempDir()
+	walPath := dir + "/wal.log"
+
+	engine, err := storage.NewEngine(walPath)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	db := database.NewDatabase(engine)
+
+	// Apply SET command committed at Raft index 100, term 1
+	cmd1 := storage.CommittedCommand{
+		RaftIndex: 100,
+		RaftTerm:  1,
+		Operation: wal.OperationSet,
+		Key:       "cluster:leader",
+		Value:     "node-a",
+	}
+	if err := db.ApplyCommitted(cmd1); err != nil {
+		t.Fatalf("ApplyCommitted: %v", err)
+	}
+
+	val, err := db.Get("cluster:leader")
+	if err != nil || val != "node-a" {
+		t.Fatalf("Get: expected node-a, got %q (err: %v)", val, err)
+	}
+	if engine.LastAppliedIndex() != 100 {
+		t.Fatalf("expected lastAppliedIndex 100, got %d", engine.LastAppliedIndex())
+	}
+
+	// Idempotency: Re-applying duplicate Raft index 100 should be an ignored no-op
+	cmdDuplicate := storage.CommittedCommand{
+		RaftIndex: 100,
+		RaftTerm:  1,
+		Operation: wal.OperationSet,
+		Key:       "cluster:leader",
+		Value:     "node-b-should-be-ignored",
+	}
+	if err := db.ApplyCommitted(cmdDuplicate); err != nil {
+		t.Fatalf("ApplyCommitted duplicate: %v", err)
+	}
+	valAfterDuplicate, _ := db.Get("cluster:leader")
+	if valAfterDuplicate != "node-a" {
+		t.Fatalf("idempotency broken: duplicate index altered value to %q", valAfterDuplicate)
+	}
+
+	// Apply DELETE command committed at Raft index 101, term 1
+	cmdDelete := storage.CommittedCommand{
+		RaftIndex: 101,
+		RaftTerm:  1,
+		Operation: wal.OperationDelete,
+		Key:       "cluster:leader",
+	}
+	if err := db.ApplyCommitted(cmdDelete); err != nil {
+		t.Fatalf("ApplyCommitted delete: %v", err)
+	}
+
+	_, err = db.Get("cluster:leader")
+	if !errors.Is(err, database.ErrKeyNotFound) {
+		t.Fatalf("expected ErrKeyNotFound after committed delete, got %v", err)
+	}
+
+	db.Close()
+
+	// Reopen engine and ensure replayed WAL matches final state
+	engine2, err := storage.NewEngine(walPath)
+	if err != nil {
+		t.Fatalf("reopen NewEngine: %v", err)
+	}
+	defer engine2.Close()
+	db2 := database.NewDatabase(engine2)
+
+	_, err = db2.Get("cluster:leader")
+	if !errors.Is(err, database.ErrKeyNotFound) {
+		t.Fatalf("expected ErrKeyNotFound after replay, got %v", err)
 	}
 }
 

@@ -51,23 +51,27 @@ Before modifying the in-memory state (`Memtable`), ORBIT **first** writes the mu
 
 2. **Write-Ahead Log (`internal/wal/wal.go`, `record.go`)**:
    - Append-only log file format with JSON Lines (`.log`).
+   - **Schema Versioning & Integrity**: Versioned records (`version: 1`) equipped with **CRC32-IEEE checksums** to catch bitrot, unauthorized edits, and corrupted records.
    - **Committed Sequence Counter**: Mutex-protected committed sequence counter that advances strictly after a successful `fsync` to disk.
+   - **Streaming Recovery (O(1) Memory)**: Records stream one-by-one via `HandlerFunc`, eliminating massive historical memory spikes on startup and avoiding redundant scans.
    - **Failure Poisoning**: Any disk write or sync failure marks the log poisoned, halting further writes into an uncertain state.
    - **Strict Sequence Progression**: Enforces contiguous $1 \rightarrow 2 \rightarrow 3$ sequences during replay; sequence gaps or duplicates halt recovery.
-   - **Strict Record Validation**: Rejects unknown operations, empty keys, or malformed fields during replay.
+   - **Strict Record & Field Validation**: Rejects unknown operations, empty keys, unknown JSON fields, or malformed records.
    - **Strict Corruption Detection**: Rejects blank newline-delimited lines; truncates incomplete trailing writes left by crashes mid-write back to the clean record boundary.
    - Deletions recorded as tombstones (`OperationDelete`).
 
-3. **Storage Engine & Crash Recovery (`internal/storage/engine.go`)**:
+3. **Storage Engine & Raft Integration Boundary (`internal/storage/engine.go`)**:
+   - **Consensus Application Boundary**: Exposes `ApplyCommitted(CommittedCommand)` separating consensus concerns (**Raft log index**, **Raft term**) from local physical **WAL sequence numbers**.
+   - **Commit Idempotency**: Tracks `lastAppliedIndex` to ensure duplicate consensus entries are safe, idempotent no-ops.
    - Coordinates WAL and Memtable mutations atomically under `writeMu`.
-   - Self-healing startup: automatically replays the WAL on boot to reconstruct the Memtable before accepting traffic.
+   - Self-healing startup: single-pass streaming WAL replay on boot reconstructs the Memtable before accepting traffic.
    - Shutdown tracking: returns `ErrClosed` if mutations are attempted after shutdown.
 
 4. **Database Operations Layer (`internal/database/`)**:
-   - Exposes clean `Set`, `Get`, `Delete`, `Health` methods.
-   - Input validation (rejects blank keys/values).
+   - Exposes clean `Set`, `Get`, `Delete`, `ApplyCommitted`, `Health` methods.
+   - **Standard KV Semantics**: Empty values (`""`) are fully valid; rejects only blank keys.
    - **Lifecycle Coordination**: Uses `sync.RWMutex` so `Close()` waits for all active in-flight operations to complete before closing the storage engine.
-   - Sentinel errors (`ErrKeyNotFound`, `ErrEmptyKey`, `ErrEmptyValue`, `ErrClosed`).
+   - Sentinel errors (`ErrKeyNotFound`, `ErrEmptyKey`, `ErrClosed`).
    - Defines the `StorageEngine` interface, creating a decoupled contract for Section 2 (Raft consensus) integration.
 
 5. **HTTP REST API (`internal/api/`, `cmd/orbit/main.go`)**:
@@ -83,7 +87,7 @@ Before modifying the in-memory state (`Memtable`), ORBIT **first** writes the mu
 | Method | Endpoint | Request Body | Success Code | Description |
 |---|---|---|---|---|
 | `GET` | `/health` | _None_ | `200 OK` | Diagnostic health & readiness check |
-| `POST` | `/api/v1/kv` | `{"key": "user:1", "value": "Anshik"}` | `201 Created` | Store a key-value pair |
+| `POST` | `/api/v1/kv` | `{"key": "user:1", "value": "Anshik"}` | `201 Created` | Store a key-value pair (empty values permitted) |
 | `GET` | `/api/v1/kv/{key}` | _None_ | `200 OK` | Retrieve value for key |
 | `DELETE` | `/api/v1/kv/{key}` | _None_ | `200 OK` | Delete key (tombstone) |
 
@@ -92,7 +96,7 @@ Before modifying the in-memory state (`Memtable`), ORBIT **first** writes the mu
 ## Running and Verifying
 
 ### 1. Run All Automated Tests
-Includes unit tests, durability restart simulations, monotonic sequence checks, concurrency stress tests, and partial write crash tests with race detection:
+Includes unit tests, durability restart simulations, monotonic sequence checks, concurrency stress tests, Raft apply tests, and partial write crash tests with race detection:
 ```bash
 go test ./tests/... -v -race
 ```
@@ -140,6 +144,6 @@ curl -X DELETE http://localhost:2525/api/v1/kv/user:1
 #### Verify Crash Durability:
 1. Insert keys via `POST /api/v1/kv`.
 2. Stop ORBIT (`Ctrl + C`).
-3. Inspect `data/node-a/wal.log` to see the durable entries.
+3. Inspect `data/node-a/wal.log` to see the durable entries with checksums and schema versions.
 4. Restart ORBIT with `go run ./cmd/orbit`.
 5. Retrieve the keys via `GET /api/v1/kv/{key}` — data is recovered from the WAL!

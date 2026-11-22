@@ -110,15 +110,29 @@ func TestEmptyKeyRejected(t *testing.T) {
 	}
 }
 
-// TestEmptyValueRejected verifies that blank values are rejected with ErrEmptyValue.
-func TestEmptyValueRejected(t *testing.T) {
+// TestEmptyValueAllowed verifies that empty values are permitted under standard KV semantics.
+func TestEmptyValueAllowed(t *testing.T) {
 	db := newTestDB(t)
 
-	if err := db.Set("user:1", ""); !errors.Is(err, database.ErrEmptyValue) {
-		t.Errorf("Set with empty value: expected ErrEmptyValue, got %v", err)
+	if err := db.Set("key:empty", ""); err != nil {
+		t.Fatalf("Set with empty value failed: %v", err)
 	}
-	if err := db.Set("user:1", "   "); !errors.Is(err, database.ErrEmptyValue) {
-		t.Errorf("Set with whitespace value: expected ErrEmptyValue, got %v", err)
+
+	got, err := db.Get("key:empty")
+	if err != nil {
+		t.Fatalf("Get with empty value failed: %v", err)
+	}
+	if got != "" {
+		t.Errorf("expected empty string, got %q", got)
+	}
+
+	// Whitespace-only values are also valid raw values
+	if err := db.Set("key:spaces", "   "); err != nil {
+		t.Fatalf("Set with spaces failed: %v", err)
+	}
+	gotSpaces, err := db.Get("key:spaces")
+	if err != nil || gotSpaces != "   " {
+		t.Errorf("expected 3 spaces, got %q", gotSpaces)
 	}
 }
 

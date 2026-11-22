@@ -1,8 +1,13 @@
 package database
 
-import "strings"
+import (
+	"strings"
+
+	"orbit/internal/storage"
+)
 
 // Set stores key -> value in the database.
+// Under standard key-value semantics, empty string values are valid.
 func (db *Database) Set(key, value string) error {
 	db.closeMu.RLock()
 	defer db.closeMu.RUnlock()
@@ -12,9 +17,6 @@ func (db *Database) Set(key, value string) error {
 	}
 	if strings.TrimSpace(key) == "" {
 		return ErrEmptyKey
-	}
-	if strings.TrimSpace(value) == "" {
-		return ErrEmptyValue
 	}
 	return db.engine.Set(key, value)
 }
@@ -50,6 +52,20 @@ func (db *Database) Delete(key string) error {
 		return ErrEmptyKey
 	}
 	return db.engine.Delete(key)
+}
+
+// ApplyCommitted routes a consensus-replicated committed command to the storage engine.
+func (db *Database) ApplyCommitted(cmd storage.CommittedCommand) error {
+	db.closeMu.RLock()
+	defer db.closeMu.RUnlock()
+
+	if db.closed {
+		return ErrClosed
+	}
+	if strings.TrimSpace(cmd.Key) == "" {
+		return ErrEmptyKey
+	}
+	return db.engine.ApplyCommitted(cmd)
 }
 
 // Health checks whether the database is accepting operations and the
