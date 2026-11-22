@@ -3,6 +3,7 @@ package storage
 import (
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 
@@ -11,8 +12,10 @@ import (
 
 // Sentinel errors.
 var (
-	ErrClosed       = errors.New("storage: engine is closed")
-	ErrRaftIndexGap = errors.New("storage: raft index gap detected")
+	ErrClosed                  = errors.New("storage: engine is closed")
+	ErrRaftIndexGap            = errors.New("storage: raft index gap detected")
+	ErrRaftIndexOverflow       = errors.New("storage: raft index overflow")
+	ErrSnapshotIndexRegression = errors.New("storage: snapshot index must be greater than or equal to last applied index")
 )
 
 // CommittedCommand represents an entry that has reached majority consensus
@@ -44,6 +47,7 @@ type Engine struct {
 	wal              *wal.Log
 	writeMu          sync.Mutex  // serializes WAL append + Memtable update transaction
 	closed           atomic.Bool // tracks shutdown state
+	closeErr         error       // sticky error from Close()
 	lastAppliedIndex uint64      // highest applied Raft index for idempotency
 }
 
@@ -110,6 +114,11 @@ func (e *Engine) ApplyCommitted(cmd CommittedCommand) error {
 
 	// Consensus index validation for Raft commands
 	if cmd.RaftIndex != 0 {
+		// Overflow check: prevent lastAppliedIndex + 1 overflow
+		if e.lastAppliedIndex == math.MaxUint64 {
+			return ErrRaftIndexOverflow
+		}
+
 		// Idempotency: ignore duplicate or already-committed commands
 		if cmd.RaftIndex <= e.lastAppliedIndex {
 			return nil
@@ -172,10 +181,57 @@ func (e *Engine) LastAppliedIndex() uint64 {
 
 // SetLastAppliedIndex explicitly sets the applied Raft index baseline, e.g. when restoring
 // from a consensus snapshot in Section 2.
-func (e *Engine) SetLastAppliedIndex(index uint64) {
+// Rejects regressions where index < lastAppliedIndex to prevent state inconsistencies.
+func (e *Engine) SetLastAppliedIndex(index uint64) error {
 	e.writeMu.Lock()
 	defer e.writeMu.Unlock()
+
+	if e.closed.Load() {
+		return ErrClosed
+	}
+	if index < e.lastAppliedIndex {
+		return fmt.Errorf("%w: new index %d < current index %d", ErrSnapshotIndexRegression, index, e.lastAppliedIndex)
+	}
 	e.lastAppliedIndex = index
+	return nil
+}
+
+// SnapshotMetadata captures the consensus state of a snapshot.
+type SnapshotMetadata struct {
+	Index uint64 // highest Raft index included in the snapshot
+	Term  uint64 // term of the highest Raft index
+}
+
+// InstallSnapshot atomically installs a snapshot into the storage engine:
+//  1. Validates that the engine is open.
+//  2. Enforces monotonicity: rejects regressions where meta.Index < e.lastAppliedIndex.
+//  3. Atomically replaces the in-memory Memtable with the snapshot state.
+//  4. Advances lastAppliedIndex to meta.Index.
+func (e *Engine) InstallSnapshot(meta SnapshotMetadata, state map[string]string) error {
+	if e.closed.Load() {
+		return ErrClosed
+	}
+
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+
+	if e.closed.Load() {
+		return ErrClosed
+	}
+
+	if meta.Index < e.lastAppliedIndex {
+		return fmt.Errorf("%w: snapshot index %d < current applied index %d",
+			ErrSnapshotIndexRegression, meta.Index, e.lastAppliedIndex)
+	}
+
+	newMem := NewMemtable()
+	for k, v := range state {
+		newMem.Set(k, v)
+	}
+
+	e.memtable = newMem
+	e.lastAppliedIndex = meta.Index
+	return nil
 }
 
 // Set stores key -> value in the database.
@@ -215,17 +271,19 @@ func (e *Engine) Health() error {
 }
 
 // Close safely flushes the WAL, closes file handles, and releases the exclusive process lock.
-// Idempotent: multiple calls return nil.
+// Retains sticky error: if close fails, subsequent invocations return the same error.
 func (e *Engine) Close() error {
 	e.writeMu.Lock()
 	defer e.writeMu.Unlock()
 
-	if e.closed.Swap(true) {
-		return nil
+	if e.closed.Load() {
+		return e.closeErr
 	}
+	e.closed.Store(true)
 
 	if err := e.wal.Close(); err != nil {
-		return fmt.Errorf("storage: close wal: %w", err)
+		e.closeErr = fmt.Errorf("storage: close wal: %w", err)
+		return e.closeErr
 	}
 	return nil
 }

@@ -23,8 +23,8 @@ const (
 func main() {
 	fmt.Println("ORBIT Database Starting...")
 
-	// Ensure the data directory exists.
-	if err := os.MkdirAll("data/node-a", 0755); err != nil {
+	// Ensure the data directory exists with restrictive 0700 permissions.
+	if err := os.MkdirAll("data/node-a", 0700); err != nil {
 		log.Fatalf("failed to create data directory: %v", err)
 	}
 
@@ -37,7 +37,10 @@ func main() {
 	}
 
 	// --- Wrap engine in the database layer ---
-	db := database.NewDatabase(engine)
+	db, err := database.NewDatabase(engine)
+	if err != nil {
+		log.Fatalf("failed to initialize database layer: %v", err)
+	}
 
 	// --- Wire up HTTP routes ---
 	mux := http.NewServeMux()

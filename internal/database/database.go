@@ -1,6 +1,7 @@
 package database
 
 import (
+	"reflect"
 	"sync"
 
 	"orbit/internal/storage"
@@ -32,9 +33,22 @@ type Database struct {
 	closeErr error // records sticky error if engine.Close() fails
 }
 
+// isNilEngine checks whether an engine interface is nil or carries a typed nil pointer.
+func isNilEngine(engine StorageEngine) bool {
+	if engine == nil {
+		return true
+	}
+	val := reflect.ValueOf(engine)
+	return val.Kind() == reflect.Ptr && val.IsNil()
+}
+
 // NewDatabase wraps a StorageEngine in a Database.
-func NewDatabase(engine StorageEngine) *Database {
-	return &Database{engine: engine}
+// Enforces the constructor contract: rejects nil engines and typed nil pointers with ErrNilEngine.
+func NewDatabase(engine StorageEngine) (*Database, error) {
+	if isNilEngine(engine) {
+		return nil, ErrNilEngine
+	}
+	return &Database{engine: engine}, nil
 }
 
 // Close gracefully shuts down the database:

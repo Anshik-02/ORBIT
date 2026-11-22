@@ -50,18 +50,20 @@ Before modifying the in-memory state (`Memtable`), ORBIT **first** writes the mu
    - O(1) average lookup and deletion performance.
 
 2. **Write-Ahead Log (`internal/wal/wal.go`, `record.go`, `lock_*.go`)**:
-   - **Exclusive Process-Level Lock**: Uses OS-level file locking (`<walPath>.lock` via `LockFileEx` on Windows, `flock` on Unix) preventing multiple processes from concurrently mutating the same data directory.
+   - **Exclusive Process-Level Lock**: Uses OS-level file locking (`<walPath>.lock` via `LockFileEx` on Windows, `flock` on Unix) preventing multiple processes from concurrently mutating the same data directory. Verified across separate operating system processes and through abnormal process terminations.
+   - **Restrictive Security Permissions**: Directories default to `0700` and files (`wal.log`, `wal.log.lock`) to `0600` (owner read/write only).
    - **Schema Versioning & Length-Prefixed Checksums**: Versioned records (`version: 1`) with unambiguous length-prefixed **CRC32-IEEE checksums** eliminating field boundary ambiguity.
    - **Committed Sequence Counter & Overflow Check**: Mutex-protected counter that advances strictly after a successful `fsync`, protected against `MaxUint64` overflow.
    - **Streaming Recovery (O(1) Memory)**: Records stream one-by-one via `HandlerFunc`, eliminating startup memory spikes and redundant scans.
-   - **Failure Poisoning**: Any disk write or sync failure marks the log poisoned, halting further writes into an uncertain state.
+   - **Failure Poisoning & Sticky Close Errors**: Any disk write or sync failure marks the log poisoned, halting further writes into an uncertain state. All layers (WAL, Engine, Database) preserve sticky close errors.
    - **Strict Invariants**: Enforces contiguous $1 \rightarrow 2 \rightarrow 3$ sequences, rejects trailing JSON tokens on record lines, and rejects blank lines.
    - **Truncation of Incomplete Writes**: Truncates partial trailing writes from crash mid-write back to the clean record boundary.
    - Deletions recorded as tombstones (`OperationDelete`).
 
 3. **Storage Engine & Raft Integration Boundary (`internal/storage/engine.go`)**:
    - **Consensus Application Boundary**: Exposes `ApplyCommitted(CommittedCommand)` separating consensus metadata (**Raft log index**, **Raft term**) from local physical **WAL sequence numbers**.
-   - **Durable Progress & Gap Enforcement**: Persists `RaftIndex` and `RaftTerm` into WAL records so `lastAppliedIndex` survives restarts. Enforces strictly contiguous sequential application (`lastAppliedIndex + 1`), rejecting index gaps (`ErrRaftIndexGap`).
+   - **Durable Progress, Gap Enforcement & Overflow Protection**: Persists `RaftIndex` and `RaftTerm` into WAL records so `lastAppliedIndex` survives restarts. Enforces strictly contiguous sequential application (`lastAppliedIndex + 1`), rejecting index gaps (`ErrRaftIndexGap`) and guarding against `MaxUint64` index overflow (`ErrRaftIndexOverflow`).
+   - **Atomic Snapshot Installation Baseline**: Implements `InstallSnapshot(SnapshotMetadata, map[string]string)` with regression rejection (`ErrSnapshotIndexRegression`) ensuring atomic state replacement when catching up lagging cluster nodes.
    - **Commit Idempotency**: Duplicate consensus entries are safe, idempotent no-ops.
    - Coordinates WAL and Memtable mutations atomically under `writeMu`.
    - Self-healing startup: single-pass streaming WAL replay on boot reconstructs the Memtable and restores consensus progress.
@@ -69,10 +71,11 @@ Before modifying the in-memory state (`Memtable`), ORBIT **first** writes the mu
 
 4. **Database Operations Layer (`internal/database/`)**:
    - Exposes clean `Set`, `Get`, `Delete`, `ApplyCommitted`, `Health` methods.
+   - **Constructor Contract Enforcement**: `NewDatabase` strictly validates against `nil` and typed nil pointer engines (`ErrNilEngine`).
    - **Standard KV Semantics**: Empty values (`""`) are fully valid; rejects only blank keys.
    - **Lifecycle Coordination**: Uses `sync.RWMutex` so `Close()` waits for all active in-flight operations to complete before closing the storage engine.
    - **Sticky Shutdown Errors**: Preserves close failures across retries.
-   - Sentinel errors (`ErrKeyNotFound`, `ErrEmptyKey`, `ErrClosed`).
+   - Sentinel errors (`ErrKeyNotFound`, `ErrEmptyKey`, `ErrClosed`, `ErrNilEngine`).
    - Defines the `StorageEngine` interface, creating a decoupled contract for Section 2 (Raft consensus) integration.
 
 5. **HTTP REST API (`internal/api/`, `cmd/orbit/main.go`)**:

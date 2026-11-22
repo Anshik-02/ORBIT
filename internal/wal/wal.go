@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -44,16 +45,26 @@ type Log struct {
 	sequence uint64     // highest committed sequence number on disk
 	mu       sync.Mutex // protects appends, replaying, poisoning, and close
 	closed   bool
+	closeErr error // sticky error from Close()
 	err      error // sticky failure; once set, WAL is poisoned and rejects writes
 }
 
 // Open opens (or creates) the WAL file at the given path.
 // Acquires an exclusive, process-level file lock (<path>.lock) to prevent
 // multiple ORBIT nodes or processes from interfering with the same data directory.
+// Restricts file permissions to 0600 (owner-only) and directory to 0700.
 func Open(path string) (*Log, error) {
-	// 1. Acquire process-level exclusive lock on <path>.lock
+	// Ensure parent directory exists with restrictive 0700 permissions
+	dir := filepath.Dir(path)
+	if dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return nil, fmt.Errorf("wal: create directory %q: %w", dir, err)
+		}
+	}
+
+	// 1. Acquire process-level exclusive lock on <path>.lock (0600)
 	lockPath := path + ".lock"
-	lFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0644)
+	lFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("wal: open lock file %q: %w", lockPath, err)
 	}
@@ -63,8 +74,8 @@ func Open(path string) (*Log, error) {
 		return nil, err
 	}
 
-	// 2. Open WAL file in read/write mode
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
+	// 2. Open WAL file in read/write mode with 0600 permissions
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		unlockFile(lFile)
 		lFile.Close()
@@ -292,21 +303,25 @@ func (l *Log) Health() error {
 }
 
 // Close flushes remaining buffers, closes the WAL file, and releases the process lock.
+// Retains sticky error: if close fails, subsequent invocations return the same error.
 func (l *Log) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	if l.closed {
-		return nil
+		return l.closeErr
 	}
 	l.closed = true
 
 	var flushErr error
-	if l.err == nil {
+	if l.err == nil && l.writer != nil {
 		flushErr = l.writer.Flush()
 	}
 
-	closeErr := l.file.Close()
+	var closeErr error
+	if l.file != nil {
+		closeErr = l.file.Close()
+	}
 
 	var unlockErr error
 	if l.lockFile != nil {
@@ -315,13 +330,16 @@ func (l *Log) Close() error {
 	}
 
 	if flushErr != nil {
-		return fmt.Errorf("wal: flush on close: %w", flushErr)
+		l.closeErr = fmt.Errorf("wal: flush on close: %w", flushErr)
+		return l.closeErr
 	}
 	if closeErr != nil {
-		return fmt.Errorf("wal: close file: %w", closeErr)
+		l.closeErr = fmt.Errorf("wal: close file: %w", closeErr)
+		return l.closeErr
 	}
 	if unlockErr != nil {
-		return fmt.Errorf("wal: unlock on close: %w", unlockErr)
+		l.closeErr = fmt.Errorf("wal: unlock on close: %w", unlockErr)
+		return l.closeErr
 	}
 	return nil
 }

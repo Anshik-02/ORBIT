@@ -20,8 +20,16 @@ func newTestDB(t *testing.T) *database.Database {
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
-	t.Cleanup(func() { engine.Close() })
-	return database.NewDatabase(engine)
+	t.Cleanup(func() {
+		if closeErr := engine.Close(); closeErr != nil {
+			t.Errorf("cleanup close engine: %v", closeErr)
+		}
+	})
+	db, err := database.NewDatabase(engine)
+	if err != nil {
+		t.Fatalf("NewDatabase: %v", err)
+	}
+	return db
 }
 
 // TestSetAndGet verifies the happy path: store a value, retrieve it.
@@ -55,8 +63,12 @@ func TestGetMissingKey(t *testing.T) {
 func TestOverwriteKey(t *testing.T) {
 	db := newTestDB(t)
 
-	db.Set("user:1", "Anshik")
-	db.Set("user:1", "Anshika") // overwrite
+	if err := db.Set("user:1", "Anshik"); err != nil {
+		t.Fatalf("Set first: %v", err)
+	}
+	if err := db.Set("user:1", "Anshika"); err != nil { // overwrite
+		t.Fatalf("Set overwrite: %v", err)
+	}
 
 	got, err := db.Get("user:1")
 	if err != nil {
@@ -71,7 +83,9 @@ func TestOverwriteKey(t *testing.T) {
 func TestDelete(t *testing.T) {
 	db := newTestDB(t)
 
-	db.Set("user:2", "Rahul")
+	if err := db.Set("user:2", "Rahul"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
 
 	if err := db.Delete("user:2"); err != nil {
 		t.Fatalf("Delete: %v", err)
@@ -194,10 +208,29 @@ func TestConcurrentDatabaseWritesAndReads(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < opsPerWriter*2; i++ {
 				key := fmt.Sprintf("key-%d", i%5)
-				_, _ = db.Get(key)
+				_, err := db.Get(key)
+				if err != nil && !errors.Is(err, database.ErrKeyNotFound) {
+					t.Errorf("Get error during concurrent reads: %v", err)
+				}
 			}
 		}()
 	}
 
 	wg.Wait()
+}
+
+// TestNewDatabaseNilEngineRejected verifies constructor contract enforcement.
+func TestNewDatabaseNilEngineRejected(t *testing.T) {
+	// Raw nil
+	db, err := database.NewDatabase(nil)
+	if !errors.Is(err, database.ErrNilEngine) {
+		t.Fatalf("expected ErrNilEngine for raw nil, got db=%v, err=%v", db, err)
+	}
+
+	// Typed nil pointer
+	var nilEngine *storage.Engine = nil
+	db2, err := database.NewDatabase(nilEngine)
+	if !errors.Is(err, database.ErrNilEngine) {
+		t.Fatalf("expected ErrNilEngine for typed nil pointer, got db=%v, err=%v", db2, err)
+	}
 }

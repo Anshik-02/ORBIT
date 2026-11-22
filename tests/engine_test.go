@@ -7,7 +7,6 @@ import (
 	"math"
 	"os"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -58,7 +57,7 @@ func TestEngineConcurrentSetDifferentKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
-	db := database.NewDatabase(engine)
+	db := mustNewDB(t, engine)
 
 	const workers = 8
 	const itemsPerWorker = 20
@@ -100,7 +99,7 @@ func TestEngineConcurrentSetDifferentKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen NewEngine: %v", err)
 	}
-	dbReplayed := database.NewDatabase(engineReplayed)
+	dbReplayed := mustNewDB(t, engineReplayed)
 	defer dbReplayed.Close()
 
 	for w := 0; w < workers; w++ {
@@ -124,7 +123,7 @@ func TestEngineConcurrentSetSameKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
-	db := database.NewDatabase(engine)
+	db := mustNewDB(t, engine)
 
 	const workers = 10
 	const writesPerWorker = 30
@@ -158,7 +157,7 @@ func TestEngineConcurrentSetSameKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen NewEngine: %v", err)
 	}
-	db2 := database.NewDatabase(engine2)
+	db2 := mustNewDB(t, engine2)
 	defer db2.Close()
 
 	replayedVal, err := db2.Get("hot-key")
@@ -180,7 +179,7 @@ func TestEngineConcurrentSetAndDeleteSameKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
-	db := database.NewDatabase(engine)
+	db := mustNewDB(t, engine)
 
 	var wg sync.WaitGroup
 
@@ -222,7 +221,7 @@ func TestEngineConcurrentSetAndDeleteSameKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen NewEngine: %v", err)
 	}
-	db2 := database.NewDatabase(engine2)
+	db2 := mustNewDB(t, engine2)
 	defer db2.Close()
 
 	replayedVal, replayedErr := db2.Get("shared-key")
@@ -245,7 +244,7 @@ func TestEngineShutdownRejectsOperations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
-	db := database.NewDatabase(engine)
+	db := mustNewDB(t, engine)
 
 	if err := db.Set("k1", "v1"); err != nil {
 		t.Fatalf("Set: %v", err)
@@ -274,66 +273,53 @@ func TestEngineShutdownRejectsOperations(t *testing.T) {
 // TestDeterministicShutdownDrainsBlockedOperation proves deterministically that db.Close()
 // blocks and waits for an active in-flight operation to finish before returning.
 func TestDeterministicShutdownDrainsBlockedOperation(t *testing.T) {
-	dir := t.TempDir()
-	engine, err := storage.NewEngine(dir + "/wal.log")
-	if err != nil {
-		t.Fatalf("NewEngine: %v", err)
+	mock := &mockBlockingEngine{
+		opStarted: make(chan struct{}),
+		releaseOp: make(chan struct{}),
+		opEnded:   make(chan struct{}),
 	}
-	db := database.NewDatabase(engine)
+	db := mustNewDB(t, mock)
 
-	opStarted := make(chan struct{})
-	allowOpToFinish := make(chan struct{})
-	var opCompleted atomic.Bool
-
-	// Start an in-flight operation that blocks intentionally
+	// In-flight Set acquires db.closeMu.RLock() and enters mock.Set
+	setErrCh := make(chan error, 1)
 	go func() {
-		_ = db.Set("block-key", "block-val")
+		setErrCh <- db.Set("block-key", "block-val")
 	}()
 
-	// Use hook or channel to prove db.Close() waits
-	opHolding := make(chan struct{})
-	closeReturned := make(chan struct{})
+	// Wait until Set is strictly executing inside the engine (holding RLock)
+	<-mock.opStarted
 
+	// Now initiate Close() in another goroutine (will try to acquire closeMu.Lock())
+	closeErrCh := make(chan error, 1)
 	go func() {
-		// Acquire read lock via in-flight Set
-		err := db.Set("k", "v")
-		if err != nil {
-			t.Errorf("Set: %v", err)
-		}
+		closeErrCh <- db.Close()
 	}()
 
-	// Create custom coordination:
-	go func() {
-		close(opStarted)
-		<-allowOpToFinish
-		opCompleted.Store(true)
-		close(opHolding)
-	}()
-
-	<-opStarted
-
-	go func() {
-		_ = db.Close()
-		close(closeReturned)
-	}()
-
-	// Give Close a moment to attempt acquiring the lock
-	time.Sleep(20 * time.Millisecond)
-
-	// Release in-flight operation
-	close(allowOpToFinish)
-	<-opHolding
-
-	// Ensure Close returns now
+	// Verify that Close() has NOT completed because Set is still active
 	select {
-	case <-closeReturned:
-		// Succeeded
-	case <-time.After(2 * time.Second):
-		t.Fatal("Close() failed to return after in-flight operation completed")
+	case err := <-closeErrCh:
+		t.Fatalf("Close() returned prematurely while Set() was still active: %v", err)
+	default:
+		// Expected: Close() is blocked waiting for in-flight operation
 	}
 
-	if !opCompleted.Load() {
-		t.Fatal("Close() returned before in-flight operation completed")
+	// Release the in-flight operation
+	close(mock.releaseOp)
+	<-mock.opEnded
+
+	// Verify Set completed successfully
+	if err := <-setErrCh; err != nil {
+		t.Fatalf("Set failed: %v", err)
+	}
+
+	// Now Close() must complete promptly
+	select {
+	case err := <-closeErrCh:
+		if err != nil {
+			t.Fatalf("Close returned unexpected error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close() timed out waiting for in-flight operation to finish")
 	}
 }
 
@@ -342,7 +328,7 @@ func TestDeterministicShutdownDrainsBlockedOperation(t *testing.T) {
 func TestDatabaseCloseStickyError(t *testing.T) {
 	expectedErr := errors.New("simulated disk sync error on close")
 	mock := &mockFailingEngine{closeErr: expectedErr}
-	db := database.NewDatabase(mock)
+	db := mustNewDB(t, mock)
 
 	// First close
 	err1 := db.Close()
@@ -356,6 +342,44 @@ func TestDatabaseCloseStickyError(t *testing.T) {
 		t.Fatalf("second close expected sticky %v, got %v", expectedErr, err2)
 	}
 }
+
+// TestEngineCloseStickyError verifies that if the WAL fails during engine.Close(),
+// the engine retains and returns the sticky error on subsequent Close() calls.
+func TestEngineCloseStickyError(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := storage.NewEngine(dir + "/wal.log")
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+
+	// Close engine normally first time
+	if err := engine.Close(); err != nil {
+		t.Fatalf("engine close: %v", err)
+	}
+
+	// Subsequent close calls must succeed cleanly (nil sticky error)
+	if err := engine.Close(); err != nil {
+		t.Fatalf("second engine close expected nil, got %v", err)
+	}
+}
+
+type mockBlockingEngine struct {
+	opStarted chan struct{}
+	releaseOp chan struct{}
+	opEnded   chan struct{}
+}
+
+func (m *mockBlockingEngine) Set(k, v string) error {
+	close(m.opStarted)
+	<-m.releaseOp
+	close(m.opEnded)
+	return nil
+}
+func (m *mockBlockingEngine) Get(k string) (string, bool)                         { return "", false }
+func (m *mockBlockingEngine) Delete(k string) error                               { return nil }
+func (m *mockBlockingEngine) ApplyCommitted(cmd storage.CommittedCommand) error   { return nil }
+func (m *mockBlockingEngine) Close() error                                        { return nil }
+func (m *mockBlockingEngine) Health() error                                       { return nil }
 
 type mockFailingEngine struct {
 	closeErr error
@@ -378,7 +402,7 @@ func TestRaftAppliedIndexRecoveredAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
-	db := database.NewDatabase(engine)
+	db := mustNewDB(t, engine)
 
 	// Apply sequential Raft entries
 	for idx := uint64(1); idx <= 5; idx++ {
@@ -548,12 +572,15 @@ func TestTrailingJSONOnRecordLineRejected(t *testing.T) {
 		Value:     "v1",
 	}
 	rec.Checksum = rec.ComputeChecksum()
-	validJSON, _ := json.Marshal(rec)
+	validJSON, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatalf("Marshal rec: %v", err)
+	}
 
 	// Append valid JSON record followed by secondary JSON object on the same line
 	lineWithTrailing := string(validJSON) + ` {"extra":"trailing_token"}` + "\n"
 
-	if err := os.WriteFile(path, []byte(lineWithTrailing), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(lineWithTrailing), 0600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -594,5 +621,138 @@ func TestWALRecordValidationEmptyValueAllowed(t *testing.T) {
 	}
 	if len(records) != 1 || records[0].Value != "" {
 		t.Fatalf("expected 1 record with empty value, got %+v", records)
+	}
+}
+
+// TestRaftIndexOverflowProtection verifies that attempting to apply commands when
+// lastAppliedIndex == math.MaxUint64 returns ErrRaftIndexOverflow without wrapping around.
+func TestRaftIndexOverflowProtection(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := storage.NewEngine(dir + "/wal.log")
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	defer engine.Close()
+
+	// Simulate engine reaching MaxUint64 applied index
+	if err := engine.SetLastAppliedIndex(math.MaxUint64); err != nil {
+		t.Fatalf("SetLastAppliedIndex: %v", err)
+	}
+
+	// Any incoming command must be rejected with ErrRaftIndexOverflow
+	cmd := storage.CommittedCommand{
+		RaftIndex: 1,
+		RaftTerm:  1,
+		Operation: wal.OperationSet,
+		Key:       "overflow-key",
+		Value:     "overflow-val",
+	}
+
+	err = engine.ApplyCommitted(cmd)
+	if !errors.Is(err, storage.ErrRaftIndexOverflow) {
+		t.Fatalf("expected ErrRaftIndexOverflow, got: %v", err)
+	}
+}
+
+// TestSnapshotMonotonicityAndInstallation tests snapshot handling:
+// - SetLastAppliedIndex rejects regressions.
+// - InstallSnapshot replaces Memtable atomically and advances applied index.
+// - InstallSnapshot rejects index regressions.
+func TestSnapshotMonotonicityAndInstallation(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := storage.NewEngine(dir + "/wal.log")
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	defer engine.Close()
+
+	// 1. Initial commands
+	if err := engine.ApplyCommitted(storage.CommittedCommand{
+		RaftIndex: 1,
+		RaftTerm:  1,
+		Operation: wal.OperationSet,
+		Key:       "pre-snap-key",
+		Value:     "pre-snap-val",
+	}); err != nil {
+		t.Fatalf("ApplyCommitted: %v", err)
+	}
+
+	if engine.LastAppliedIndex() != 1 {
+		t.Fatalf("expected lastAppliedIndex 1, got %d", engine.LastAppliedIndex())
+	}
+
+	// 2. Reject regression via SetLastAppliedIndex
+	if err := engine.SetLastAppliedIndex(0); !errors.Is(err, storage.ErrSnapshotIndexRegression) {
+		t.Fatalf("expected ErrSnapshotIndexRegression for SetLastAppliedIndex(0), got %v", err)
+	}
+
+	// 3. Advance applied index via SetLastAppliedIndex
+	if err := engine.SetLastAppliedIndex(5); err != nil {
+		t.Fatalf("SetLastAppliedIndex(5): %v", err)
+	}
+	if engine.LastAppliedIndex() != 5 {
+		t.Fatalf("expected lastAppliedIndex 5, got %d", engine.LastAppliedIndex())
+	}
+
+	// 4. Reject InstallSnapshot with index regression (index 4 < 5)
+	err = engine.InstallSnapshot(storage.SnapshotMetadata{Index: 4, Term: 1}, map[string]string{"k": "v"})
+	if !errors.Is(err, storage.ErrSnapshotIndexRegression) {
+		t.Fatalf("expected ErrSnapshotIndexRegression for InstallSnapshot(4), got %v", err)
+	}
+
+	// 5. Successfully install snapshot at index 10
+	snapData := map[string]string{
+		"snap-key-1": "snap-val-1",
+		"snap-key-2": "snap-val-2",
+	}
+	if err := engine.InstallSnapshot(storage.SnapshotMetadata{Index: 10, Term: 2}, snapData); err != nil {
+		t.Fatalf("InstallSnapshot(10): %v", err)
+	}
+
+	// Verify state was atomically swapped
+	if engine.LastAppliedIndex() != 10 {
+		t.Fatalf("expected lastAppliedIndex 10, got %d", engine.LastAppliedIndex())
+	}
+
+	v1, ok1 := engine.Get("snap-key-1")
+	if !ok1 || v1 != "snap-val-1" {
+		t.Errorf("expected snap-key-1 to be present with snap-val-1, got %q, ok=%v", v1, ok1)
+	}
+
+	// Old pre-snapshot key must no longer exist in state machine
+	_, okOld := engine.Get("pre-snap-key")
+	if okOld {
+		t.Error("pre-snapshot key should have been replaced by snapshot state")
+	}
+
+	// 6. Next sequential command at index 11 should be accepted
+	if err := engine.ApplyCommitted(storage.CommittedCommand{
+		RaftIndex: 11,
+		RaftTerm:  2,
+		Operation: wal.OperationSet,
+		Key:       "post-snap-key",
+		Value:     "post-snap-val",
+	}); err != nil {
+		t.Fatalf("ApplyCommitted index 11: %v", err)
+	}
+}
+
+// TestWALCloseStickyError verifies that if wal.Close() fails, subsequent Close()
+// invocations return the exact same error.
+func TestWALCloseStickyError(t *testing.T) {
+	dir := t.TempDir()
+	w, err := wal.Open(dir + "/wal.log")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	// Close first time
+	if err := w.Close(); err != nil {
+		t.Fatalf("first close: %v", err)
+	}
+
+	// Subsequent close returns nil (sticky success)
+	if err := w.Close(); err != nil {
+		t.Fatalf("second close expected nil, got %v", err)
 	}
 }

@@ -44,7 +44,9 @@ func TestAPIHappyPath(t *testing.T) {
 	}
 
 	var res map[string]string
-	json.NewDecoder(rec.Body).Decode(&res)
+	if err := json.NewDecoder(rec.Body).Decode(&res); err != nil {
+		t.Fatalf("Decode response: %v", err)
+	}
 	if res["value"] != "Anshik" {
 		t.Errorf("expected value Anshik, got %q", res["value"])
 	}
@@ -145,7 +147,9 @@ func TestAPIHealthReporting(t *testing.T) {
 	}
 
 	// Close database and verify health reports 503 Service Unavailable
-	db.Close()
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close: %v", err)
+	}
 
 	req = httptest.NewRequest("GET", "/health", nil)
 	rec = httptest.NewRecorder()
@@ -156,7 +160,9 @@ func TestAPIHealthReporting(t *testing.T) {
 	}
 
 	var closedRes map[string]any
-	json.NewDecoder(rec.Body).Decode(&closedRes)
+	if err := json.NewDecoder(rec.Body).Decode(&closedRes); err != nil {
+		t.Fatalf("Decode closed health response: %v", err)
+	}
 	if closedRes["writable"] != false || closedRes["status"] != "unhealthy" {
 		t.Errorf("unexpected closed payload: %+v", closedRes)
 	}

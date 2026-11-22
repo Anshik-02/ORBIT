@@ -8,6 +8,15 @@ import (
 	"orbit/internal/storage"
 )
 
+func mustNewDB(t *testing.T, engine database.StorageEngine) *database.Database {
+	t.Helper()
+	db, err := database.NewDatabase(engine)
+	if err != nil {
+		t.Fatalf("NewDatabase: %v", err)
+	}
+	return db
+}
+
 // TestRecoveryAfterRestart is the core durability test.
 //
 // It simulates the full restart lifecycle:
@@ -25,7 +34,7 @@ func TestRecoveryAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first engine open: %v", err)
 	}
-	db1 := database.NewDatabase(engine1)
+	db1 := mustNewDB(t, engine1)
 
 	if err := db1.Set("user:1", "Anshik"); err != nil {
 		t.Fatalf("Set user:1: %v", err)
@@ -49,8 +58,12 @@ func TestRecoveryAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second engine open: %v", err)
 	}
-	db2 := database.NewDatabase(engine2)
-	defer db2.Close()
+	db2 := mustNewDB(t, engine2)
+	defer func() {
+		if err := db2.Close(); err != nil {
+			t.Errorf("db2.Close: %v", err)
+		}
+	}()
 
 	// user:1 and user:3 must survive.
 	got1, err := db2.Get("user:1")
@@ -80,7 +93,7 @@ func TestRecoveryOverwrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	db1 := database.NewDatabase(engine1)
+	db1 := mustNewDB(t, engine1)
 
 	// Write the same key 5 times.
 	for _, v := range []string{"v1", "v2", "v3", "v4", "v5"} {
@@ -97,8 +110,12 @@ func TestRecoveryOverwrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	db2 := database.NewDatabase(engine2)
-	defer db2.Close()
+	db2 := mustNewDB(t, engine2)
+	defer func() {
+		if err := db2.Close(); err != nil {
+			t.Errorf("db2.Close: %v", err)
+		}
+	}()
 
 	got, err := db2.Get("config:mode")
 	if err != nil {
@@ -117,8 +134,12 @@ func TestRecoveryEmptyWAL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewEngine on fresh path: %v", err)
 	}
-	db := database.NewDatabase(engine)
-	defer db.Close()
+	db := mustNewDB(t, engine)
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("db.Close: %v", err)
+		}
+	}()
 
 	_, err = db.Get("anything")
 	if !errors.Is(err, database.ErrKeyNotFound) {
@@ -137,7 +158,7 @@ func TestRecoverySequencesContinueAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("engine1: %v", err)
 	}
-	db1 := database.NewDatabase(engine1)
+	db1 := mustNewDB(t, engine1)
 	if err := db1.Set("a", "1"); err != nil {
 		t.Fatalf("Set a: %v", err)
 	}
@@ -156,7 +177,7 @@ func TestRecoverySequencesContinueAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	db2 := database.NewDatabase(engine2)
+	db2 := mustNewDB(t, engine2)
 	if err := db2.Set("d", "4"); err != nil {
 		t.Fatalf("Set d: %v", err)
 	}
@@ -169,7 +190,7 @@ func TestRecoverySequencesContinueAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("third open: %v", err)
 	}
-	db3 := database.NewDatabase(engine3)
+	db3 := mustNewDB(t, engine3)
 	got, err := db3.Get("d")
 	if err != nil || got != "4" {
 		t.Errorf("key d after restart: expected 4, got %q (err: %v)", got, err)

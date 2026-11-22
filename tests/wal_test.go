@@ -137,12 +137,15 @@ func TestWALPartialWrite(t *testing.T) {
 		Value:     "Anshik",
 	}
 	rec1.Checksum = rec1.ComputeChecksum()
-	line1, _ := json.Marshal(rec1)
+	line1, err := json.Marshal(rec1)
+	if err != nil {
+		t.Fatalf("Marshal rec1: %v", err)
+	}
 	validLine := string(line1) + "\n"
 
 	truncatedLine := `{"version":1,"sequence":2,"operation":"SET","key":"use`
 
-	if err := os.WriteFile(path, []byte(validLine+truncatedLine), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(validLine+truncatedLine), 0600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -188,8 +191,11 @@ func TestWALChecksumMismatchDetected(t *testing.T) {
 	}
 	rec.Checksum = 9999999 // deliberate incorrect checksum
 
-	line, _ := json.Marshal(rec)
-	if err := os.WriteFile(path, append(line, '\n'), 0644); err != nil {
+	line, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if err := os.WriteFile(path, append(line, '\n'), 0600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -219,8 +225,11 @@ func TestWALUnsupportedVersionRejected(t *testing.T) {
 	}
 	rec.Checksum = rec.ComputeChecksum()
 
-	line, _ := json.Marshal(rec)
-	if err := os.WriteFile(path, append(line, '\n'), 0644); err != nil {
+	line, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if err := os.WriteFile(path, append(line, '\n'), 0600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -242,7 +251,7 @@ func TestWALUnknownJSONFieldsRejected(t *testing.T) {
 	path := dir + "/wal.log"
 
 	content := `{"version":1,"sequence":1,"operation":"SET","key":"k1","value":"v1","unexpected":"field","checksum":123}` + "\n"
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -266,16 +275,22 @@ func TestWALSequenceGapDetected(t *testing.T) {
 
 	rec1 := wal.Record{Version: wal.CurrentFormatVersion, Sequence: 1, Operation: wal.OperationSet, Key: "k1", Value: "v1"}
 	rec1.Checksum = rec1.ComputeChecksum()
-	line1, _ := json.Marshal(rec1)
+	line1, err := json.Marshal(rec1)
+	if err != nil {
+		t.Fatalf("Marshal rec1: %v", err)
+	}
 
 	rec2 := wal.Record{Version: wal.CurrentFormatVersion, Sequence: 3, Operation: wal.OperationSet, Key: "k2", Value: "v2"}
 	rec2.Checksum = rec2.ComputeChecksum()
-	line2, _ := json.Marshal(rec2)
+	line2, err := json.Marshal(rec2)
+	if err != nil {
+		t.Fatalf("Marshal rec2: %v", err)
+	}
 
 	content := append(line1, '\n')
 	content = append(content, append(line2, '\n')...)
 
-	if err := os.WriteFile(path, content, 0644); err != nil {
+	if err := os.WriteFile(path, content, 0600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -298,16 +313,22 @@ func TestWALSequenceDuplicateDetected(t *testing.T) {
 
 	rec1 := wal.Record{Version: wal.CurrentFormatVersion, Sequence: 1, Operation: wal.OperationSet, Key: "k1", Value: "v1"}
 	rec1.Checksum = rec1.ComputeChecksum()
-	line1, _ := json.Marshal(rec1)
+	line1, err := json.Marshal(rec1)
+	if err != nil {
+		t.Fatalf("Marshal rec1: %v", err)
+	}
 
 	rec2 := wal.Record{Version: wal.CurrentFormatVersion, Sequence: 1, Operation: wal.OperationSet, Key: "k2", Value: "v2"}
 	rec2.Checksum = rec2.ComputeChecksum()
-	line2, _ := json.Marshal(rec2)
+	line2, err := json.Marshal(rec2)
+	if err != nil {
+		t.Fatalf("Marshal rec2: %v", err)
+	}
 
 	content := append(line1, '\n')
 	content = append(content, append(line2, '\n')...)
 
-	if err := os.WriteFile(path, content, 0644); err != nil {
+	if err := os.WriteFile(path, content, 0600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -330,7 +351,7 @@ func TestWALCorruptRecordRejected(t *testing.T) {
 	path := dir + "/wal.log"
 
 	content := `{"corrupted": not-a-json}` + "\n"
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -353,12 +374,15 @@ func TestWALBlankLineRejected(t *testing.T) {
 
 	rec1 := wal.Record{Version: wal.CurrentFormatVersion, Sequence: 1, Operation: wal.OperationSet, Key: "k1", Value: "v1"}
 	rec1.Checksum = rec1.ComputeChecksum()
-	line1, _ := json.Marshal(rec1)
+	line1, err := json.Marshal(rec1)
+	if err != nil {
+		t.Fatalf("Marshal rec1: %v", err)
+	}
 
 	content := append(line1, '\n')
 	content = append(content, '\n') // blank record
 
-	if err := os.WriteFile(path, content, 0644); err != nil {
+	if err := os.WriteFile(path, content, 0600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
