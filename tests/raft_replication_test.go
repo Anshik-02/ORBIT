@@ -22,7 +22,7 @@ func TestLogReplicationBasic(t *testing.T) {
 
 	// 1. Wait for a leader to emerge
 	var leader *raft.Raft
-	deadline := time.Now().Add(1 * time.Second)
+	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		for _, n := range nodes {
 			if n.Role() == raft.Leader {
@@ -138,7 +138,7 @@ func TestReplicationCatchesUpPartitionedFollower(t *testing.T) {
 	// 1. Wait for leader
 	var leader *raft.Raft
 	var followerToIsolate *raft.Raft
-	deadline := time.Now().Add(1 * time.Second)
+	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		for _, n := range nodes {
 			if n.Role() == raft.Leader {

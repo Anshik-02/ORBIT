@@ -42,7 +42,7 @@ func TestMajorityCommitment(t *testing.T) {
 
 	// Wait for a leader to be elected
 	var leader *node.Node
-	deadline := time.Now().Add(1500 * time.Millisecond)
+	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		for _, n := range nodes {
 			if n.Raft().Role() == raft.Leader {

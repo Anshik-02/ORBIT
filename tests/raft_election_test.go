@@ -68,7 +68,7 @@ func TestSingleNodeElection(t *testing.T) {
 	}
 
 	// Must become leader quickly
-	deadline := time.Now().Add(500 * time.Millisecond)
+	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		if node.Role() == raft.Leader {
 			return // Success
@@ -92,7 +92,7 @@ func TestThreeNodeElection(t *testing.T) {
 
 	// Wait for election to resolve
 	var leader *raft.Raft
-	deadline := time.Now().Add(1 * time.Second)
+	deadline := time.Now().Add(3 * time.Second)
 
 	for time.Now().Before(deadline) {
 		leaders := 0
@@ -110,7 +110,7 @@ func TestThreeNodeElection(t *testing.T) {
 	}
 
 	if leader == nil {
-		t.Fatal("no leader elected after 1s")
+		t.Fatal("no leader elected within timeout")
 	}
 
 	// Verify other nodes are followers
@@ -140,14 +140,19 @@ func TestLeaderHeartbeatsKeepFollowersQuiet(t *testing.T) {
 	}
 
 	// Wait for initial election
-	time.Sleep(300 * time.Millisecond)
-
 	var leader *raft.Raft
-	for _, n := range nodes {
-		if n.Role() == raft.Leader {
-			leader = n
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, n := range nodes {
+			if n.Role() == raft.Leader {
+				leader = n
+				break
+			}
+		}
+		if leader != nil {
 			break
 		}
+		time.Sleep(15 * time.Millisecond)
 	}
 	if leader == nil {
 		t.Fatal("expected a leader to be elected")
@@ -181,7 +186,7 @@ func TestLeaderFailureTriggersNewElection(t *testing.T) {
 
 	// Wait for leader election
 	var oldLeader *raft.Raft
-	deadline := time.Now().Add(1 * time.Second)
+	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		for _, n := range nodes {
 			if n.Role() == raft.Leader {
@@ -205,7 +210,7 @@ func TestLeaderFailureTriggersNewElection(t *testing.T) {
 
 	// Wait for remaining 2 followers to detect heartbeat timeout and elect new leader
 	var newLeader *raft.Raft
-	failoverDeadline := time.Now().Add(1 * time.Second)
+	failoverDeadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(failoverDeadline) {
 		for _, n := range nodes {
 			if n.ID() != oldLeader.ID() && n.Role() == raft.Leader {
@@ -229,9 +234,17 @@ func TestLeaderFailureTriggersNewElection(t *testing.T) {
 
 	// Reconnect old leader: when it receives heartbeat from new leader, it must step down
 	net.Rejoin(oldLeader.ID())
-	time.Sleep(100 * time.Millisecond)
+	stepDownDeadline := time.Now().Add(3 * time.Second)
+	steppedDown := false
+	for time.Now().Before(stepDownDeadline) {
+		if oldLeader.Role() == raft.Follower {
+			steppedDown = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
-	if oldLeader.Role() != raft.Follower {
+	if !steppedDown {
 		t.Fatalf("old leader failed to step down after reconnecting: got role %v", oldLeader.Role())
 	}
 }

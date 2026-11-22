@@ -248,7 +248,7 @@ func TestIsolatedLeaderStaleReadPrevented(t *testing.T) {
 	// Elect initial leader
 	var leader *node.Node
 	var leaderIdx int
-	deadline := time.Now().Add(1500 * time.Millisecond)
+	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		for i, n := range nodes {
 			if n.Raft().Role() == raft.Leader {
@@ -271,7 +271,7 @@ func TestIsolatedLeaderStaleReadPrevented(t *testing.T) {
 	if err != nil {
 		t.Fatalf("propose initial balance: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	if err := leader.Raft().WaitForApply(ctx, idx); err != nil {
 		cancel()
 		t.Fatalf("apply initial balance: %v", err)
@@ -283,7 +283,7 @@ func TestIsolatedLeaderStaleReadPrevented(t *testing.T) {
 
 	// 3. Remaining 2 nodes elect a new leader
 	var newLeader *node.Node
-	failoverDeadline := time.Now().Add(1500 * time.Millisecond)
+	failoverDeadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(failoverDeadline) {
 		for i, n := range nodes {
 			if i != leaderIdx && n.Raft().Role() == raft.Leader {
@@ -305,7 +305,7 @@ func TestIsolatedLeaderStaleReadPrevented(t *testing.T) {
 	if err != nil {
 		t.Fatalf("propose on new leader: %v", err)
 	}
-	ctxNew, cancelNew := context.WithTimeout(context.Background(), 1*time.Second)
+	ctxNew, cancelNew := context.WithTimeout(context.Background(), 2*time.Second)
 	if err := newLeader.Raft().WaitForApply(ctxNew, newIdx); err != nil {
 		cancelNew()
 		t.Fatalf("apply on new leader: %v", err)

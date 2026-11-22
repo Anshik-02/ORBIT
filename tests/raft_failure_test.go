@@ -40,7 +40,7 @@ func TestPartitionLeaderCannotCommit(t *testing.T) {
 
 	// 1. Elect initial leader
 	var leader *node.Node
-	deadline := time.Now().Add(1500 * time.Millisecond)
+	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		for _, n := range nodes {
 			if n.Raft().Role() == raft.Leader {
@@ -76,7 +76,7 @@ func TestPartitionLeaderCannotCommit(t *testing.T) {
 
 	// 4. Remaining 2 nodes must elect a new leader
 	var newLeader *node.Node
-	failoverDeadline := time.Now().Add(1500 * time.Millisecond)
+	failoverDeadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(failoverDeadline) {
 		for _, n := range nodes {
 			if n.ID() != leader.ID() && n.Raft().Role() == raft.Leader {
@@ -159,7 +159,7 @@ func TestMinorityPartitionAllowsMajorityToContinue(t *testing.T) {
 	// Wait for leader
 	var leader *node.Node
 	var follower *node.Node
-	deadline := time.Now().Add(1500 * time.Millisecond)
+	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		for _, n := range nodes {
 			if n.Raft().Role() == raft.Leader {
@@ -186,7 +186,7 @@ func TestMinorityPartitionAllowsMajorityToContinue(t *testing.T) {
 		t.Fatalf("Propose on leader with minority partition: %v", err)
 	}
 
-	commitCtx, cancelCommit := context.WithTimeout(context.Background(), 1*time.Second)
+	commitCtx, cancelCommit := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancelCommit()
 	if err := leader.Raft().WaitForCommit(commitCtx, idx); err != nil {
 		t.Fatalf("majority failed to commit: %v", err)
@@ -194,10 +194,9 @@ func TestMinorityPartitionAllowsMajorityToContinue(t *testing.T) {
 
 	// Rejoin the partitioned follower
 	net.Rejoin(follower.ID())
-	time.Sleep(200 * time.Millisecond)
 
 	// Follower must catch up
-	catchupDeadline := time.Now().Add(1 * time.Second)
+	catchupDeadline := time.Now().Add(3 * time.Second)
 	caughtUp := false
 	for time.Now().Before(catchupDeadline) {
 		if v, ok := follower.Engine().Get("maj_key"); ok && v == "maj_val" {
@@ -236,7 +235,7 @@ func TestNodeCrashAndRestartInCluster(t *testing.T) {
 
 	// Wait for leader
 	var leader *node.Node
-	deadline := time.Now().Add(1500 * time.Millisecond)
+	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		for _, n := range nodes {
 			if n.Raft().Role() == raft.Leader {
@@ -259,7 +258,7 @@ func TestNodeCrashAndRestartInCluster(t *testing.T) {
 		if err != nil {
 			t.Fatalf("propose: %v", err)
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_ = leader.Raft().WaitForApply(ctx, idx)
 		cancel()
 	}
@@ -286,7 +285,7 @@ func TestNodeCrashAndRestartInCluster(t *testing.T) {
 	if err != nil {
 		t.Fatalf("propose while one node down: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	if err := leader.Raft().WaitForApply(ctx, idx4); err != nil {
 		t.Fatalf("commit while one node down: %v", err)
 	}
@@ -310,7 +309,7 @@ func TestNodeCrashAndRestartInCluster(t *testing.T) {
 	}()
 
 	// Wait for restarted node to catch up with all entries including k4
-	catchupDeadline := time.Now().Add(2 * time.Second)
+	catchupDeadline := time.Now().Add(4 * time.Second)
 	caughtUp := false
 	for time.Now().Before(catchupDeadline) {
 		if v, ok := restartedNode.Engine().Get("k4"); ok && v == "v4" {

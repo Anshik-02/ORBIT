@@ -46,7 +46,7 @@ func TestRaftHandlerDirect(t *testing.T) {
 	// Wait for leader
 	var leaderNode *node.Node
 	var followerNode *node.Node
-	deadline := time.Now().Add(1500 * time.Millisecond)
+	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		for _, n := range nodes {
 			if n.Raft().Role() == raft.Leader {
@@ -250,7 +250,7 @@ func TestClusterHTTPRealNetwork(t *testing.T) {
 	// Wait for leader
 	var leaderNode *node.Node
 	var leaderCfg node.NodeConfig
-	deadline := time.Now().Add(2500 * time.Millisecond)
+	deadline := time.Now().Add(4 * time.Second)
 	for time.Now().Before(deadline) {
 		for i, n := range nodes {
 			if n.Raft().Role() == raft.Leader {

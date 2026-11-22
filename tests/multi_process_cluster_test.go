@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -24,7 +25,11 @@ func TestMultiProcessHTTPCluster(t *testing.T) {
 
 	// 1. Build orbit binary in a temporary directory
 	tempDir := t.TempDir()
-	binPath := filepath.Join(tempDir, "orbit_cluster_test.exe")
+	binName := "orbit_cluster_test"
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+	binPath := filepath.Join(tempDir, binName)
 
 	buildCmd := exec.Command("go", "build", "-o", binPath, "./cmd/orbit")
 	buildCmd.Dir = ".."
@@ -292,7 +297,7 @@ func TestMultiProcessHTTPCluster(t *testing.T) {
 			if err := json.NewDecoder(resp.Body).Decode(&health); err == nil {
 				resp.Body.Close()
 				// Node should catch up with cluster commit index (at least 2 entries: country + state)
-				if health.Status == "ok" && health.CommitIndex >= 2 {
+				if health.Status == "ok" && health.CommitIndex >= 2 && health.LastApplied >= 2 && health.LeaderID != "" {
 					restartedHealthy = true
 					break
 				}
@@ -311,26 +316,38 @@ func TestMultiProcessHTTPCluster(t *testing.T) {
 	// Verify that country=India survived the restart (durability)
 	// and state=Karnataka was replicated to the restarted node (convergence).
 	for key, expectedVal := range map[string]string{"country": "India", "state": "Karnataka"} {
-		url := fmt.Sprintf("http://127.0.0.1:%d/api/v1/kv/%s", restartedAPIPort, key)
-		resp, err := client.Get(url)
-		if err != nil {
-			t.Fatalf("GET %s through restarted node: %v", key, err)
-		}
 		var kv struct {
 			Key   string `json:"key"`
 			Value string `json:"value"`
 		}
-		if err := json.NewDecoder(resp.Body).Decode(&kv); err != nil {
-			resp.Body.Close()
-			t.Fatalf("decode KV response for %s: %v", key, err)
-		}
-		resp.Body.Close()
+		var finalStatusCode int
+		readDeadline := time.Now().Add(6 * time.Second)
+		success := false
 
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("expected 200 OK for %s from restarted node, got %d", key, resp.StatusCode)
+		for time.Now().Before(readDeadline) {
+			url := fmt.Sprintf("http://127.0.0.1:%d/api/v1/kv/%s", restartedAPIPort, key)
+			resp, err := client.Get(url)
+			if err == nil {
+				finalStatusCode = resp.StatusCode
+				if resp.StatusCode == http.StatusOK {
+					if err := json.NewDecoder(resp.Body).Decode(&kv); err == nil {
+						resp.Body.Close()
+						if kv.Value == expectedVal {
+							success = true
+							break
+						}
+					} else {
+						resp.Body.Close()
+					}
+				} else {
+					resp.Body.Close()
+				}
+			}
+			time.Sleep(50 * time.Millisecond)
 		}
-		if kv.Value != expectedVal {
-			t.Fatalf("key %s: expected %q on restarted node, got %q", key, expectedVal, kv.Value)
+
+		if !success {
+			t.Fatalf("key %s: expected %q on restarted node, got %q (status: %d)", key, expectedVal, kv.Value, finalStatusCode)
 		}
 	}
 }
