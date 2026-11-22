@@ -14,6 +14,7 @@ var (
 	ErrEntryNotFound = errors.New("raft: log entry not found")
 	ErrInvalidIndex  = errors.New("raft: invalid log index")
 	ErrCorruptState  = errors.New("raft: persistent state is corrupted")
+	ErrQuorumLost    = errors.New("raft: lost majority quorum; cannot confirm leadership")
 )
 
 // Role represents the current consensus role of a node in the Raft cluster.

@@ -165,7 +165,7 @@ func (h *RaftHandler) HandleSet(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleGet handles GET /api/v1/kv/{key}.
-// Consistent reads route to the leader.
+// Linearizable reads are quorum-confirmed through the leader (ReadIndex protocol).
 func (h *RaftHandler) HandleGet(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 	if strings.TrimSpace(key) == "" {
@@ -176,6 +176,29 @@ func (h *RaftHandler) HandleGet(w http.ResponseWriter, r *http.Request) {
 	if h.raft.Role() != raft.Leader {
 		h.redirectToLeader(w, fmt.Sprintf("/api/v1/kv/%s", key))
 		return
+	}
+
+	// Verify leadership with majority quorum to prevent stale reads from an isolated partition leader
+	ctx, cancel := context.WithTimeout(r.Context(), h.reqTimeout)
+	defer cancel()
+
+	if err := h.raft.VerifyLeadership(ctx); err != nil {
+		if errors.Is(err, raft.ErrNotLeader) {
+			h.redirectToLeader(w, fmt.Sprintf("/api/v1/kv/%s", key))
+			return
+		}
+		log.Printf("[WARN] quorum-confirmed read failed: %v", err)
+		writeError(w, http.StatusServiceUnavailable, "unable to confirm leadership quorum for linearizable read")
+		return
+	}
+
+	// Wait until state machine catches up with commit index
+	commitIdx := h.raft.CommitIndex()
+	if commitIdx > 0 {
+		if err := h.raft.WaitForApply(ctx, commitIdx); err != nil {
+			writeError(w, http.StatusInternalServerError, "consensus apply error: "+err.Error())
+			return
+		}
 	}
 
 	value, err := h.db.Get(key)

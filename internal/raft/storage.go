@@ -16,6 +16,7 @@ import (
 var (
 	ErrChecksumMismatch   = errors.New("raft: log entry checksum mismatch")
 	ErrStorageClosed      = errors.New("raft: storage is closed")
+	ErrStoragePoisoned    = errors.New("raft: storage is poisoned due to previous write failure")
 	ErrInvalidTruncateIdx = errors.New("raft: cannot truncate log index 0 or negative")
 )
 
@@ -65,6 +66,8 @@ type FileStorage struct {
 	votedFor     string
 	entries      []LogEntry // 1-based indexing; entries[0] is sentinel {Index:0, Term:0}
 	closed       bool
+	poisoned     bool
+	poisonErr    error
 }
 
 // computeEntryChecksum calculates a length-prefixed CRC32-IEEE checksum over an entry's fields.
@@ -202,6 +205,9 @@ func (fs *FileStorage) SaveState(term uint64, votedFor string) error {
 	if fs.closed {
 		return ErrStorageClosed
 	}
+	if fs.poisoned {
+		return fmt.Errorf("%w: %v", ErrStoragePoisoned, fs.poisonErr)
+	}
 
 	meta := metadataState{
 		CurrentTerm: term,
@@ -213,6 +219,8 @@ func (fs *FileStorage) SaveState(term uint64, votedFor string) error {
 	}
 
 	if err := atomicWriteFile(fs.metaPath, data, 0600); err != nil {
+		fs.poisoned = true
+		fs.poisonErr = err
 		return fmt.Errorf("write metadata: %w", err)
 	}
 
@@ -229,10 +237,14 @@ func (fs *FileStorage) GetState() (term uint64, votedFor string, err error) {
 	if fs.closed {
 		return 0, "", ErrStorageClosed
 	}
+	if fs.poisoned {
+		return 0, "", fmt.Errorf("%w: %v", ErrStoragePoisoned, fs.poisonErr)
+	}
 	return fs.currentTerm, fs.votedFor, nil
 }
 
 // AppendEntries appends one or more entries to the log and fsyncs to disk.
+// Invariant: In-memory cache is updated ONLY after physical disk write and fsync succeed.
 func (fs *FileStorage) AppendEntries(entries []LogEntry) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -240,10 +252,15 @@ func (fs *FileStorage) AppendEntries(entries []LogEntry) error {
 	if fs.closed {
 		return ErrStorageClosed
 	}
+	if fs.poisoned {
+		return fmt.Errorf("%w: %v", ErrStoragePoisoned, fs.poisonErr)
+	}
 	if len(entries) == 0 {
 		return nil
 	}
 
+	// 1. Buffer all records in memory first to prevent partial disk writes
+	var buf bytes.Buffer
 	for _, entry := range entries {
 		cs := computeEntryChecksum(entry.Index, entry.Term, entry.Operation, entry.Key, entry.Value)
 		rec := persistentRecord{
@@ -259,31 +276,43 @@ func (fs *FileStorage) AppendEntries(entries []LogEntry) error {
 		if err != nil {
 			return fmt.Errorf("marshal log record %d: %w", entry.Index, err)
 		}
-		data = append(data, '\n')
-
-		if _, err := fs.logFile.Write(data); err != nil {
-			return fmt.Errorf("write log record %d: %w", entry.Index, err)
-		}
-
-		fs.entries = append(fs.entries, entry)
+		buf.Write(data)
+		buf.WriteByte('\n')
 	}
 
-	// Flush and sync to physical media
+	// 2. Write to disk
+	if _, err := fs.logFile.Write(buf.Bytes()); err != nil {
+		fs.poisoned = true
+		fs.poisonErr = err
+		return fmt.Errorf("write log records: %w", err)
+	}
+
+	// 3. Flush and sync to physical media
 	if err := fs.logFile.Sync(); err != nil {
+		fs.poisoned = true
+		fs.poisonErr = err
 		return fmt.Errorf("sync log file: %w", err)
 	}
+
+	// 4. Update in-memory entry cache ONLY after physical fsync succeeds
+	fs.entries = append(fs.entries, entries...)
 
 	return nil
 }
 
 // Truncate removes all entries from fromIndex to the end of the log.
 // Used when a follower discovers conflicting entries from a new leader.
+// Invariant: Existing log file and in-memory cache remain untouched until the replacement
+// truncated log is safely serialized, synced, and atomically renamed.
 func (fs *FileStorage) Truncate(fromIndex uint64) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
 	if fs.closed {
 		return ErrStorageClosed
+	}
+	if fs.poisoned {
+		return fmt.Errorf("%w: %v", ErrStoragePoisoned, fs.poisonErr)
 	}
 	if fromIndex == 0 {
 		return ErrInvalidTruncateIdx
@@ -292,19 +321,13 @@ func (fs *FileStorage) Truncate(fromIndex uint64) error {
 		return nil // Nothing to truncate
 	}
 
-	// Truncate in-memory slice
-	fs.entries = fs.entries[:fromIndex]
+	// 1. Identify remaining prefix entries without mutating fs.entries yet
+	remainingEntries := fs.entries[:fromIndex]
 
-	// Close open file handle
-	if fs.logFile != nil {
-		_ = fs.logFile.Close()
-		fs.logFile = nil
-	}
-
-	// Re-serialize valid remaining entries to disk
+	// 2. Re-serialize valid remaining entries to memory buffer
 	var buf bytes.Buffer
-	for i := 1; i < len(fs.entries); i++ {
-		e := fs.entries[i]
+	for i := 1; i < len(remainingEntries); i++ {
+		e := remainingEntries[i]
 		cs := computeEntryChecksum(e.Index, e.Term, e.Operation, e.Key, e.Value)
 		rec := persistentRecord{
 			Index:     e.Index,
@@ -322,16 +345,32 @@ func (fs *FileStorage) Truncate(fromIndex uint64) error {
 		buf.WriteByte('\n')
 	}
 
+	// 3. Close open file handle before atomic replacement
+	if fs.logFile != nil {
+		_ = fs.logFile.Close()
+		fs.logFile = nil
+	}
+
+	// 4. Atomically write replacement log file
 	if err := atomicWriteFile(fs.logPath, buf.Bytes(), 0600); err != nil {
+		fs.poisoned = true
+		fs.poisonErr = err
 		return fmt.Errorf("rewrite truncated log: %w", err)
 	}
 
-	// Reopen in append mode
+	// 5. Reopen in append mode
 	f, err := os.OpenFile(fs.logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
+		fs.poisoned = true
+		fs.poisonErr = err
 		return fmt.Errorf("reopen truncated log: %w", err)
 	}
 	fs.logFile = f
+
+	// 6. Update in-memory cache ONLY after replacement disk log is reopened safely
+	newEntries := make([]LogEntry, len(remainingEntries))
+	copy(newEntries, remainingEntries)
+	fs.entries = newEntries
 
 	return nil
 }
@@ -367,6 +406,20 @@ func (fs *FileStorage) LastLogInfo() (lastIndex uint64, lastTerm uint64) {
 
 	last := fs.entries[len(fs.entries)-1]
 	return last.Index, last.Term
+}
+
+// Health returns an error if storage is closed or poisoned.
+func (fs *FileStorage) Health() error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	if fs.closed {
+		return ErrStorageClosed
+	}
+	if fs.poisoned {
+		return fmt.Errorf("%w: %v", ErrStoragePoisoned, fs.poisonErr)
+	}
+	return nil
 }
 
 // Close flushes and closes the persistent log handle.

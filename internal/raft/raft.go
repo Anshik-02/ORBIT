@@ -50,6 +50,7 @@ type Raft struct {
 	leaderID    string // current known leader ID
 	commitIndex uint64
 	lastApplied uint64
+	applyErr    error // fatal error during state-machine application
 
 	// Volatile state on leaders
 	nextIndex  map[string]uint64
@@ -234,10 +235,16 @@ func (r *Raft) WaitForCommit(ctx context.Context, index uint64) error {
 }
 
 // WaitForApply blocks until the given log index has been applied to the state machine
-// (lastApplied >= index) or the context is canceled.
+// (lastApplied >= index), or returns immediately if a fatal application error occurred
+// or the context is canceled.
 func (r *Raft) WaitForApply(ctx context.Context, index uint64) error {
 	for {
 		r.mu.Lock()
+		if r.applyErr != nil {
+			err := r.applyErr
+			r.mu.Unlock()
+			return err
+		}
 		applied := r.lastApplied >= index
 		closed := r.closed
 		r.mu.Unlock()
@@ -257,6 +264,109 @@ func (r *Raft) WaitForApply(ctx context.Context, index uint64) error {
 	}
 }
 
+// ApplyErr returns any fatal error encountered during state machine application.
+func (r *Raft) ApplyErr() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.applyErr
+}
+
+// VerifyLeadership confirms that this node is currently the legitimate leader
+// by exchanging a heartbeat round with a majority quorum of the cluster (Raft §6.4).
+// This guarantees that the leader has not been partitioned/deposed, enabling linearizable reads.
+func (r *Raft) VerifyLeadership(ctx context.Context) error {
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return ErrStopped
+	}
+	if r.role != Leader {
+		r.mu.Unlock()
+		return ErrNotLeader
+	}
+
+	// Single-node cluster is inherently unanimous
+	if len(r.peers) == 0 {
+		r.mu.Unlock()
+		return nil
+	}
+
+	term := r.currentTerm
+	leaderID := r.id
+	leaderCommit := r.commitIndex
+
+	peersCopy := make(map[string]string, len(r.peers))
+	for id, addr := range r.peers {
+		peersCopy[id] = addr
+	}
+	r.mu.Unlock()
+
+	totalNodes := len(peersCopy) + 1
+	majority := (totalNodes / 2) + 1
+
+	// Self counts as 1 confirmation
+	var confirmations int32 = 1
+	var wg sync.WaitGroup
+	confCh := make(chan bool, len(peersCopy))
+
+	for peerID, peerAddr := range peersCopy {
+		wg.Add(1)
+		go func(pID, pAddr string) {
+			defer wg.Done()
+
+			r.mu.Lock()
+			nextIdx := r.nextIndex[pID]
+			if nextIdx == 0 {
+				nextIdx = 1
+			}
+			prevIdx := nextIdx - 1
+			prevEntry, _ := r.storage.GetEntry(prevIdx)
+			r.mu.Unlock()
+
+			req := &AppendEntriesRequest{
+				Term:         term,
+				LeaderID:     leaderID,
+				PrevLogIndex: prevIdx,
+				PrevLogTerm:  prevEntry.Term,
+				Entries:      nil,
+				LeaderCommit: leaderCommit,
+			}
+
+			resp, err := r.transport.SendAppendEntries(ctx, pAddr, req)
+			if err != nil {
+				return
+			}
+
+			r.mu.Lock()
+			if resp.Term > r.currentTerm {
+				_ = r.stepDownLocked(resp.Term)
+				r.mu.Unlock()
+				return
+			}
+			isStillLeader := (r.role == Leader && r.currentTerm == term)
+			r.mu.Unlock()
+
+			if isStillLeader && resp.Term == term {
+				confCh <- true
+			}
+		}(peerID, peerAddr)
+	}
+
+	go func() {
+		wg.Wait()
+		close(confCh)
+	}()
+
+	for range confCh {
+		confirmations++
+		if int(confirmations) >= majority {
+			return nil
+		}
+	}
+
+	return ErrQuorumLost
+}
+
 // resetElectionTimeoutLocked sets a random election timeout within [min, max].
 func (r *Raft) resetElectionTimeoutLocked() {
 	jitter := r.electionTimeoutMax - r.electionTimeoutMin
@@ -268,14 +378,17 @@ func (r *Raft) resetElectionTimeoutLocked() {
 }
 
 // stepDownLocked transitions the node to Follower for a new, higher term.
-func (r *Raft) stepDownLocked(newTerm uint64) {
+func (r *Raft) stepDownLocked(newTerm uint64) error {
+	if err := r.storage.SaveState(newTerm, ""); err != nil {
+		return fmt.Errorf("step down save state: %w", err)
+	}
 	r.currentTerm = newTerm
 	r.role = Follower
 	r.leaderID = ""
 	r.votedFor = ""
-	_ = r.storage.SaveState(r.currentTerm, r.votedFor)
 	r.lastHeartbeat = time.Now()
 	r.resetElectionTimeoutLocked()
+	return nil
 }
 
 // runLoop is the core timer ticker driving heartbeats and election timeouts.
@@ -320,11 +433,16 @@ func (r *Raft) tick(now time.Time) {
 
 // startElectionLocked begins a new election as a Candidate (M3).
 func (r *Raft) startElectionLocked() {
+	newTerm := r.currentTerm + 1
+	// Invariant: term and vote must be durably saved BEFORE candidate campaigns
+	if err := r.storage.SaveState(newTerm, r.id); err != nil {
+		return
+	}
+
 	r.role = Candidate
 	r.leaderID = ""
-	r.currentTerm++
+	r.currentTerm = newTerm
 	r.votedFor = r.id
-	_ = r.storage.SaveState(r.currentTerm, r.votedFor)
 	r.lastHeartbeat = time.Now()
 	r.resetElectionTimeoutLocked()
 
@@ -372,7 +490,7 @@ func (r *Raft) startElectionLocked() {
 
 			// Check if higher term seen
 			if resp.Term > r.currentTerm {
-				r.stepDownLocked(resp.Term)
+				_ = r.stepDownLocked(resp.Term)
 				return
 			}
 
@@ -503,7 +621,7 @@ func (r *Raft) sendAppendEntriesToPeer(peerID, peerAddr string, req *AppendEntri
 
 	// Check if remote peer operates on higher term
 	if resp.Term > r.currentTerm {
-		r.stepDownLocked(resp.Term)
+		_ = r.stepDownLocked(resp.Term)
 		return
 	}
 
@@ -581,35 +699,50 @@ func (r *Raft) checkAndUpdateCommitIndexLocked() {
 	}
 }
 
-// applyLoop continuously drains committed entries and invokes the commit callback.
+// applyLoop continuously drains committed entries and invokes the commit callback sequentially.
+// Invariant: lastApplied advances ONLY after each entry has been successfully applied to the state machine.
+// Any callback failure halts application and records applyErr to prevent state machine divergence.
 func (r *Raft) applyLoop() {
 	for {
 		r.mu.Lock()
-		for r.commitIndex <= r.lastApplied && !r.closed {
+		for r.commitIndex <= r.lastApplied && !r.closed && r.applyErr == nil {
 			r.applyCond.Wait()
 		}
 
-		if r.closed {
+		if r.closed || r.applyErr != nil {
 			r.mu.Unlock()
 			return
 		}
 
-		// Gather entries to apply
-		var toApply []LogEntry
-		for idx := r.lastApplied + 1; idx <= r.commitIndex; idx++ {
-			if entry, ok := r.storage.GetEntry(idx); ok {
-				toApply = append(toApply, entry)
-			}
+		nextIndex := r.lastApplied + 1
+		entry, ok := r.storage.GetEntry(nextIndex)
+		if !ok {
+			r.applyErr = fmt.Errorf("raft: committed entry at index %d not found in storage", nextIndex)
+			r.applyCond.Broadcast()
+			r.mu.Unlock()
+			return
 		}
-		r.lastApplied = r.commitIndex
 		cb := r.commitCallback
 		r.mu.Unlock()
 
-		for _, entry := range toApply {
-			if cb != nil {
-				_ = cb(entry)
-			}
+		// Apply sequentially to state machine outside mu
+		var err error
+		if cb != nil {
+			err = cb(entry)
 		}
+
+		r.mu.Lock()
+		if err != nil {
+			r.applyErr = fmt.Errorf("raft: state-machine apply failed for entry %d: %w", nextIndex, err)
+			r.applyCond.Broadcast()
+			r.mu.Unlock()
+			return
+		}
+
+		// Advance lastApplied ONLY upon successful application of this entry
+		r.lastApplied = nextIndex
+		r.applyCond.Broadcast()
+		r.mu.Unlock()
 	}
 }
 
@@ -628,7 +761,12 @@ func (r *Raft) HandleRequestVote(ctx context.Context, req *RequestVoteRequest) (
 
 	// 2. If req.Term > currentTerm, step down to follower
 	if req.Term > r.currentTerm {
-		r.stepDownLocked(req.Term)
+		if err := r.stepDownLocked(req.Term); err != nil {
+			return &RequestVoteResponse{
+				Term:        r.currentTerm,
+				VoteGranted: false,
+			}, fmt.Errorf("step down to term %d: %w", req.Term, err)
+		}
 	}
 
 	// 3. Check vote availability: votedFor is null or candidateID
@@ -643,8 +781,14 @@ func (r *Raft) HandleRequestVote(ctx context.Context, req *RequestVoteRequest) (
 		(req.LastLogTerm == lastLogTerm && req.LastLogIndex >= lastLogIndex)
 
 	if canVote && logOk {
+		// Invariant: Vote MUST be durably saved before granting it
+		if err := r.storage.SaveState(r.currentTerm, req.CandidateID); err != nil {
+			return &RequestVoteResponse{
+				Term:        r.currentTerm,
+				VoteGranted: false,
+			}, fmt.Errorf("durable vote save failed: %w", err)
+		}
 		r.votedFor = req.CandidateID
-		_ = r.storage.SaveState(r.currentTerm, r.votedFor)
 		r.lastHeartbeat = time.Now() // Granting vote resets election timeout
 
 		return &RequestVoteResponse{
@@ -674,7 +818,12 @@ func (r *Raft) HandleAppendEntries(ctx context.Context, req *AppendEntriesReques
 
 	// 2. If req.Term > currentTerm, step down to Follower
 	if req.Term > r.currentTerm {
-		r.stepDownLocked(req.Term)
+		if err := r.stepDownLocked(req.Term); err != nil {
+			return &AppendEntriesResponse{
+				Term:    r.currentTerm,
+				Success: false,
+			}, fmt.Errorf("step down to term %d: %w", req.Term, err)
+		}
 	} else if r.role == Candidate {
 		// Valid leader recognized for current term
 		r.role = Follower
