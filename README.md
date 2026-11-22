@@ -65,11 +65,11 @@ ORBIT is a high-performance, crash-resilient, distributed Key-Value database wri
 - **M6: Majority Commitment & State Machine Application (`internal/raft/raft.go`, `tests/raft_commit_test.go`)**:
   Quorum calculation ($N/2 + 1$), Raft §5.4.2 current-term commitment constraint, sequential asynchronous state machine draining via `applyLoop` and `sync.Cond` advancing `lastApplied` strictly per-entry on callback success, and restart recovery seeding (`InitialLastApplied`).
 - **M7: Client Request Integration (`internal/api/raft_handlers.go`, `tests/raft_api_test.go`)**:
-  Leader-aware HTTP routing: writes to leader block until quorum commit; writes to followers return `307 Temporary Redirect` with `Location` header and structured JSON redirect metadata; **Quorum-Confirmed Reads (ReadIndex)**: reads verify current leadership with a majority heartbeat round to prevent stale reads from isolated leaders.
-- **M8: Failure Handling & Recovery (`tests/raft_failure_test.go`, `tests/raft_hardening_test.go`)**:
-  Survives leader isolation (uncommitted entries do not commit without quorum; remaining 2 nodes elect new leader), minority follower partitions (majority continues without pause), node crash & restart with full WAL replay, disk persistence failure rejections, and state-machine apply error handling.
-- **M9: End-to-End Cluster Testing & CLI Runner (`cmd/orbit/main.go`, `configs/`, `tests/raft_e2e_test.go`, `tests/multi_process_cluster_test.go`)**:
-  CLI runner supporting `--config configs/node-X.json`, full concurrent client stress testing with race detector verification, and actual three-process live cluster failover testing.
+  Leader-aware HTTP routing: writes to leader block until quorum commit; writes to followers return `307 Temporary Redirect` with `Location` header and structured JSON redirect metadata; **Quorum-Confirmed Reads (ReadIndex Protocol, Raft §6.4)**: linearizable reads execute the Raft ReadIndex protocol—confirming leadership via majority quorum heartbeats, ensuring current-term commitment (Leader Completeness Property), and waiting for `lastApplied >= readIndex` before serving the query.
+- **M8: Failure Handling & Recovery (`tests/raft_failure_test.go`, `tests/raft_hardening_test.go`, `tests/raft_convergence_test.go`)**:
+  Survives leader isolation (uncommitted entries do not commit without quorum; remaining 2 nodes elect new leader), minority follower partitions (majority continues without pause), node crash & restart with full WAL replay, disk persistence failure halting (`storageErr`), strict log replay validation, partition heal convergence, and state-machine apply error handling.
+- **M9: End-to-End Cluster Testing, CI & CLI Runner (`cmd/orbit/main.go`, `configs/`, `.github/workflows/ci.yml`, `tests/raft_e2e_test.go`, `tests/multi_process_cluster_test.go`, `tests/raft_convergence_test.go`)**:
+  CLI runner supporting `--config configs/node-X.json`, full concurrent client stress testing with race detector verification, GitHub Actions CI workflow, and actual three-process live cluster failover and restart-convergence testing.
 
 ---
 

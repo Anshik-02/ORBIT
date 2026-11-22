@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -150,51 +151,114 @@ func (fs *FileStorage) recoverMetadata() error {
 	return nil
 }
 
-// recoverLog replays and validates all records from raft.log.
+// recoverLog replays and validates all records from raft.log with strict validation:
+//  1. Rejects blank lines anywhere in the log as corruption.
+//  2. Disallows unknown fields and secondary trailing JSON tokens.
+//  3. Verifies contiguous 1-based indexing (expectedIndex) and monotonically non-decreasing terms.
+//  4. Verifies length-prefixed CRC32-IEEE checksums.
+//  5. Automatically truncates partial trailing writes from crashes mid-write back to last valid boundary.
 func (fs *FileStorage) recoverLog() error {
-	f, err := os.OpenFile(fs.logPath, os.O_CREATE|os.O_RDONLY, 0600)
+	f, err := os.OpenFile(fs.logPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
+	reader := bufio.NewReader(f)
+	var lastValidOffset int64 = 0
+	var currentOffset int64 = 0
 	expectedIndex := uint64(1)
+	var prevTerm uint64 = 0
 
-	for scanner.Scan() {
-		line := bytes.TrimSpace(scanner.Bytes())
-		if len(line) == 0 {
-			continue // skip empty lines if any
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		lineLen := int64(len(line))
+
+		if lineLen > 0 {
+			hasNewline := line[lineLen-1] == '\n'
+			trimmed := bytes.TrimSpace(line)
+
+			if hasNewline {
+				// Strict append-only log: blank records are never written by Raft
+				if len(trimmed) == 0 {
+					return fmt.Errorf("%w: corrupt record at offset %d: unexpected blank line", ErrCorruptState, currentOffset)
+				}
+
+				// Strict JSON decoding: disallow unknown fields
+				dec := json.NewDecoder(bytes.NewReader(trimmed))
+				dec.DisallowUnknownFields()
+
+				var rec persistentRecord
+				if err := dec.Decode(&rec); err != nil {
+					return fmt.Errorf("%w: corrupt record at offset %d: %v", ErrCorruptState, currentOffset, err)
+				}
+
+				// Check trailing tokens on record line
+				var trailing json.RawMessage
+				if err := dec.Decode(&trailing); err != io.EOF {
+					return fmt.Errorf("%w: unexpected trailing content on record line at offset %d", ErrCorruptState, currentOffset)
+				}
+
+				// Verify checksum
+				expectedChecksum := computeEntryChecksum(rec.Index, rec.Term, rec.Operation, rec.Key, rec.Value)
+				if rec.Checksum != expectedChecksum {
+					return fmt.Errorf("%w: record index %d (stored %d, computed %d)",
+						ErrChecksumMismatch, rec.Index, rec.Checksum, expectedChecksum)
+				}
+
+				// Verify contiguous index
+				if rec.Index != expectedIndex {
+					return fmt.Errorf("%w: non-contiguous index at offset %d: expected %d, got %d",
+						ErrCorruptState, currentOffset, expectedIndex, rec.Index)
+				}
+
+				// Verify monotonically non-decreasing terms
+				if rec.Term < prevTerm {
+					return fmt.Errorf("%w: term regression at index %d: was %d, got %d",
+						ErrCorruptState, rec.Index, prevTerm, rec.Term)
+				}
+
+				fs.entries = append(fs.entries, LogEntry{
+					Index:     rec.Index,
+					Term:      rec.Term,
+					Operation: rec.Operation,
+					Key:       rec.Key,
+					Value:     rec.Value,
+				})
+				prevTerm = rec.Term
+				expectedIndex++
+				currentOffset += lineLen
+				lastValidOffset = currentOffset
+			} else {
+				// Incomplete trailing record without newline (crash mid-write)
+				break
+			}
 		}
 
-		var rec persistentRecord
-		if err := json.Unmarshal(line, &rec); err != nil {
-			return fmt.Errorf("%w: unmarshal record at index %d: %v", ErrCorruptState, expectedIndex, err)
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			return fmt.Errorf("raft storage: read error at offset %d: %w", currentOffset, readErr)
 		}
-
-		// Verify checksum
-		expectedChecksum := computeEntryChecksum(rec.Index, rec.Term, rec.Operation, rec.Key, rec.Value)
-		if rec.Checksum != expectedChecksum {
-			return fmt.Errorf("%w: record index %d (stored %d, computed %d)",
-				ErrChecksumMismatch, rec.Index, rec.Checksum, expectedChecksum)
-		}
-
-		// Verify contiguous index
-		if rec.Index != expectedIndex {
-			return fmt.Errorf("%w: expected index %d, found %d", ErrCorruptState, expectedIndex, rec.Index)
-		}
-
-		fs.entries = append(fs.entries, LogEntry{
-			Index:     rec.Index,
-			Term:      rec.Term,
-			Operation: rec.Operation,
-			Key:       rec.Key,
-			Value:     rec.Value,
-		})
-		expectedIndex++
 	}
 
-	return scanner.Err()
+	// Truncate any trailing partial write back to clean lastValidOffset
+	fileInfo, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("raft storage: stat log file: %w", err)
+	}
+
+	if fileInfo.Size() > lastValidOffset {
+		if err := f.Truncate(lastValidOffset); err != nil {
+			return fmt.Errorf("raft storage: truncate partial trailing write: %w", err)
+		}
+		if err := f.Sync(); err != nil {
+			return fmt.Errorf("raft storage: sync truncated log: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // SaveState atomically persists currentTerm and votedFor to disk.
@@ -257,6 +321,22 @@ func (fs *FileStorage) AppendEntries(entries []LogEntry) error {
 	}
 	if len(entries) == 0 {
 		return nil
+	}
+
+	// 0. Validate contiguous indexes and monotonic terms before touching disk
+	lastEntry := fs.entries[len(fs.entries)-1]
+	expectedIndex := lastEntry.Index + 1
+	prevTerm := lastEntry.Term
+
+	for _, entry := range entries {
+		if entry.Index != expectedIndex {
+			return fmt.Errorf("%w: append expected index %d, got %d", ErrInvalidIndex, expectedIndex, entry.Index)
+		}
+		if entry.Term < prevTerm {
+			return fmt.Errorf("%w: append term regressed from %d to %d at index %d", ErrCorruptState, prevTerm, entry.Term, entry.Index)
+		}
+		expectedIndex++
+		prevTerm = entry.Term
 	}
 
 	// 1. Buffer all records in memory first to prevent partial disk writes

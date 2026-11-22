@@ -51,6 +51,7 @@ type Raft struct {
 	commitIndex uint64
 	lastApplied uint64
 	applyErr    error // fatal error during state-machine application
+	storageErr  error // fatal error during durable persistence
 
 	// Volatile state on leaders
 	nextIndex  map[string]uint64
@@ -271,29 +272,68 @@ func (r *Raft) ApplyErr() error {
 	return r.applyErr
 }
 
-// VerifyLeadership confirms that this node is currently the legitimate leader
-// by exchanging a heartbeat round with a majority quorum of the cluster (Raft §6.4).
-// This guarantees that the leader has not been partitioned/deposed, enabling linearizable reads.
-func (r *Raft) VerifyLeadership(ctx context.Context) error {
+// StorageErr returns any fatal error encountered during durable state persistence.
+func (r *Raft) StorageErr() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.storageErr
+}
+
+// hasCommittedInCurrentTermLocked verifies whether the leader has committed at least
+// one entry from its current term (Raft §5.4.2 & §6.4 Leader Completeness Property).
+func (r *Raft) hasCommittedInCurrentTermLocked() bool {
+	if r.commitIndex == 0 {
+		lastIdx, _ := r.storage.LastLogInfo()
+		return lastIdx == 0
+	}
+	entry, ok := r.storage.GetEntry(r.commitIndex)
+	if !ok {
+		return false
+	}
+	return entry.Term == r.currentTerm
+}
+
+// ReadIndex implements the Raft ReadIndex protocol (Raft dissertation §6.4).
+// It returns a safe commit index up to which the local state machine must apply before
+// reading, guaranteeing linearizable reads without writing dummy entries to the log.
+//
+// Invariants verified:
+//  1. The node must be the current Leader.
+//  2. No fatal persistent storage error has halted consensus.
+//  3. The leader must have committed an entry in its current term (Leader Completeness Property).
+//  4. Heartbeats confirmed by a strict majority quorum to ensure the leader has not been deposed.
+func (r *Raft) ReadIndex(ctx context.Context) (uint64, error) {
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
-		return ErrStopped
+		return 0, ErrStopped
+	}
+	if r.storageErr != nil {
+		err := r.storageErr
+		r.mu.Unlock()
+		return 0, fmt.Errorf("consensus halted due to fatal storage error: %w", err)
 	}
 	if r.role != Leader {
 		r.mu.Unlock()
-		return ErrNotLeader
+		return 0, ErrNotLeader
 	}
+
+	// Raft §6.4: A leader cannot serve linearizable reads until it has
+	// committed at least one entry in its current term.
+	if !r.hasCommittedInCurrentTermLocked() {
+		r.mu.Unlock()
+		return 0, ErrLeaderNotReady
+	}
+
+	readIndex := r.commitIndex
+	term := r.currentTerm
+	leaderID := r.id
 
 	// Single-node cluster is inherently unanimous
 	if len(r.peers) == 0 {
 		r.mu.Unlock()
-		return nil
+		return readIndex, nil
 	}
-
-	term := r.currentTerm
-	leaderID := r.id
-	leaderCommit := r.commitIndex
 
 	peersCopy := make(map[string]string, len(r.peers))
 	for id, addr := range r.peers {
@@ -314,22 +354,16 @@ func (r *Raft) VerifyLeadership(ctx context.Context) error {
 		go func(pID, pAddr string) {
 			defer wg.Done()
 
-			r.mu.Lock()
-			nextIdx := r.nextIndex[pID]
-			if nextIdx == 0 {
-				nextIdx = 1
-			}
-			prevIdx := nextIdx - 1
-			prevEntry, _ := r.storage.GetEntry(prevIdx)
-			r.mu.Unlock()
-
+			// Pure heartbeat with PrevLogIndex=0 and PrevLogTerm=0:
+			// Verifies term authority without interfering with in-flight replication
+			// or triggering follower log divergence rejections.
 			req := &AppendEntriesRequest{
 				Term:         term,
 				LeaderID:     leaderID,
-				PrevLogIndex: prevIdx,
-				PrevLogTerm:  prevEntry.Term,
+				PrevLogIndex: 0,
+				PrevLogTerm:  0,
 				Entries:      nil,
-				LeaderCommit: leaderCommit,
+				LeaderCommit: readIndex,
 			}
 
 			resp, err := r.transport.SendAppendEntries(ctx, pAddr, req)
@@ -339,11 +373,13 @@ func (r *Raft) VerifyLeadership(ctx context.Context) error {
 
 			r.mu.Lock()
 			if resp.Term > r.currentTerm {
-				_ = r.stepDownLocked(resp.Term)
+				if err := r.stepDownLocked(resp.Term); err != nil {
+					r.storageErr = err
+				}
 				r.mu.Unlock()
 				return
 			}
-			isStillLeader := (r.role == Leader && r.currentTerm == term)
+			isStillLeader := (r.role == Leader && r.currentTerm == term && r.storageErr == nil)
 			r.mu.Unlock()
 
 			if isStillLeader && resp.Term == term {
@@ -360,11 +396,24 @@ func (r *Raft) VerifyLeadership(ctx context.Context) error {
 	for range confCh {
 		confirmations++
 		if int(confirmations) >= majority {
-			return nil
+			r.mu.Lock()
+			stillLeader := (r.role == Leader && r.currentTerm == term && r.storageErr == nil)
+			r.mu.Unlock()
+			if !stillLeader {
+				return 0, ErrNotLeader
+			}
+			return readIndex, nil
 		}
 	}
 
-	return ErrQuorumLost
+	return 0, ErrQuorumLost
+}
+
+// VerifyLeadership confirms that this node is currently the legitimate leader
+// by verifying a majority quorum (Raft §6.4).
+func (r *Raft) VerifyLeadership(ctx context.Context) error {
+	_, err := r.ReadIndex(ctx)
+	return err
 }
 
 // resetElectionTimeoutLocked sets a random election timeout within [min, max].
@@ -412,7 +461,7 @@ func (r *Raft) tick(now time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.closed {
+	if r.closed || r.storageErr != nil {
 		return
 	}
 
@@ -433,9 +482,14 @@ func (r *Raft) tick(now time.Time) {
 
 // startElectionLocked begins a new election as a Candidate (M3).
 func (r *Raft) startElectionLocked() {
+	if r.closed || r.storageErr != nil {
+		return
+	}
+
 	newTerm := r.currentTerm + 1
 	// Invariant: term and vote must be durably saved BEFORE candidate campaigns
 	if err := r.storage.SaveState(newTerm, r.id); err != nil {
+		r.storageErr = fmt.Errorf("start election save state: %w", err)
 		return
 	}
 
@@ -490,12 +544,14 @@ func (r *Raft) startElectionLocked() {
 
 			// Check if higher term seen
 			if resp.Term > r.currentTerm {
-				_ = r.stepDownLocked(resp.Term)
+				if err := r.stepDownLocked(resp.Term); err != nil {
+					r.storageErr = err
+				}
 				return
 			}
 
 			// Ensure candidate is still running in the same term
-			if r.role != Candidate || r.currentTerm != term {
+			if r.role != Candidate || r.currentTerm != term || r.storageErr != nil {
 				return
 			}
 
@@ -535,6 +591,9 @@ func (r *Raft) Propose(op, key, value string) (uint64, uint64, error) {
 	if r.closed {
 		return 0, 0, ErrStopped
 	}
+	if r.storageErr != nil {
+		return 0, 0, fmt.Errorf("consensus halted due to fatal storage error: %w", r.storageErr)
+	}
 	if r.role != Leader {
 		return 0, 0, ErrNotLeader
 	}
@@ -551,6 +610,7 @@ func (r *Raft) Propose(op, key, value string) (uint64, uint64, error) {
 
 	// Append to local persistent log
 	if err := r.storage.AppendEntries([]LogEntry{entry}); err != nil {
+		r.storageErr = fmt.Errorf("append local log: %w", err)
 		return 0, 0, fmt.Errorf("append local log: %w", err)
 	}
 	r.matchIndex[r.id] = newIndex
@@ -621,12 +681,14 @@ func (r *Raft) sendAppendEntriesToPeer(peerID, peerAddr string, req *AppendEntri
 
 	// Check if remote peer operates on higher term
 	if resp.Term > r.currentTerm {
-		_ = r.stepDownLocked(resp.Term)
+		if err := r.stepDownLocked(resp.Term); err != nil {
+			r.storageErr = err
+		}
 		return
 	}
 
 	// Verify sender is still Leader in the same term
-	if r.role != Leader || r.currentTerm != term {
+	if r.role != Leader || r.currentTerm != term || r.storageErr != nil {
 		return
 	}
 
@@ -751,6 +813,10 @@ func (r *Raft) HandleRequestVote(ctx context.Context, req *RequestVoteRequest) (
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if r.storageErr != nil {
+		return nil, fmt.Errorf("consensus halted due to fatal storage error: %w", r.storageErr)
+	}
+
 	// 1. If req.Term < currentTerm, reject vote
 	if req.Term < r.currentTerm {
 		return &RequestVoteResponse{
@@ -762,6 +828,7 @@ func (r *Raft) HandleRequestVote(ctx context.Context, req *RequestVoteRequest) (
 	// 2. If req.Term > currentTerm, step down to follower
 	if req.Term > r.currentTerm {
 		if err := r.stepDownLocked(req.Term); err != nil {
+			r.storageErr = err
 			return &RequestVoteResponse{
 				Term:        r.currentTerm,
 				VoteGranted: false,
@@ -783,6 +850,7 @@ func (r *Raft) HandleRequestVote(ctx context.Context, req *RequestVoteRequest) (
 	if canVote && logOk {
 		// Invariant: Vote MUST be durably saved before granting it
 		if err := r.storage.SaveState(r.currentTerm, req.CandidateID); err != nil {
+			r.storageErr = fmt.Errorf("durable vote save failed: %w", err)
 			return &RequestVoteResponse{
 				Term:        r.currentTerm,
 				VoteGranted: false,
@@ -808,6 +876,10 @@ func (r *Raft) HandleAppendEntries(ctx context.Context, req *AppendEntriesReques
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if r.storageErr != nil {
+		return nil, fmt.Errorf("consensus halted due to fatal storage error: %w", r.storageErr)
+	}
+
 	// 1. Reply false if req.Term < currentTerm (Section 5.1)
 	if req.Term < r.currentTerm {
 		return &AppendEntriesResponse{
@@ -819,6 +891,7 @@ func (r *Raft) HandleAppendEntries(ctx context.Context, req *AppendEntriesReques
 	// 2. If req.Term > currentTerm, step down to Follower
 	if req.Term > r.currentTerm {
 		if err := r.stepDownLocked(req.Term); err != nil {
+			r.storageErr = err
 			return &AppendEntriesResponse{
 				Term:    r.currentTerm,
 				Success: false,
@@ -875,10 +948,12 @@ func (r *Raft) HandleAppendEntries(ctx context.Context, req *AppendEntriesReques
 			if existing.Term != entry.Term {
 				// Existing entry conflicts with new one: truncate this and all subsequent entries
 				if err := r.storage.Truncate(entry.Index); err != nil {
+					r.storageErr = fmt.Errorf("truncate conflicting entries: %w", err)
 					return nil, fmt.Errorf("truncate conflicting entries: %w", err)
 				}
 				// Append remaining entries
 				if err := r.storage.AppendEntries(req.Entries[i:]); err != nil {
+					r.storageErr = fmt.Errorf("append new entries after truncate: %w", err)
 					return nil, fmt.Errorf("append new entries after truncate: %w", err)
 				}
 				break
@@ -887,6 +962,7 @@ func (r *Raft) HandleAppendEntries(ctx context.Context, req *AppendEntriesReques
 		} else {
 			// Entry not present: append remaining entries
 			if err := r.storage.AppendEntries(req.Entries[i:]); err != nil {
+				r.storageErr = fmt.Errorf("append new entries: %w", err)
 				return nil, fmt.Errorf("append new entries: %w", err)
 			}
 			break

@@ -165,7 +165,7 @@ func (h *RaftHandler) HandleSet(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleGet handles GET /api/v1/kv/{key}.
-// Linearizable reads are quorum-confirmed through the leader (ReadIndex protocol).
+// Linearizable reads are quorum-confirmed through the leader using the ReadIndex protocol (Raft §6.4).
 func (h *RaftHandler) HandleGet(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 	if strings.TrimSpace(key) == "" {
@@ -178,24 +178,41 @@ func (h *RaftHandler) HandleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify leadership with majority quorum to prevent stale reads from an isolated partition leader
 	ctx, cancel := context.WithTimeout(r.Context(), h.reqTimeout)
 	defer cancel()
 
-	if err := h.raft.VerifyLeadership(ctx); err != nil {
+	// Execute ReadIndex protocol (confirming leader term, commit in term, and quorum)
+	var readIndex uint64
+	var err error
+	for {
+		readIndex, err = h.raft.ReadIndex(ctx)
+		if err == nil {
+			break
+		}
+		if errors.Is(err, raft.ErrLeaderNotReady) && ctx.Err() == nil {
+			select {
+			case <-ctx.Done():
+				err = ctx.Err()
+			case <-time.After(10 * time.Millisecond):
+				continue
+			}
+		}
+		break
+	}
+
+	if err != nil {
 		if errors.Is(err, raft.ErrNotLeader) {
 			h.redirectToLeader(w, fmt.Sprintf("/api/v1/kv/%s", key))
 			return
 		}
-		log.Printf("[WARN] quorum-confirmed read failed: %v", err)
-		writeError(w, http.StatusServiceUnavailable, "unable to confirm leadership quorum for linearizable read")
+		log.Printf("[WARN] ReadIndex linearizable read failed: %v", err)
+		writeError(w, http.StatusServiceUnavailable, "unable to confirm leadership quorum for linearizable read: "+err.Error())
 		return
 	}
 
-	// Wait until state machine catches up with commit index
-	commitIdx := h.raft.CommitIndex()
-	if commitIdx > 0 {
-		if err := h.raft.WaitForApply(ctx, commitIdx); err != nil {
+	// Wait until state machine catches up with readIndex
+	if readIndex > 0 {
+		if err := h.raft.WaitForApply(ctx, readIndex); err != nil {
 			writeError(w, http.StatusInternalServerError, "consensus apply error: "+err.Error())
 			return
 		}
@@ -269,6 +286,23 @@ func (h *RaftHandler) HandleHealth(w http.ResponseWriter, r *http.Request) {
 	storageStatus := "healthy"
 	if err := h.db.Health(); err != nil {
 		storageStatus = "unhealthy: " + err.Error()
+		writeJSON(w, http.StatusServiceUnavailable, RaftHealthResponse{
+			Status:      "unhealthy",
+			Node:        h.nodeID,
+			Role:        strings.ToLower(role.String()),
+			LeaderID:    h.raft.LeaderID(),
+			Term:        h.raft.CurrentTerm(),
+			CommitIndex: h.raft.CommitIndex(),
+			LastApplied: h.raft.LastApplied(),
+			Storage:     storageStatus,
+			Writable:    false,
+			Cluster:     "raft",
+		})
+		return
+	}
+
+	if storageErr := h.raft.StorageErr(); storageErr != nil {
+		storageStatus = "unhealthy: fatal consensus storage error: " + storageErr.Error()
 		writeJSON(w, http.StatusServiceUnavailable, RaftHealthResponse{
 			Status:      "unhealthy",
 			Node:        h.nodeID,

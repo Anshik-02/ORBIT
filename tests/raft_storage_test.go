@@ -198,3 +198,114 @@ func TestRaftStorageChecksumBitrotDetected(t *testing.T) {
 		t.Fatalf("expected ErrChecksumMismatch or ErrCorruptState, got: %v", err)
 	}
 }
+
+// TestRaftStorageRejectsBlankLines verifies that empty/blank lines in raft.log are rejected as corrupt.
+func TestRaftStorageRejectsBlankLines(t *testing.T) {
+	dir := t.TempDir()
+
+	s, err := raft.OpenFileStorage(dir)
+	if err != nil {
+		t.Fatalf("open storage: %v", err)
+	}
+	if err := s.AppendEntries([]raft.LogEntry{
+		{Index: 1, Term: 1, Operation: "SET", Key: "k1", Value: "v1"},
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Inject a blank line
+	logPath := filepath.Join(dir, "raft", "raft.log")
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatalf("open log: %v", err)
+	}
+	if _, err := f.WriteString("\n\n"); err != nil {
+		t.Fatalf("write blank lines: %v", err)
+	}
+	f.Close()
+
+	// Reopen should fail with ErrCorruptState
+	_, err = raft.OpenFileStorage(dir)
+	if !errors.Is(err, raft.ErrCorruptState) {
+		t.Fatalf("expected ErrCorruptState for blank line, got: %v", err)
+	}
+}
+
+// TestRaftStorageTruncatesPartialTrailingWrite verifies crash mid-write trailing record is cleanly truncated.
+func TestRaftStorageTruncatesPartialTrailingWrite(t *testing.T) {
+	dir := t.TempDir()
+
+	s, err := raft.OpenFileStorage(dir)
+	if err != nil {
+		t.Fatalf("open storage: %v", err)
+	}
+	if err := s.AppendEntries([]raft.LogEntry{
+		{Index: 1, Term: 1, Operation: "SET", Key: "k1", Value: "v1"},
+		{Index: 2, Term: 1, Operation: "SET", Key: "k2", Value: "v2"},
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Append partial trailing bytes (simulate crash mid-write of record 3)
+	logPath := filepath.Join(dir, "raft", "raft.log")
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatalf("open log: %v", err)
+	}
+	if _, err := f.WriteString(`{"index":3,"term":1,"op`); err != nil {
+		t.Fatalf("write partial: %v", err)
+	}
+	f.Close()
+
+	// Recovery should succeed and truncate back to index 2
+	sReopened, err := raft.OpenFileStorage(dir)
+	if err != nil {
+		t.Fatalf("reopen after partial trailing write failed: %v", err)
+	}
+	defer sReopened.Close()
+
+	lastIdx, _ := sReopened.LastLogInfo()
+	if lastIdx != 2 {
+		t.Fatalf("expected last index 2 after truncating partial write, got %d", lastIdx)
+	}
+}
+
+// TestRaftStorageRejectsInvalidAppend verifies append rejection for non-contiguous index or regressing term.
+func TestRaftStorageRejectsInvalidAppend(t *testing.T) {
+	dir := t.TempDir()
+
+	s, err := raft.OpenFileStorage(dir)
+	if err != nil {
+		t.Fatalf("open storage: %v", err)
+	}
+	defer s.Close()
+
+	// 1. Initial valid append
+	if err := s.AppendEntries([]raft.LogEntry{
+		{Index: 1, Term: 2, Operation: "SET", Key: "k1", Value: "v1"},
+	}); err != nil {
+		t.Fatalf("initial append: %v", err)
+	}
+
+	// 2. Reject non-contiguous index (e.g. index 3 instead of 2)
+	err = s.AppendEntries([]raft.LogEntry{
+		{Index: 3, Term: 2, Operation: "SET", Key: "k3", Value: "v3"},
+	})
+	if !errors.Is(err, raft.ErrInvalidIndex) {
+		t.Fatalf("expected ErrInvalidIndex for gap, got: %v", err)
+	}
+
+	// 3. Reject term regression (e.g. term 1 after term 2)
+	err = s.AppendEntries([]raft.LogEntry{
+		{Index: 2, Term: 1, Operation: "SET", Key: "k2", Value: "v2"},
+	})
+	if !errors.Is(err, raft.ErrCorruptState) {
+		t.Fatalf("expected ErrCorruptState for term regression, got: %v", err)
+	}
+}

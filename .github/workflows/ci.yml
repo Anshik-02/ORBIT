@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          check-latest: true
+
+      - name: Go Vet
+        run: go vet ./...
+
+      - name: Build Binary
+        run: go build -v ./cmd/orbit
+
+      - name: Run Test Suite (Race Detector Enabled)
+        run: go test -v ./tests/... -race -count=1 -timeout 180s

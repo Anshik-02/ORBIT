@@ -256,4 +256,81 @@ func TestMultiProcessHTTPCluster(t *testing.T) {
 	if newPostResp.StatusCode != http.StatusCreated {
 		t.Fatalf("expected 201 Created from new leader process, got %d", newPostResp.StatusCode)
 	}
+
+	// 11. Read back both keys from new leader to confirm consistency
+	for _, key := range []string{"country", "state"} {
+		url := fmt.Sprintf("http://127.0.0.1:%d/api/v1/kv/%s", newLeaderPort, key)
+		resp, err := client.Get(url)
+		if err != nil {
+			t.Fatalf("GET %s from new leader: %v", key, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK for key %s from new leader, got %d", key, resp.StatusCode)
+		}
+	}
+
+	// 12. Restart the killed node process with the same configuration file
+	restartedCmd := exec.Command(binPath, "--config", configPaths[leaderProcIdx])
+	restartedCmd.Stdout = os.Stdout
+	restartedCmd.Stderr = os.Stderr
+	if err := restartedCmd.Start(); err != nil {
+		t.Fatalf("restart killed process %d: %v", leaderProcIdx, err)
+	}
+	procs[leaderProcIdx] = restartedCmd
+
+	// 13. Poll restarted node until it catches up and is healthy
+	restartedAPIPort := ports[leaderProcIdx].apiPort
+	restartedURL := fmt.Sprintf("http://127.0.0.1:%d/health", restartedAPIPort)
+	restartedDeadline := time.Now().Add(6 * time.Second)
+	restartedHealthy := false
+
+	for time.Now().Before(restartedDeadline) {
+		resp, err := client.Get(restartedURL)
+		if err == nil {
+			var health api.RaftHealthResponse
+			if err := json.NewDecoder(resp.Body).Decode(&health); err == nil {
+				resp.Body.Close()
+				// Node should catch up with cluster commit index (at least 2 entries: country + state)
+				if health.Status == "ok" && health.CommitIndex >= 2 {
+					restartedHealthy = true
+					break
+				}
+			} else {
+				resp.Body.Close()
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if !restartedHealthy {
+		t.Fatal("restarted process failed to catch up to cluster commit index within timeout")
+	}
+
+	// 14. Query restarted process for both keys:
+	// Verify that country=India survived the restart (durability)
+	// and state=Karnataka was replicated to the restarted node (convergence).
+	for key, expectedVal := range map[string]string{"country": "India", "state": "Karnataka"} {
+		url := fmt.Sprintf("http://127.0.0.1:%d/api/v1/kv/%s", restartedAPIPort, key)
+		resp, err := client.Get(url)
+		if err != nil {
+			t.Fatalf("GET %s through restarted node: %v", key, err)
+		}
+		var kv struct {
+			Key   string `json:"key"`
+			Value string `json:"value"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&kv); err != nil {
+			resp.Body.Close()
+			t.Fatalf("decode KV response for %s: %v", key, err)
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK for %s from restarted node, got %d", key, resp.StatusCode)
+		}
+		if kv.Value != expectedVal {
+			t.Fatalf("key %s: expected %q on restarted node, got %q", key, expectedVal, kv.Value)
+		}
+	}
 }
