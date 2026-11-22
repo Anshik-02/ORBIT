@@ -66,6 +66,7 @@ func main() {
 		Handler:      mux,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
 	// --- Graceful shutdown on Ctrl+C / SIGTERM ---

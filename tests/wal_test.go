@@ -1,7 +1,9 @@
 package tests
 
 import (
+	"fmt"
 	"os"
+	"sync"
 	"testing"
 
 	"orbit/internal/wal"
@@ -96,7 +98,6 @@ func TestWALDeleteOmitsValue(t *testing.T) {
 		t.Fatalf("Append: %v", err)
 	}
 
-	// Read the raw log line and verify no "value" field is present.
 	raw, err := os.ReadFile(dir + "/wal.log")
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
@@ -114,16 +115,15 @@ func TestWALDeleteOmitsValue(t *testing.T) {
 	}
 }
 
-// TestWALPartialWrite simulates a partial (truncated) final line,
-// which is what happens when the process crashes mid-write.
-// Replay must succeed and return only the complete records.
+// TestWALPartialWrite verifies that an incomplete trailing write is skipped
+// and the file is truncated back to the clean record boundary.
 func TestWALPartialWrite(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/wal.log"
 
-	// Write a valid record manually, then append a truncated line.
+	// Write a valid record followed by an incomplete line (no newline).
 	validLine := `{"sequence":1,"operation":"SET","key":"user:1","value":"Anshik"}` + "\n"
-	truncatedLine := `{"sequence":2,"operation":"SET","key":"use` // no closing brace, no newline
+	truncatedLine := `{"sequence":2,"operation":"SET","key":"use`
 
 	if err := os.WriteFile(path, []byte(validLine+truncatedLine), 0644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
@@ -137,14 +137,131 @@ func TestWALPartialWrite(t *testing.T) {
 
 	records, err := w.Replay()
 	if err != nil {
-		t.Fatalf("Replay should not error on partial final line, got: %v", err)
+		t.Fatalf("Replay failed on partial line: %v", err)
 	}
 
-	// Only the complete first record should be returned.
 	if len(records) != 1 {
 		t.Fatalf("expected 1 record, got %d", len(records))
 	}
 	if records[0].Key != "user:1" {
 		t.Errorf("expected key user:1, got %q", records[0].Key)
+	}
+
+	// Verify file was physically truncated to the valid line length.
+	stat, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if stat.Size() != int64(len(validLine)) {
+		t.Errorf("expected file size %d after truncation, got %d", len(validLine), stat.Size())
+	}
+}
+
+// TestWALSequenceGapDetected verifies that non-contiguous sequences (e.g. 1 -> 3)
+// are detected as corruptions during replay.
+func TestWALSequenceGapDetected(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/wal.log"
+
+	// Sequence 1 followed by sequence 3 (gap!)
+	content := `{"sequence":1,"operation":"SET","key":"k1","value":"v1"}` + "\n" +
+		`{"sequence":3,"operation":"SET","key":"k2","value":"v2"}` + "\n"
+
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err := wal.Open(path)
+	if err == nil {
+		t.Fatal("expected error on sequence gap, got nil")
+	}
+}
+
+// TestWALSequenceDuplicateDetected verifies that duplicate sequence numbers are rejected.
+func TestWALSequenceDuplicateDetected(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/wal.log"
+
+	content := `{"sequence":1,"operation":"SET","key":"k1","value":"v1"}` + "\n" +
+		`{"sequence":1,"operation":"SET","key":"k2","value":"v2"}` + "\n"
+
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err := wal.Open(path)
+	if err == nil {
+		t.Fatal("expected error on duplicate sequence, got nil")
+	}
+}
+
+// TestWALCorruptRecordRejected verifies that a complete line with invalid JSON
+// is rejected and not ignored.
+func TestWALCorruptRecordRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/wal.log"
+
+	content := `{"sequence":1,"operation":"SET","key":"k1","value":"v1"}` + "\n" +
+		`{"corrupted": not-a-json}` + "\n"
+
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err := wal.Open(path)
+	if err == nil {
+		t.Fatal("expected error on corrupt record, got nil")
+	}
+}
+
+// TestWALConcurrentAppends tests concurrent writes directly against the WAL,
+// ensuring no interleaved bytes or race conditions occur.
+func TestWALConcurrentAppends(t *testing.T) {
+	dir := t.TempDir()
+	w, err := wal.Open(dir + "/wal.log")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer w.Close()
+
+	const numGoroutines = 10
+	const writesPerGoroutine = 20
+	var wg sync.WaitGroup
+
+	for g := 0; g < numGoroutines; g++ {
+		wg.Add(1)
+		go func(gid int) {
+			defer wg.Done()
+			for i := 0; i < writesPerGoroutine; i++ {
+				rec := wal.Record{
+					Operation: wal.OperationSet,
+					Key:       fmt.Sprintf("k-%d-%d", gid, i),
+					Value:     fmt.Sprintf("v-%d-%d", gid, i),
+				}
+				if err := w.Append(rec); err != nil {
+					t.Errorf("Append failed: %v", err)
+				}
+			}
+		}(g)
+	}
+
+	wg.Wait()
+
+	// Replay and verify all records are present with contiguous sequences
+	records, err := w.Replay()
+	if err != nil {
+		t.Fatalf("Replay after concurrent writes failed: %v", err)
+	}
+
+	expectedTotal := numGoroutines * writesPerGoroutine
+	if len(records) != expectedTotal {
+		t.Fatalf("expected %d records, got %d", expectedTotal, len(records))
+	}
+
+	for i, r := range records {
+		expectedSeq := uint64(i + 1)
+		if r.Sequence != expectedSeq {
+			t.Errorf("record[%d]: sequence = %d, want %d", i, r.Sequence, expectedSeq)
+		}
 	}
 }

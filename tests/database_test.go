@@ -2,6 +2,8 @@ package tests
 
 import (
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 
 	"orbit/internal/database"
@@ -145,4 +147,43 @@ func TestMultipleKeys(t *testing.T) {
 			t.Errorf("Get(%q) = %q, want %q", k, got, want)
 		}
 	}
+}
+
+// TestConcurrentDatabaseWritesAndReads verifies that simultaneous writers and readers
+// preserve consistency and have zero data races under the Go race detector.
+func TestConcurrentDatabaseWritesAndReads(t *testing.T) {
+	db := newTestDB(t)
+
+	const writers = 8
+	const opsPerWriter = 25
+	var wg sync.WaitGroup
+
+	// Start concurrent writers
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(wid int) {
+			defer wg.Done()
+			for i := 0; i < opsPerWriter; i++ {
+				key := fmt.Sprintf("key-%d", i%5) // high collision across writers
+				val := fmt.Sprintf("val-%d-%d", wid, i)
+				if err := db.Set(key, val); err != nil {
+					t.Errorf("Set error: %v", err)
+				}
+			}
+		}(w)
+	}
+
+	// Start concurrent readers
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < opsPerWriter*2; i++ {
+				key := fmt.Sprintf("key-%d", i%5)
+				_, _ = db.Get(key)
+			}
+		}()
+	}
+
+	wg.Wait()
 }

@@ -2,6 +2,8 @@ package storage
 
 import (
 	"fmt"
+	"sync"
+
 	"orbit/internal/wal"
 )
 
@@ -14,27 +16,23 @@ import (
 //
 // The invariant Engine enforces:
 //
-//	WAL write + sync  →  Memtable update  →  return to caller
+//	[writeMu.Lock] -> WAL append + sync -> Memtable update -> [writeMu.Unlock]
 //
-// If the process crashes between the WAL sync and the Memtable update,
-// the next startup will replay the WAL and reconstruct the correct state.
-// No data is lost.
-//
-// Other packages (api, database) must use Engine's public methods.
-// They must never reach into the WAL or Memtable directly.
+// Concurrency Model:
+//   - All write operations (Set / Delete) serialize through `writeMu`.
+//     This ensures that the order operations appear in the WAL strictly
+//     matches the order they mutate the Memtable.
+//   - Read operations (Get) only touch the Memtable with a shared RLock,
+//     allowing highly concurrent, non-blocking reads.
 type Engine struct {
 	memtable *Memtable
 	wal      *wal.Log
+	writeMu  sync.Mutex // serializes WAL append + Memtable update transaction
 }
 
 // NewEngine opens the WAL at walPath, replays it to reconstruct the
 // Memtable, and returns a ready-to-use Engine.
-//
-// This is the single entry point for starting the storage layer.
-// It handles recovery automatically — callers don't need to know that
-// a WAL replay happened.
 func NewEngine(walPath string) (*Engine, error) {
-	// Open (or create) the WAL file.
 	w, err := wal.Open(walPath)
 	if err != nil {
 		return nil, fmt.Errorf("storage: open wal: %w", err)
@@ -45,7 +43,7 @@ func NewEngine(walPath string) (*Engine, error) {
 		wal:      w,
 	}
 
-	// Replay the WAL to rebuild the Memtable from disk state.
+	// Replay WAL to restore state
 	if err := engine.recover(); err != nil {
 		w.Close()
 		return nil, fmt.Errorf("storage: recovery failed: %w", err)
@@ -54,10 +52,7 @@ func NewEngine(walPath string) (*Engine, error) {
 	return engine, nil
 }
 
-// recover reads all WAL records and applies them to the Memtable in order.
-//
-// Called once during NewEngine(). After this returns, the Memtable reflects
-// the exact database state as of the last successful write before shutdown.
+// recover replays all WAL records into the Memtable.
 func (e *Engine) recover() error {
 	records, err := e.wal.Replay()
 	if err != nil {
@@ -71,25 +66,23 @@ func (e *Engine) recover() error {
 		case wal.OperationDelete:
 			e.memtable.Delete(r.Key)
 		default:
-			// Unknown operations are skipped rather than aborting recovery.
-			// This makes forward compatibility easier when new operation types
-			// are introduced — old nodes can still start up and serve reads.
+			// Forward compatibility: ignore unknown operations
 		}
 	}
 
 	return nil
 }
 
-// Set stores key → value in the database.
+// Set stores key -> value in the database.
 //
-// Steps (in this exact order):
-//  1. Append a SET record to the WAL and sync to disk.
+// Serialized through writeMu:
+//  1. Append SET record to WAL and sync to physical disk.
 //  2. Update the Memtable.
-//
-// If step 1 fails, we return an error and the Memtable is NOT updated.
-// If the process crashes after step 1 but before step 2, recovery will
-// correctly replay the SET and the data will not be lost.
+// Both steps complete atomically with respect to other writes.
 func (e *Engine) Set(key, value string) error {
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+
 	record := wal.Record{
 		Operation: wal.OperationSet,
 		Key:       key,
@@ -105,23 +98,20 @@ func (e *Engine) Set(key, value string) error {
 }
 
 // Get retrieves the value for key.
-//
-// Returns (value, true) if the key exists, ("", false) if it does not.
-// This is a pure in-memory lookup — no disk I/O.
+// Concurrent and non-blocking: accesses the Memtable via RLock.
 func (e *Engine) Get(key string) (string, bool) {
 	return e.memtable.Get(key)
 }
 
 // Delete removes key from the database.
 //
-// Steps (in this exact order):
-//  1. Append a DELETE (tombstone) record to the WAL and sync to disk.
-//  2. Remove the key from the Memtable.
-//
-// The WAL record is a tombstone: during recovery, encountering a DELETE
-// record ensures the key is absent from the reconstructed Memtable even
-// if earlier SET records for the same key exist in the log.
+// Serialized through writeMu:
+//  1. Append DELETE tombstone record to WAL and sync to physical disk.
+//  2. Remove key from the Memtable.
 func (e *Engine) Delete(key string) error {
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+
 	record := wal.Record{
 		Operation: wal.OperationDelete,
 		Key:       key,
@@ -136,8 +126,10 @@ func (e *Engine) Delete(key string) error {
 }
 
 // Close flushes and closes the WAL.
-// Must be called before the process exits to ensure no buffered data is lost.
 func (e *Engine) Close() error {
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+
 	if err := e.wal.Close(); err != nil {
 		return fmt.Errorf("storage: close wal: %w", err)
 	}

@@ -3,9 +3,13 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"io"
+	"log"
 	"net/http"
 	"orbit/internal/database"
 )
+
+const maxRequestBodyBytes = 1 << 20 // 1 MB
 
 // Handler holds a reference to the Database.
 // All HTTP handlers are methods on this struct so they share one DB instance.
@@ -56,19 +60,33 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 
 // HandleSet handles POST /api/v1/kv
 //
-// Request body:
-//
-//	{ "key": "user:1", "value": "Anshik" }
-//
-// Responses:
-//
-//	201 Created  — write succeeded and is durable
-//	400 Bad Request — missing/blank key or value
-//	500 Internal Server Error — storage failure
+// Robustness checks:
+//   - Request body limited to 1MB.
+//   - Unknown JSON fields rejected.
+//   - Trailing JSON tokens/values rejected.
+//   - Internal storage errors logged on server and obscured from clients.
 func (h *Handler) HandleSet(w http.ResponseWriter, r *http.Request) {
+	// Limit request body size
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+
 	var req setRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if err := dec.Decode(&req); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request body exceeds 1MB limit")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+
+	// Verify no unexpected trailing data exists
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		writeError(w, http.StatusBadRequest, "unexpected trailing content after JSON body")
 		return
 	}
 
@@ -79,7 +97,8 @@ func (h *Handler) HandleSet(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, database.ErrEmptyValue):
 			writeError(w, http.StatusBadRequest, "value must not be empty")
 		default:
-			writeError(w, http.StatusInternalServerError, "storage error: "+err.Error())
+			log.Printf("[ERROR] storage failure on SET: %v", err)
+			writeError(w, http.StatusInternalServerError, "internal storage error")
 		}
 		return
 	}
@@ -88,12 +107,6 @@ func (h *Handler) HandleSet(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleGet handles GET /api/v1/kv/{key}
-//
-// Responses:
-//
-//	200 OK        — { "key": "...", "value": "..." }
-//	400 Bad Request — blank key
-//	404 Not Found — key does not exist
 func (h *Handler) HandleGet(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 
@@ -105,7 +118,8 @@ func (h *Handler) HandleGet(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, database.ErrKeyNotFound):
 			writeError(w, http.StatusNotFound, "key not found")
 		default:
-			writeError(w, http.StatusInternalServerError, "storage error: "+err.Error())
+			log.Printf("[ERROR] storage failure on GET (%q): %v", key, err)
+			writeError(w, http.StatusInternalServerError, "internal storage error")
 		}
 		return
 	}
@@ -114,12 +128,6 @@ func (h *Handler) HandleGet(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleDelete handles DELETE /api/v1/kv/{key}
-//
-// Responses:
-//
-//	200 OK        — key deleted (or was already absent — idempotent)
-//	400 Bad Request — blank key
-//	500 Internal Server Error — storage failure
 func (h *Handler) HandleDelete(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 
@@ -128,7 +136,8 @@ func (h *Handler) HandleDelete(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, database.ErrEmptyKey):
 			writeError(w, http.StatusBadRequest, "key must not be empty")
 		default:
-			writeError(w, http.StatusInternalServerError, "storage error: "+err.Error())
+			log.Printf("[ERROR] storage failure on DELETE (%q): %v", key, err)
+			writeError(w, http.StatusInternalServerError, "internal storage error")
 		}
 		return
 	}
