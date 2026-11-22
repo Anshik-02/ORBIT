@@ -18,6 +18,11 @@ type Config struct {
 	ElectionTimeoutMin time.Duration
 	ElectionTimeoutMax time.Duration
 	CommitCallback     func(LogEntry) error // Invoked sequentially when an entry is committed
+
+	// InitialLastApplied seeds lastApplied on startup from a recovered storage engine.
+	// Set this to engine.LastAppliedIndex() so the applyLoop skips already-applied entries
+	// after a node restart, preventing duplicate state-machine application.
+	InitialLastApplied uint64
 }
 
 // Raft implements a consensus engine following the Raft consensus algorithm.
@@ -42,6 +47,7 @@ type Raft struct {
 
 	// Volatile state on all servers
 	role        Role
+	leaderID    string // current known leader ID
 	commitIndex uint64
 	lastApplied uint64
 
@@ -97,6 +103,7 @@ func New(cfg Config) (*Raft, error) {
 		currentTerm:        term,
 		votedFor:           votedFor,
 		role:               Follower,
+		lastApplied:        cfg.InitialLastApplied, // seed from recovered storage engine
 		heartbeatInterval:  cfg.HeartbeatInterval,
 		electionTimeoutMin: cfg.ElectionTimeoutMin,
 		electionTimeoutMax: cfg.ElectionTimeoutMax,
@@ -167,6 +174,13 @@ func (r *Raft) Role() Role {
 	return r.role
 }
 
+// LeaderID returns the currently recognized cluster leader ID, or empty if unknown.
+func (r *Raft) LeaderID() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.leaderID
+}
+
 // CurrentTerm returns the current election term.
 func (r *Raft) CurrentTerm() uint64 {
 	r.mu.Lock()
@@ -195,6 +209,54 @@ func (r *Raft) LastApplied() uint64 {
 	return r.lastApplied
 }
 
+// WaitForCommit blocks until the given log index has been committed (commitIndex >= index)
+// or the context is canceled. Used by HTTP handlers to wait for a proposed entry to reach quorum.
+func (r *Raft) WaitForCommit(ctx context.Context, index uint64) error {
+	for {
+		r.mu.Lock()
+		committed := r.commitIndex >= index
+		closed := r.closed
+		r.mu.Unlock()
+
+		if closed {
+			return ErrStopped
+		}
+		if committed {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// WaitForApply blocks until the given log index has been applied to the state machine
+// (lastApplied >= index) or the context is canceled.
+func (r *Raft) WaitForApply(ctx context.Context, index uint64) error {
+	for {
+		r.mu.Lock()
+		applied := r.lastApplied >= index
+		closed := r.closed
+		r.mu.Unlock()
+
+		if closed {
+			return ErrStopped
+		}
+		if applied {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
 // resetElectionTimeoutLocked sets a random election timeout within [min, max].
 func (r *Raft) resetElectionTimeoutLocked() {
 	jitter := r.electionTimeoutMax - r.electionTimeoutMin
@@ -209,6 +271,7 @@ func (r *Raft) resetElectionTimeoutLocked() {
 func (r *Raft) stepDownLocked(newTerm uint64) {
 	r.currentTerm = newTerm
 	r.role = Follower
+	r.leaderID = ""
 	r.votedFor = ""
 	_ = r.storage.SaveState(r.currentTerm, r.votedFor)
 	r.lastHeartbeat = time.Now()
@@ -258,6 +321,7 @@ func (r *Raft) tick(now time.Time) {
 // startElectionLocked begins a new election as a Candidate (M3).
 func (r *Raft) startElectionLocked() {
 	r.role = Candidate
+	r.leaderID = ""
 	r.currentTerm++
 	r.votedFor = r.id
 	_ = r.storage.SaveState(r.currentTerm, r.votedFor)
@@ -330,6 +394,7 @@ func (r *Raft) startElectionLocked() {
 // becomeLeaderLocked promotes the node to Leader and initializes tracking state (M3 & M4).
 func (r *Raft) becomeLeaderLocked() {
 	r.role = Leader
+	r.leaderID = r.id
 	lastLogIndex, _ := r.storage.LastLogInfo()
 
 	for peerID := range r.peers {
@@ -614,6 +679,7 @@ func (r *Raft) HandleAppendEntries(ctx context.Context, req *AppendEntriesReques
 		// Valid leader recognized for current term
 		r.role = Follower
 	}
+	r.leaderID = req.LeaderID
 
 	// Valid heartbeat recognized: reset election timer
 	r.lastHeartbeat = time.Now()

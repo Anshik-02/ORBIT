@@ -1,153 +1,175 @@
-# ORBIT — Core Database & Storage Engine (Section 1)
+# ORBIT — Distributed Consensus Key-Value Database
 
-ORBIT is a high-performance, crash-resilient, persistent Key-Value database storage engine written in Go. Section 1 delivers a completely standalone storage node implementing Write-Ahead Logging (WAL), an in-memory Memtable, automatic crash recovery, lifecycle-coordinated graceful drain, process-level exclusive locking, and an HTTP REST API.
+ORBIT is a high-performance, crash-resilient, distributed Key-Value database written in Go. It combines an ACID-compliant single-node storage engine (Write-Ahead Logging with streaming recovery and process locking) with a production-grade implementation of the **Raft Consensus Algorithm** (leader election, randomized timeouts, log replication, majority commitment, fault tolerance, and automatic client request forwarding/redirects).
 
 ---
 
 ## Architecture Overview
 
 ```
-                      +-------------------+
-                      |    HTTP Client    |
-                      +---------+---------+
-                                |  (GET / POST / DELETE / HEALTH)
-                                v
-                      +-------------------+
-                      |   HTTP API Layer  |
-                      | (internal/api)    |
-                      +---------+---------+
+                          CLIENT (HTTP)
                                 |
                                 v
-                      +-------------------+
-                      |  Database Layer   |
-                      | (validation/errs) |
-                      +---------+---------+
+                     +---------------------+
+                     |    NODE A (2525)    |
+                     |       LEADER        |
+                     +----------+----------+
                                 |
-                                v
-                      +-------------------+
-                      |   StorageEngine   |
-                      | (internal/storage)|
-                      +----+---------+----+
-                           |         |
-                  (1) Append         | (2) Update State
-                           v         v
-                 +-----------+     +------------+
-                 |    WAL    |     |  Memtable  |
-                 | (on disk) |     | (in-memory)|
-                 +-----------+     +------------+
+                  Raft RPC (AppendEntries)
+                                |
+               +----------------+----------------+
+               |                                 |
+               v                                 v
+     +-------------------+             +-------------------+
+     |   NODE B (2526)   |             |   NODE C (2527)   |
+     |     FOLLOWER      |             |     FOLLOWER      |
+     +-------------------+             +-------------------+
+
+   Each Node Architecture:
+   +-------------------------------------------------------+
+   |  Client HTTP API (2525) -> Leader-aware / Redirects  |
+   +-------------------------------------------------------+
+   |  Raft Transport (3525)  -> AppendEntries / Vote RPCs  |
+   +-------------------------------------------------------+
+   |  Raft Consensus Engine  -> Election / Quorum Commit   |
+   |    - raft.log (consensus log) + metadata.json         |
+   +-------------------------------------------------------+
+   |  Storage Engine (ApplyCommitted)                      |
+   |    - wal.log (applied state WAL)                      |
+   |    - Memtable (concurrent in-memory state)            |
+   +-------------------------------------------------------+
 ```
 
-### The Durability Invariant
-Before modifying the in-memory state (`Memtable`), ORBIT **first** writes the mutation record to the Write-Ahead Log (`wal.log`) and explicitly calls `fsync()` to flush to persistent disk. If the process is terminated or loses power, upon restarting it replays the WAL from disk to restore the exact state.
+### Two Distinct Logs Architectural Decoupling
+1. **Raft Consensus Log (`data/<node>/raft/raft.log` + `metadata.json`)**:
+   Tracks in-flight and replicated log proposals across the distributed cluster. Uncommitted entries may be overwritten if a leader crashes before quorum.
+2. **Storage Engine WAL (`data/<node>/wal.log`)**:
+   Only receives entries **after** they have reached strict majority quorum commitment (`ApplyCommitted`). The local storage engine remains strictly decoupled from consensus terms and indexes.
 
 ---
 
-## Core Features Implemented
+## Phase 2 Milestones Implemented
 
-1. **Memtable (`internal/storage/memtable.go`)**:
-   - In-memory key-value store using Go `map[string]string`.
-   - Thread-safe read/write operations using `sync.RWMutex` (concurrent non-blocking reads).
-   - O(1) average lookup and deletion performance.
-
-2. **Write-Ahead Log (`internal/wal/wal.go`, `record.go`, `lock_*.go`)**:
-   - **Exclusive Process-Level Lock**: Uses OS-level file locking (`<walPath>.lock` via `LockFileEx` on Windows, `flock` on Unix) preventing multiple processes from concurrently mutating the same data directory. Verified across separate operating system processes and through abnormal process terminations.
-   - **Restrictive Security Permissions**: Directories default to `0700` and files (`wal.log`, `wal.log.lock`) to `0600` (owner read/write only).
-   - **Schema Versioning & Length-Prefixed Checksums**: Versioned records (`version: 1`) with unambiguous length-prefixed **CRC32-IEEE checksums** eliminating field boundary ambiguity.
-   - **Committed Sequence Counter & Overflow Check**: Mutex-protected counter that advances strictly after a successful `fsync`, protected against `MaxUint64` overflow.
-   - **Streaming Recovery (O(1) Memory)**: Records stream one-by-one via `HandlerFunc`, eliminating startup memory spikes and redundant scans.
-   - **Failure Poisoning & Sticky Close Errors**: Any disk write or sync failure marks the log poisoned, halting further writes into an uncertain state. All layers (WAL, Engine, Database) preserve sticky close errors.
-   - **Strict Invariants**: Enforces contiguous $1 \rightarrow 2 \rightarrow 3$ sequences, rejects trailing JSON tokens on record lines, and rejects blank lines.
-   - **Truncation of Incomplete Writes**: Truncates partial trailing writes from crash mid-write back to the clean record boundary.
-   - Deletions recorded as tombstones (`OperationDelete`).
-
-3. **Storage Engine & Raft Integration Boundary (`internal/storage/engine.go`)**:
-   - **Consensus Application Boundary**: Exposes `ApplyCommitted(CommittedCommand)` separating consensus metadata (**Raft log index**, **Raft term**) from local physical **WAL sequence numbers**.
-   - **Durable Progress, Gap Enforcement & Overflow Protection**: Persists `RaftIndex` and `RaftTerm` into WAL records so `lastAppliedIndex` survives restarts. Enforces strictly contiguous sequential application (`lastAppliedIndex + 1`), rejecting index gaps (`ErrRaftIndexGap`) and guarding against `MaxUint64` index overflow (`ErrRaftIndexOverflow`).
-   - **Atomic Snapshot Installation Baseline**: Implements `InstallSnapshot(SnapshotMetadata, map[string]string)` with regression rejection (`ErrSnapshotIndexRegression`) ensuring atomic state replacement when catching up lagging cluster nodes.
-   - **Commit Idempotency**: Duplicate consensus entries are safe, idempotent no-ops.
-   - Coordinates WAL and Memtable mutations atomically under `writeMu`.
-   - Self-healing startup: single-pass streaming WAL replay on boot reconstructs the Memtable and restores consensus progress.
-   - Shutdown tracking: returns `ErrClosed` if mutations are attempted after shutdown.
-
-4. **Database Operations Layer (`internal/database/`)**:
-   - Exposes clean `Set`, `Get`, `Delete`, `ApplyCommitted`, `Health` methods.
-   - **Constructor Contract Enforcement**: `NewDatabase` strictly validates against `nil` and typed nil pointer engines (`ErrNilEngine`).
-   - **Standard KV Semantics**: Empty values (`""`) are fully valid; rejects only blank keys.
-   - **Lifecycle Coordination**: Uses `sync.RWMutex` so `Close()` waits for all active in-flight operations to complete before closing the storage engine.
-   - **Sticky Shutdown Errors**: Preserves close failures across retries.
-   - Sentinel errors (`ErrKeyNotFound`, `ErrEmptyKey`, `ErrClosed`, `ErrNilEngine`).
-   - Defines the `StorageEngine` interface, creating a decoupled contract for Section 2 (Raft consensus) integration.
-
-5. **HTTP REST API (`internal/api/`, `cmd/orbit/main.go`)**:
-   - Native Go 1.22+ routing with method matching and path parameters.
-   - Strict input validation: 1MB body limit (returns `413 Request Entity Too Large`), rejection of unknown JSON fields and trailing payloads.
-   - **Phased Graceful Shutdown**: Drains active requests within 5s, forcibly terminates lingering sockets on timeout with `server.Close()`, and coordinates cleanup without `log.Fatalf` in goroutines.
-   - **Diagnostic Health Check (`/health`)**: Reports process status, storage engine health (detecting poisoned WALs), write availability, and cluster role.
+- **M0: Cluster Topologies & Node Configuration (`internal/node/config.go`, `node.go`)**:
+  Structured `NodeConfig`, `PeerConfig`, duration unmarshaling (human-readable `"50ms"` or nanoseconds), validation, and standard 3-node cluster layouts.
+- **M1: Persistent Raft Storage Engine (`internal/raft/storage.go`)**:
+  Durable `raft.log` with length-prefixed CRC32 checksums, atomic term/vote metadata persistence via `metadata.json.tmp`, log truncation, and in-memory cache with sentinel at index 0.
+- **M2: Inter-Node Transport Subsystem (`internal/raft/transport.go`, `http_transport.go`, `mock_transport.go`)**:
+  Pluggable transport architecture with HTTP REST transport (`POST /raft/vote`, `POST /raft/append`) and an in-memory `MockNetwork` for deterministic testing with network partition simulation (`Isolate`, `Rejoin`, `DropVotes`).
+- **M3: Randomized Election Timeouts & Leader Election (`internal/raft/raft.go`)**:
+  Randomized jittered election timers, parallel vote solicitation, strict majority vote counting, split-vote resolution, and candidate log up-to-date validation (§5.4.1).
+- **M4: Heartbeat Mechanism & Leadership Maintenance (`internal/raft/raft.go`)**:
+  Periodic leader heartbeats suppressing follower elections, authority validation, and immediate step-down upon discovering higher terms.
+- **M5: Replicated Log Proposals & Catch-Up Replication (`internal/raft/raft.go`)**:
+  Log proposal dispatch, conflict detection, fast backtracking via `ConflictIndex` hints, and log overwriting.
+- **M6: Majority Commitment & State Machine Application (`internal/raft/raft.go`, `tests/raft_commit_test.go`)**:
+  Quorum calculation ($N/2 + 1$), Raft §5.4.2 current-term commitment constraint, sequential asynchronous state machine draining via `applyLoop` and `sync.Cond`, and restart recovery seeding (`InitialLastApplied`).
+- **M7: Client Request Integration (`internal/api/raft_handlers.go`, `tests/raft_api_test.go`)**:
+  Leader-aware HTTP routing: writes to leader block until quorum commit; writes to followers return `307 Temporary Redirect` with `Location` header and structured JSON redirect metadata; leader serves linearizable reads.
+- **M8: Failure Handling & Recovery (`tests/raft_failure_test.go`)**:
+  Survives leader isolation (uncommitted entries do not commit without quorum; remaining 2 nodes elect new leader), minority follower partitions (majority continues without pause), node crash & restart with full WAL replay and catch-up.
+- **M9: End-to-End Cluster Testing & CLI Runner (`cmd/orbit/main.go`, `configs/`, `tests/raft_e2e_test.go`)**:
+  CLI runner supporting `--config configs/node-X.json`, full concurrent client stress testing with race detector verification.
 
 ---
 
 ## API Endpoints
 
-| Method | Endpoint | Request Body | Success Code | Description |
+| Method | Endpoint | Request Body | Status Codes | Description |
 |---|---|---|---|---|
-| `GET` | `/health` | _None_ | `200 OK` | Diagnostic health & readiness check |
-| `POST` | `/api/v1/kv` | `{"key": "user:1", "value": "Anshik"}` | `201 Created` | Store a key-value pair (empty values permitted) |
-| `GET` | `/api/v1/kv/{key}` | _None_ | `200 OK` | Retrieve value for key |
-| `DELETE` | `/api/v1/kv/{key}` | _None_ | `200 OK` | Delete key (tombstone) |
+| `GET` | `/health` | _None_ | `200 OK` / `503 Service Unavailable` | Cluster health, role, leader ID, term, commit/applied index |
+| `POST` | `/api/v1/kv` | `{"key":"user:1","value":"Anshik"}` | `201 Created` / `307 Temporary Redirect` | Write KV pair. Automatically redirects to leader if sent to follower |
+| `GET` | `/api/v1/kv/{key}` | _None_ | `200 OK` / `307 Temporary Redirect` / `404 Not Found` | Consistent read for key |
+| `DELETE` | `/api/v1/kv/{key}` | _None_ | `200 OK` / `307 Temporary Redirect` | Remove key via consensus tombstone |
 
 ---
 
-## Running and Verifying
+## Running a 3-Node Cluster Locally
 
-### 1. Run All Automated Tests
-Includes unit tests, durability restart simulations, monotonic sequence checks, concurrency stress tests, Raft apply and gap tests, exclusive process locking tests, and partial write crash tests with race detection:
+Configuration files for local 3-node cluster are provided in `configs/`:
+
+### Terminal 1 (Node A)
 ```bash
-go test ./tests/... -v -race
+go run ./cmd/orbit --config configs/node-a.json
 ```
+- Client HTTP API: `http://127.0.0.1:2525`
+- Raft Transport: `http://127.0.0.1:3525`
 
-### 2. Start the ORBIT Server
+### Terminal 2 (Node B)
 ```bash
-go run ./cmd/orbit
+go run ./cmd/orbit --config configs/node-b.json
 ```
-The server will start listening on `http://localhost:2525`.
+- Client HTTP API: `http://127.0.0.1:2526`
+- Raft Transport: `http://127.0.0.1:3526`
 
-### 3. Test HTTP Operations
-
-#### Health check:
+### Terminal 3 (Node C)
 ```bash
-curl http://localhost:2525/health
+go run ./cmd/orbit --config configs/node-c.json
+```
+- Client HTTP API: `http://127.0.0.1:2527`
+- Raft Transport: `http://127.0.0.1:3527`
+
+---
+
+## Interacting with the Cluster
+
+### 1. Check Node Health & Discover Leader
+```bash
+curl http://127.0.0.1:2525/health
 ```
 Response:
 ```json
 {
   "status": "ok",
   "node": "node-a",
+  "role": "leader",
+  "leader_id": "node-a",
+  "term": 1,
+  "commit_index": 0,
+  "last_applied": 0,
   "storage": "healthy",
   "writable": true,
-  "cluster": "standalone"
+  "cluster": "raft"
 }
 ```
 
-#### Store a key-value pair (SET):
+### 2. Write Data to Leader
 ```bash
-curl -X POST http://localhost:2525/api/v1/kv \
+curl -i -X POST http://127.0.0.1:2525/api/v1/kv \
   -H "Content-Type: application/json" \
-  -d '{"key":"user:1","value":"Anshik"}'
+  -d '{"key":"planet","value":"Saturn"}'
+```
+Response:
+```http
+HTTP/1.1 201 Created
+Content-Type: application/json
+
+{"key":"planet","value":"Saturn"}
 ```
 
-#### Retrieve a value (GET):
+### 3. Write Data to Follower (Automatic Leader Redirect)
+Send a request to Node B (follower on port 2526):
 ```bash
-curl http://localhost:2525/api/v1/kv/user:1
+curl -i -X POST http://127.0.0.1:2526/api/v1/kv \
+  -H "Content-Type: application/json" \
+  -d '{"key":"galaxy","value":"Milky Way"}'
 ```
+Response:
+```http
+HTTP/1.1 307 Temporary Redirect
+Location: http://127.0.0.1:2525/api/v1/kv
+Content-Type: application/json
 
-#### Delete a key (DELETE):
+{"error":"not_leader","leader_id":"node-a","leader_address":"127.0.0.1:2525"}
+```
+Using `curl -L` will automatically follow the redirect to the leader and complete the write!
+
+---
+
+## Running the Automated Test Suite
+
+To run the complete test suite including single-node durability tests, multi-process lock tests, Raft elections, replication, commitments, failure scenarios, and concurrent end-to-end tests with the Go race detector:
+
 ```bash
-curl -X DELETE http://localhost:2525/api/v1/kv/user:1
+go test ./tests/... -v -race -count=1
 ```
-
-#### Verify Crash Durability:
-1. Insert keys via `POST /api/v1/kv`.
-2. Stop ORBIT (`Ctrl + C`).
-3. Inspect `data/node-a/wal.log` to see the durable entries with checksums and schema versions.
-4. Restart ORBIT with `go run ./cmd/orbit`.
-5. Retrieve the keys via `GET /api/v1/kv/{key}` — data is recovered from the WAL!

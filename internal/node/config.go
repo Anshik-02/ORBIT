@@ -1,9 +1,11 @@
 package node
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -36,6 +38,76 @@ type NodeConfig struct {
 	HeartbeatInterval  time.Duration `json:"heartbeat_interval"`   // default: 50ms
 	ElectionTimeoutMin time.Duration `json:"election_timeout_min"` // default: 150ms
 	ElectionTimeoutMax time.Duration `json:"election_timeout_max"` // default: 300ms
+}
+
+// UnmarshalJSON parses a NodeConfig, transparently supporting human-readable duration strings
+// (such as "50ms", "150ms") or raw nanosecond integers.
+func (c *NodeConfig) UnmarshalJSON(data []byte) error {
+	type rawConfig struct {
+		ID                 string          `json:"id"`
+		Address            string          `json:"address"`
+		RaftAddress        string          `json:"raft_address"`
+		DataDir            string          `json:"data_dir"`
+		Peers              []PeerConfig    `json:"peers"`
+		HeartbeatInterval  json.RawMessage `json:"heartbeat_interval"`
+		ElectionTimeoutMin json.RawMessage `json:"election_timeout_min"`
+		ElectionTimeoutMax json.RawMessage `json:"election_timeout_max"`
+	}
+
+	var raw rawConfig
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	c.ID = raw.ID
+	c.Address = raw.Address
+	c.RaftAddress = raw.RaftAddress
+	c.DataDir = raw.DataDir
+	c.Peers = raw.Peers
+
+	parseDuration := func(rawMsg json.RawMessage) (time.Duration, error) {
+		if len(rawMsg) == 0 || string(rawMsg) == "null" {
+			return 0, nil
+		}
+		var s string
+		if err := json.Unmarshal(rawMsg, &s); err == nil {
+			return time.ParseDuration(s)
+		}
+		var num int64
+		if err := json.Unmarshal(rawMsg, &num); err == nil {
+			return time.Duration(num), nil
+		}
+		return 0, fmt.Errorf("invalid duration: %s", string(rawMsg))
+	}
+
+	var err error
+	if c.HeartbeatInterval, err = parseDuration(raw.HeartbeatInterval); err != nil {
+		return fmt.Errorf("heartbeat_interval: %w", err)
+	}
+	if c.ElectionTimeoutMin, err = parseDuration(raw.ElectionTimeoutMin); err != nil {
+		return fmt.Errorf("election_timeout_min: %w", err)
+	}
+	if c.ElectionTimeoutMax, err = parseDuration(raw.ElectionTimeoutMax); err != nil {
+		return fmt.Errorf("election_timeout_max: %w", err)
+	}
+
+	return nil
+}
+
+// LoadConfig reads, deserializes, and validates a NodeConfig from a JSON file.
+func LoadConfig(path string) (NodeConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return NodeConfig{}, fmt.Errorf("node: read config file %q: %w", path, err)
+	}
+	var cfg NodeConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return NodeConfig{}, fmt.Errorf("node: parse config JSON %q: %w", path, err)
+	}
+	if err := cfg.Validate(); err != nil {
+		return NodeConfig{}, fmt.Errorf("node: validate config %q: %w", path, err)
+	}
+	return cfg, nil
 }
 
 // Validate ensures the node configuration is self-consistent and well-formed.

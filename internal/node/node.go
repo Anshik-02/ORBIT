@@ -94,6 +94,7 @@ func NewNode(cfg NodeConfig, customTransport raft.Transport) (*Node, error) {
 		ElectionTimeoutMin: cfg.ElectionTimeoutMin,
 		ElectionTimeoutMax: cfg.ElectionTimeoutMax,
 		CommitCallback:     n.onCommittedEntry,
+		InitialLastApplied: eng.LastAppliedIndex(), // seed from recovered WAL to prevent re-application
 	})
 	if err != nil {
 		_ = rStorage.Close()
@@ -130,8 +131,12 @@ func (n *Node) Start() error {
 	// Start client HTTP API server if address provided
 	if n.config.Address != "" {
 		mux := http.NewServeMux()
-		handler := api.NewHandler(n.db)
-		api.RegisterRoutes(mux, handler)
+		peerHTTPAddrs := make(map[string]string)
+		for _, p := range n.config.Peers {
+			peerHTTPAddrs[p.ID] = p.Address
+		}
+		handler := api.NewRaftHandler(n.raft, n.db, n.config.ID, n.config.Address, peerHTTPAddrs)
+		api.RegisterRaftRoutes(mux, handler)
 
 		n.httpServer = &http.Server{
 			Addr:         n.config.Address,

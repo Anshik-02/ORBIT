@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 
 	"orbit/internal/api"
 	"orbit/internal/database"
+	"orbit/internal/node"
 	"orbit/internal/storage"
 )
 
@@ -21,7 +23,64 @@ const (
 )
 
 func main() {
-	fmt.Println("ORBIT Database Starting...")
+	var configFile string
+	flag.StringVar(&configFile, "config", "", "path to node configuration JSON (e.g. configs/node-a.json)")
+	flag.Parse()
+
+	if configFile != "" {
+		runClusterNode(configFile)
+		return
+	}
+
+	runStandalone()
+}
+
+// runClusterNode starts an ORBIT node participating in a distributed Raft consensus cluster.
+func runClusterNode(configPath string) {
+	cfg, err := node.LoadConfig(configPath)
+	if err != nil {
+		log.Fatalf("failed to load node config: %v", err)
+	}
+
+	fmt.Printf("Starting ORBIT Cluster Node %q...\n", cfg.ID)
+	fmt.Printf("  Client HTTP API: http://%s\n", cfg.Address)
+	fmt.Printf("  Raft Transport:  http://%s\n", cfg.RaftAddress)
+	fmt.Printf("  Data Directory:  %s\n", cfg.DataDir)
+	fmt.Printf("  Peers:           %d remote peers configured\n", len(cfg.Peers))
+
+	n, err := node.NewNode(cfg, nil) // uses production HTTPTransport
+	if err != nil {
+		log.Fatalf("failed to initialize cluster node: %v", err)
+	}
+
+	if err := n.Start(); err != nil {
+		log.Fatalf("failed to start cluster node: %v", err)
+	}
+
+	fmt.Printf("Node %s online and listening.\n", cfg.ID)
+	fmt.Println("\nEndpoints available:")
+	fmt.Printf("  POST   http://%s/api/v1/kv\n", cfg.Address)
+	fmt.Printf("  GET    http://%s/api/v1/kv/{key}\n", cfg.Address)
+	fmt.Printf("  DELETE http://%s/api/v1/kv/{key}\n", cfg.Address)
+	fmt.Printf("  GET    http://%s/health\n", cfg.Address)
+	fmt.Println("\nPress Ctrl+C to stop.")
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-quit
+
+	fmt.Printf("\nReceived signal %v. Initiating graceful cluster node shutdown...\n", sig)
+	if err := n.Stop(); err != nil {
+		log.Printf("warning: node stop error: %v", err)
+	} else {
+		fmt.Printf("Node %s drained, consensus stopped, and storage closed cleanly.\n", cfg.ID)
+	}
+	fmt.Println("ORBIT shutdown complete. Goodbye.")
+}
+
+// runStandalone runs ORBIT in standalone single-node mode (Phase 1).
+func runStandalone() {
+	fmt.Println("ORBIT Database Starting (Standalone Mode)...")
 
 	// Ensure the data directory exists with restrictive 0700 permissions.
 	if err := os.MkdirAll("data/node-a", 0700); err != nil {
@@ -91,7 +150,6 @@ func main() {
 
 	if err := server.Shutdown(ctx); err != nil {
 		log.Printf("warning: HTTP graceful drain failed (%v); forcing immediate socket termination", err)
-		// Force close policy: terminate all connections immediately when graceful shutdown fails
 		if closeErr := server.Close(); closeErr != nil {
 			log.Printf("warning: server force-close error: %v", closeErr)
 		}
