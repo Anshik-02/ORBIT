@@ -104,6 +104,16 @@ The server will start listening on `http://localhost:2525`.
 ```bash
 curl http://localhost:2525/health
 ```
+Response:
+```json
+{
+  "status": "ok",
+  "node": "node-a",
+  "storage": "healthy",
+  "writable": true,
+  "cluster": "standalone"
+}
+```
 
 #### Store a key-value pair (SET):
 ```bash

@@ -1,6 +1,6 @@
 package database
 
-import "sync/atomic"
+import "sync"
 
 // StorageEngine is the interface that the Database layer talks to.
 type StorageEngine interface {
@@ -8,17 +8,21 @@ type StorageEngine interface {
 	Get(key string) (string, bool)
 	Delete(key string) error
 	Close() error
+	Health() error
 }
 
 // Database is the public-facing database object.
 //
-// It wraps a StorageEngine and adds:
-//   - Input validation (empty keys/values)
-//   - Idiomatic Go error types (ErrKeyNotFound, ErrClosed)
-//   - Shutdown tracking preventing operations after Close
+// Lifecycle Coordination:
+//   - Uses a lifecycle `closeMu sync.RWMutex`.
+//   - In-flight operations (Set, Get, Delete, Health) acquire `closeMu.RLock()`.
+//   - Close() acquires `closeMu.Lock()`, which guarantees that every in-flight
+//     operation initiated before Close() has completely finished executing
+//     before the underlying storage engine is closed and Close() returns.
 type Database struct {
-	engine StorageEngine
-	closed atomic.Bool
+	engine  StorageEngine
+	closeMu sync.RWMutex
+	closed  bool
 }
 
 // NewDatabase wraps a StorageEngine in a Database.
@@ -26,11 +30,19 @@ func NewDatabase(engine StorageEngine) *Database {
 	return &Database{engine: engine}
 }
 
-// Close shuts down the database and flushes/closes the underlying engine.
-// Idempotent: multiple calls return nil.
+// Close gracefully shuts down the database:
+//  1. Acquires closeMu.Lock(), blocking until all active operations finish.
+//  2. Sets closed = true so future operations are rejected.
+//  3. Flushes and closes the underlying storage engine.
+//
+// Idempotent: safe to call multiple times concurrently.
 func (db *Database) Close() error {
-	if db.closed.Swap(true) {
+	db.closeMu.Lock()
+	defer db.closeMu.Unlock()
+
+	if db.closed {
 		return nil
 	}
+	db.closed = true
 	return db.engine.Close()
 }

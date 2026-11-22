@@ -139,6 +139,14 @@ func (e *Engine) Delete(key string) error {
 	return nil
 }
 
+// Health checks whether the storage engine is open and its WAL is unpoisoned.
+func (e *Engine) Health() error {
+	if e.closed.Load() {
+		return ErrClosed
+	}
+	return e.wal.Health()
+}
+
 // Close safely flushes the WAL and shuts down the storage engine.
 // Idempotent: multiple calls return nil.
 func (e *Engine) Close() error {

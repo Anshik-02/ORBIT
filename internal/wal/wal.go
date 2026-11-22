@@ -126,11 +126,12 @@ func (l *Log) Append(r Record) error {
 // Validation rules enforced:
 //  1. Sequence validation: Records must form a contiguous progression:
 //     1 -> 2 -> 3 -> ... (gaps or duplicates are rejected as corrupted).
-//  2. Operation & Field validation: Only SET and DELETE are allowed; keys
+//  2. Strict append-only log: Blank lines are strictly rejected as corruption.
+//  3. Operation & Field validation: Only SET and DELETE are allowed; keys
 //     and values must be non-empty where required.
-//  3. Complete records: Any record with a terminating newline that fails
+//  4. Complete records: Any record with a terminating newline that fails
 //     JSON parsing or validation is treated as corruption and halts replay.
-//  4. Partial write recovery: An incomplete final record without a newline
+//  5. Partial write recovery: An incomplete final record without a newline
 //     (from a crash mid-write) is permitted; the file is truncated back
 //     to the last valid record boundary.
 func (l *Log) Replay() ([]Record, error) {
@@ -164,13 +165,13 @@ func (l *Log) Replay() ([]Record, error) {
 			hasNewline := line[lineLen-1] == '\n'
 			trimmed := bytes.TrimSpace(line)
 
-			if len(trimmed) == 0 {
-				// Blank line with a newline
-				if hasNewline {
-					currentOffset += lineLen
-					lastValidOffset = currentOffset
+			if hasNewline {
+				// Strict append-only log: blank records are never written by ORBIT.
+				// Blank lines indicate corruption or file tampering.
+				if len(trimmed) == 0 {
+					return nil, fmt.Errorf("wal: corrupt record at offset %d: unexpected blank line", currentOffset)
 				}
-			} else if hasNewline {
+
 				// A complete newline-terminated line
 				var r Record
 				if err := json.Unmarshal(trimmed, &r); err != nil {
@@ -233,6 +234,20 @@ func (l *Log) Replay() ([]Record, error) {
 	l.writer.Reset(l.file)
 
 	return records, nil
+}
+
+// Health checks whether the WAL is open and unpoisoned.
+func (l *Log) Health() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.closed {
+		return ErrWALClosed
+	}
+	if l.err != nil {
+		return fmt.Errorf("%w: %v", ErrWALPoisoned, l.err)
+	}
+	return nil
 }
 
 // Close flushes remaining buffers and closes the WAL file cleanly.

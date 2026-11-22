@@ -265,3 +265,19 @@ func TestWALConcurrentAppends(t *testing.T) {
 		}
 	}
 }
+
+// TestWALBlankLineRejected verifies that blank records are rejected as corruption.
+func TestWALBlankLineRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/wal.log"
+
+	content := `{"sequence":1,"operation":"SET","key":"k1","value":"v1"}` + "\n\n"
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err := wal.Open(path)
+	if err == nil {
+		t.Fatal("expected Open to fail with blank line corruption, got nil")
+	}
+}

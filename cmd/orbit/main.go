@@ -55,12 +55,6 @@ func main() {
 	h := api.NewHandler(db)
 	api.RegisterRoutes(mux, h)
 
-	// Health check endpoint — useful for load balancers and Section 2.
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintln(w, `{"status":"ok","node":"node-a"}`)
-	})
-
 	server := &http.Server{
 		Addr:         port,
 		Handler:      mux,

@@ -42,6 +42,14 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
+type healthResponse struct {
+	Status   string `json:"status"`   // "ok" or "unhealthy"
+	Node     string `json:"node"`     // "node-a"
+	Storage  string `json:"storage"`  // "healthy" or "unhealthy: ..."
+	Writable bool   `json:"writable"` // true if engine accepts writes
+	Cluster  string `json:"cluster"`  // "standalone" (prepared for Section 2 Raft roles)
+}
+
 // --- Helpers ---
 
 // writeJSON encodes v as JSON and writes it with the given status code.
@@ -143,4 +151,33 @@ func (h *Handler) HandleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, messageResponse{Message: "deleted"})
+}
+
+// HandleHealth handles GET /health
+//
+// Distinguishes:
+//   - Process alive
+//   - Storage engine health (WAL unpoisoned)
+//   - Node available for writes
+//   - Node cluster participation role
+func (h *Handler) HandleHealth(w http.ResponseWriter, r *http.Request) {
+	err := h.db.Health()
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, healthResponse{
+			Status:   "unhealthy",
+			Node:     "node-a",
+			Storage:  "unhealthy: " + err.Error(),
+			Writable: false,
+			Cluster:  "standalone",
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, healthResponse{
+		Status:   "ok",
+		Node:     "node-a",
+		Storage:  "healthy",
+		Writable: true,
+		Cluster:  "standalone",
+	})
 }

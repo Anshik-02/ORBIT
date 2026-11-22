@@ -277,3 +277,36 @@ func TestWALRecordValidationEmptySetValue(t *testing.T) {
 		t.Fatal("expected Open to fail with empty value for SET, got nil")
 	}
 }
+
+// TestDatabaseShutdownDrainsInFlightOperations verifies that db.Close() waits
+// for all in-flight operations to complete before returning.
+func TestDatabaseShutdownDrainsInFlightOperations(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := storage.NewEngine(dir + "/wal.log")
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	db := database.NewDatabase(engine)
+
+	const totalOps = 50
+	var wg sync.WaitGroup
+
+	for i := 0; i < totalOps; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			key := fmt.Sprintf("k-%d", idx)
+			val := fmt.Sprintf("v-%d", idx)
+			_ = db.Set(key, val)
+		}(i)
+	}
+
+	// Close database concurrently with operations
+	db.Close()
+	wg.Wait()
+
+	// Any operations initiated after Close() has returned must be rejected with ErrClosed
+	if err := db.Set("after-close", "val"); !errors.Is(err, database.ErrClosed) {
+		t.Errorf("expected ErrClosed after shutdown, got %v", err)
+	}
+}

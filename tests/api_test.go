@@ -118,3 +118,46 @@ func TestAPIRejectsOversizedBody(t *testing.T) {
 		t.Errorf("expected status 413 or 400 for oversized payload, got %d", rec.Code)
 	}
 }
+
+// TestAPIHealthReporting verifies health endpoint returns detailed diagnostic information.
+func TestAPIHealthReporting(t *testing.T) {
+	db := newTestDB(t)
+	mux := http.NewServeMux()
+	handler := api.NewHandler(db)
+	api.RegisterRoutes(mux, handler)
+
+	// Healthy check
+	req := httptest.NewRequest("GET", "/health", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d. Body: %s", rec.Code, rec.Body.String())
+	}
+
+	var res map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&res); err != nil {
+		t.Fatalf("Decode error: %v", err)
+	}
+
+	if res["status"] != "ok" || res["writable"] != true || res["storage"] != "healthy" {
+		t.Errorf("unexpected healthy payload: %+v", res)
+	}
+
+	// Close database and verify health reports 503 Service Unavailable
+	db.Close()
+
+	req = httptest.NewRequest("GET", "/health", nil)
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected status 503 on closed db, got %d", rec.Code)
+	}
+
+	var closedRes map[string]any
+	json.NewDecoder(rec.Body).Decode(&closedRes)
+	if closedRes["writable"] != false || closedRes["status"] != "unhealthy" {
+		t.Errorf("unexpected closed payload: %+v", closedRes)
+	}
+}
