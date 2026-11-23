@@ -57,6 +57,10 @@ type snapshotAssembly struct {
 type Raft struct {
 	mu         sync.Mutex
 	snapshotMu sync.Mutex // serializes heavy disk persistence and state machine restore outside mu
+	// stateMu serializes all state-machine callbacks (commit and snapshot restore) so a snapshot
+	// restore can never execute concurrently with a commit callback that is mid-flight in applyLoop.
+	// Lock order: stateMu is always acquired BEFORE r.mu, and NEVER while r.mu is held.
+	stateMu sync.Mutex
 
 	id        string
 	groupID   GroupID
@@ -1036,10 +1040,14 @@ func (r *Raft) applyLoop() {
 		cb := r.commitCallback
 		r.mu.Unlock()
 
-		// Apply sequentially to state machine outside mu
+		// Apply sequentially to state machine outside mu.
+		// stateMu serializes this callback with snapshot restore:
+		// a restore cannot proceed until any in-flight callback finishes.
 		var err error
 		if cb != nil {
+			r.stateMu.Lock()
 			err = cb(entry)
+			r.stateMu.Unlock()
 		}
 
 		r.mu.Lock()
@@ -1274,6 +1282,23 @@ func (r *Raft) HandleInstallSnapshot(ctx context.Context, req *InstallSnapshotRe
 		return nil, fmt.Errorf("%w: %w", ErrStorageHalted, err)
 	}
 
+	// 0. Validate GroupID if present in request
+	if req.GroupID != "" && req.GroupID != r.groupID {
+		term := r.currentTerm
+		r.mu.Unlock()
+		return &InstallSnapshotResponse{
+			Term:    term,
+			Success: false,
+			Error:   fmt.Sprintf("group mismatch: expected %s, got %s", r.groupID, req.GroupID),
+		}, nil
+	}
+
+	// 0b. Expire stale snapshot assembly older than 30 seconds (leader change / interrupted transfer)
+	const snapshotAssemblyTTL = 30 * time.Second
+	if r.snapshotAssembly != nil && time.Since(r.snapshotAssembly.lastActivity) > snapshotAssemblyTTL {
+		r.snapshotAssembly = nil
+	}
+
 	// 1. Reply immediately if req.Term < currentTerm
 	if req.Term < r.currentTerm {
 		term := r.currentTerm
@@ -1409,11 +1434,35 @@ func (r *Raft) HandleInstallSnapshot(ctx context.Context, req *InstallSnapshotRe
 		}, nil
 	}
 
+	// Validate that LastIncludedTerm is non-zero and plausible (must be ≤ sender's term)
+	if lastIncludedTerm == 0 {
+		r.mu.Unlock()
+		return &InstallSnapshotResponse{
+			Term:    installTerm,
+			Success: false,
+			Error:   "snapshot LastIncludedTerm must be > 0",
+		}, nil
+	}
+	if lastIncludedTerm > installTerm {
+		r.mu.Unlock()
+		return &InstallSnapshotResponse{
+			Term:    installTerm,
+			Success: false,
+			Error:   fmt.Sprintf("snapshot LastIncludedTerm %d exceeds sender term %d", lastIncludedTerm, installTerm),
+		}, nil
+	}
+
 	// Release r.mu during slow disk persistence, compaction, and state-machine restore
 	r.mu.Unlock()
 
+	// snapshotMu: serialize concurrent snapshot creations/installations.
+	// stateMu:    serialize with any in-flight applyLoop commit callback.
+	// Lock order: snapshotMu → stateMu (never the reverse).
 	r.snapshotMu.Lock()
 	defer r.snapshotMu.Unlock()
+
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
 
 	meta := SnapshotMetadata{
 		Version:           SnapshotCurrentVersion,
@@ -1549,6 +1598,7 @@ func (r *Raft) TakeSnapshot() (*SnapshotMetadata, error) {
 		r.mu.Unlock()
 		return nil, fmt.Errorf("%w: %w", ErrStorageHalted, err)
 	}
+
 	if r.snapshotCallback == nil {
 		r.mu.Unlock()
 		return nil, errors.New("raft: snapshot callback not configured")
