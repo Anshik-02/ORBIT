@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -81,12 +82,16 @@ type MockTransport struct {
 }
 
 func (t *MockTransport) RegisterHandler(groupID GroupID, handler RPCHandler) error {
+	if handler == nil {
+		return ErrNilHandler
+	}
+	if strings.TrimSpace(string(groupID)) == "" {
+		return ErrInvalidGroupID
+	}
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if groupID == "" {
-		groupID = DefaultGroupID
-	}
 	if t.handlers == nil {
 		t.handlers = make(map[GroupID]RPCHandler)
 	}

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -50,12 +51,16 @@ func NewHTTPTransport(addr string) *HTTPTransport {
 
 // RegisterHandler registers an RPCHandler for a specific consensus group.
 func (t *HTTPTransport) RegisterHandler(groupID GroupID, handler RPCHandler) error {
+	if handler == nil {
+		return ErrNilHandler
+	}
+	if strings.TrimSpace(string(groupID)) == "" {
+		return ErrInvalidGroupID
+	}
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if groupID == "" {
-		groupID = DefaultGroupID
-	}
 	if t.handlers == nil {
 		t.handlers = make(map[GroupID]RPCHandler)
 	}

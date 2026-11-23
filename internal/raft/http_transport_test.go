@@ -3,6 +3,7 @@ package raft
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 	"testing"
@@ -188,4 +189,109 @@ func TestTransportIsolation(t *testing.T) {
 	if httpResp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("expected StatusMethodNotAllowed from alive server, got %d", httpResp.StatusCode)
 	}
+}
+
+// TestHTTPTransport_RejectNilAndInvalidHandlers verifies Task 1:
+// Reject nil handler, duplicate GroupID, and invalid GroupID.
+func TestHTTPTransport_RejectNilAndInvalidHandlers(t *testing.T) {
+	t.Parallel()
+
+	transport := NewHTTPTransport("127.0.0.1:0")
+	handler := &mockIsolationHandler{}
+
+	// 1. Reject nil handler
+	if err := transport.RegisterHandler(GroupID("group-0"), nil); err == nil {
+		t.Fatal("expected error for nil handler, got nil")
+	} else if !errors.Is(err, ErrNilHandler) {
+		t.Fatalf("expected ErrNilHandler, got: %v", err)
+	}
+
+	// 2. Reject empty GroupID
+	if err := transport.RegisterHandler(GroupID(""), handler); err == nil {
+		t.Fatal("expected error for empty GroupID, got nil")
+	} else if !errors.Is(err, ErrInvalidGroupID) {
+		t.Fatalf("expected ErrInvalidGroupID, got: %v", err)
+	}
+
+	// 3. Reject whitespace GroupID
+	if err := transport.RegisterHandler(GroupID("   "), handler); err == nil {
+		t.Fatal("expected error for whitespace GroupID, got nil")
+	} else if !errors.Is(err, ErrInvalidGroupID) {
+		t.Fatalf("expected ErrInvalidGroupID, got: %v", err)
+	}
+
+	// 4. Register valid GroupID
+	if err := transport.RegisterHandler(GroupID("group-valid"), handler); err != nil {
+		t.Fatalf("first valid registration failed: %v", err)
+	}
+
+	// 5. Reject duplicate GroupID
+	if err := transport.RegisterHandler(GroupID("group-valid"), handler); err == nil {
+		t.Fatal("expected error for duplicate GroupID, got nil")
+	} else if !errors.Is(err, ErrDuplicateGroup) {
+		t.Fatalf("expected ErrDuplicateGroup, got: %v", err)
+	}
+}
+
+// TestHTTPTransport_ConcurrentOperations verifies Task 5:
+// Concurrently sends RPCs to multiple groups, registers handlers, and unregisters handlers.
+func TestHTTPTransport_ConcurrentOperations(t *testing.T) {
+	t.Parallel()
+
+	transport := NewHTTPTransport("127.0.0.1:0")
+
+	// Pre-register two static groups
+	h0 := &mockIsolationHandler{}
+	h1 := &mockIsolationHandler{}
+	_ = transport.RegisterHandler(GroupID("static-0"), h0)
+	_ = transport.RegisterHandler(GroupID("static-1"), h1)
+
+	if err := transport.Start(); err != nil {
+		t.Fatalf("transport.Start() failed: %v", err)
+	}
+	defer transport.Close()
+
+	client := NewHTTPTransport("127.0.0.1:0")
+	var wg sync.WaitGroup
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Goroutines 1-3: Concurrently send RPCs to static-0 and static-1
+	for workerID := 0; workerID < 3; workerID++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				_, _ = client.SendRequestVote(ctx, transport.Addr(), GroupID("static-0"), &RequestVoteRequest{
+					Term:        uint64(i + 1),
+					CandidateID: "cand",
+				})
+				_, _ = client.SendAppendEntries(ctx, transport.Addr(), GroupID("static-1"), &AppendEntriesRequest{
+					Term:     uint64(i + 1),
+					LeaderID: "leader",
+				})
+			}
+		}(workerID)
+	}
+
+	// Goroutines 4-5: Concurrently register and unregister dynamic groups
+	for workerID := 0; workerID < 2; workerID++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < 30; i++ {
+				dynGroup := GroupID(fmt.Sprintf("dyn-%d-%d", w, i))
+				_ = transport.RegisterHandler(dynGroup, &mockIsolationHandler{})
+				// Send an RPC to dynamic group
+				_, _ = client.SendRequestVote(ctx, transport.Addr(), dynGroup, &RequestVoteRequest{Term: 1})
+				// Unregister dynamic group
+				transport.UnregisterHandler(dynGroup)
+				// Send another RPC which should return ErrGroupNotFound without panicking
+				_, _ = client.SendRequestVote(ctx, transport.Addr(), dynGroup, &RequestVoteRequest{Term: 2})
+			}
+		}(workerID)
+	}
+
+	wg.Wait()
 }

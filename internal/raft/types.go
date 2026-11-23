@@ -19,6 +19,8 @@ var (
 	ErrStorageHalted  = errors.New("raft: consensus halted due to fatal storage error")
 	ErrGroupNotFound  = errors.New("raft: consensus group not found on this node")
 	ErrDuplicateGroup = errors.New("raft: consensus group handler already registered")
+	ErrNilHandler     = errors.New("raft: rpc handler cannot be nil")
+	ErrInvalidGroupID = errors.New("raft: invalid group id")
 )
 
 // GroupID uniquely identifies an independent consensus group (e.g. "shard-0").
