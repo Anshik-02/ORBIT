@@ -38,9 +38,12 @@ type messageResponse struct {
 	Message string `json:"message"`
 }
 
-type errorResponse struct {
+// ErrorResponse represents a standardized JSON error response.
+type ErrorResponse struct {
 	Error string `json:"error"`
 }
+
+type errorResponse = ErrorResponse
 
 type healthResponse struct {
 	Status   string `json:"status"`   // "ok" or "unhealthy"

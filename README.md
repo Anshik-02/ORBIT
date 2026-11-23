@@ -1,194 +1,156 @@
-# ORBIT — Distributed Consensus Key-Value Database
+# ORBIT — Distributed Multi-Raft Key-Value Database
 
-ORBIT is a high-performance, crash-resilient, distributed Key-Value database written in Go. It combines an ACID-compliant single-node storage engine (Write-Ahead Logging with streaming recovery and process locking) with a production-grade implementation of the **Raft Consensus Algorithm** (leader election, randomized timeouts, log replication, majority commitment, fault tolerance, and automatic client request forwarding/redirects).
+ORBIT is a high-performance, crash-resilient, distributed Key-Value database written in Go. It combines an ACID-compliant single-node storage engine (Write-Ahead Logging with streaming recovery and process locking), independent multi-group **Raft consensus**, consistent hash ring sharding, and real-time WebSocket cluster observability.
 
 ---
 
 ## Architecture Overview
 
-```
-                          CLIENT (HTTP)
-                                |
-                                v
-                     +---------------------+
-                     |    NODE A (2525)    |
-                     |       LEADER        |
-                     +----------+----------+
-                                |
-                  Raft RPC (AppendEntries)
-                                |
-               +----------------+----------------+
-               |                                 |
-               v                                 v
-     +-------------------+             +-------------------+
-     |   NODE B (2526)   |             |   NODE C (2527)   |
-     |     FOLLOWER      |             |     FOLLOWER      |
-     +-------------------+             +-------------------+
+ORBIT partitions the keyspace across multiple shards using consistent hashing. Each shard runs its own independent Raft consensus group replicated across a designated subset of physical nodes. A physical node can host replicas for multiple shards concurrently with strict transport, storage, and consensus isolation.
 
-   Each Node Architecture:
-   +-------------------------------------------------------+
-   |  Client HTTP API (2525) -> Leader-aware / Redirects  |
-   +-------------------------------------------------------+
-   |  Raft Transport (3525)  -> AppendEntries / Vote RPCs  |
-   +-------------------------------------------------------+
-   |  Raft Consensus Engine  -> Election / Quorum Commit   |
-   |    - raft.log (consensus log) + metadata.json         |
-   +-------------------------------------------------------+
-   |  Storage Engine (ApplyCommitted)                      |
-   |    - wal.log (applied state WAL)                      |
-   |    - Memtable (concurrent in-memory state)            |
-   +-------------------------------------------------------+
+```
+                         CLIENT (HTTP)
+                               |
+                               v
+                     +-------------------+
+                     |   SHARD ROUTER    |
+                     +-------------------+
+                               |
+             Consistent Hashing (Virtual Nodes)
+                               |
+          +--------------------+--------------------+
+          |                    |                    |
+          v                    v                    v
+      +-------+            +-------+            +-------+
+      |Shard 0|            |Shard 1|            |Shard 2|
+      +-------+            +-------+            +-------+
+          |                    |                    |
+     Raft Group 0         Raft Group 1         Raft Group 2
+ (Node A, B, C)       (Node D, E, A)       (Node B, C, D)
 ```
 
-### Two Distinct Logs Architectural Decoupling
-1. **Raft Consensus Log (`data/<node>/raft/raft.log` + `metadata.json`)**:
-   Tracks in-flight and replicated log proposals across the distributed cluster. Uncommitted entries may be overwritten if a leader crashes before quorum.
-2. **Storage Engine WAL (`data/<node>/wal.log`)**:
-   Only receives entries **after** they have reached strict majority quorum commitment (`ApplyCommitted`). The local storage engine remains strictly decoupled from consensus terms and indexes.
+### Physical Node Internals
+
+```
++------------------------------------------------------------------------+
+|                          PHYSICAL NODE A                               |
+|                                                                        |
+|  +------------------------------------------------------------------+  |
+|  | Client KV API (/kv/:key, /cluster/*, /ws/events)                 |  |
+|  | - Transparent Shard Routing & Leader Forwarding                  |  |
+|  | - Linearizable Reads via Raft ReadIndex Protocol                 |  |
+|  | - Live Event Streaming via RFC 6455 WebSockets                   |  |
+|  +------------------------------------------------------------------+  |
+|                                                                        |
+|  +------------------------------------------------------------------+  |
+|  | Multiplexed Group-Aware HTTP Transport (/raft/vote, /raft/append)|  |
+|  +------------------------------------------------------------------+  |
+|             |                                            |             |
+|             v                                            v             |
+|  +---------------------+                      +---------------------+  |
+|  |   SHARD 0 REPLICA   |                      |   SHARD 1 REPLICA   |  |
+|  |   Raft Group 0      |                      |   Raft Group 1      |  |
+|  |   Term, Log, State  |                      |   Term, Log, State  |  |
+|  |   Isolated WAL/DB   |                      |   Isolated WAL/DB   |  |
+|  +---------------------+                      +---------------------+  |
++------------------------------------------------------------------------+
+```
+
+### Key Architectural Invariants
+
+1. **Multi-Raft Consensus Independence**:
+   Each shard maintains its own term, log entries, commit index, election timer, and leader identity. A failure or term increase in Shard 0 never affects Shard 1.
+2. **Storage Isolation**:
+   Every shard replica maintains a strictly isolated data directory (`data/<node>/shards/shard-<id>/`), including its own `raft.log`, `metadata.json`, and database `wal.log`.
+3. **Transport Multiplexing**:
+   A single shared HTTP listener routes consensus RPCs to the appropriate local Raft group using the `group_id` header and payload field.
+4. **Linearizable Reads via ReadIndex**:
+   Reads query the shard leader, execute the Raft ReadIndex protocol to verify leadership against a strict majority quorum, wait for `lastApplied >= readIndex`, and return linearizable data. Partitioned leaders reject reads if quorum cannot be confirmed.
+5. **Deterministic Replica Placement**:
+   Replicas are assigned to physical nodes using the formula $R_i = (S \cdot K + i) \pmod N$, ensuring balanced shard distribution across cluster nodes.
 
 ---
 
-## Phase 2 Milestones Implemented
+## Shard-Aware Client KV API
 
-- **M0: Cluster Topologies & Node Configuration (`internal/node/config.go`, `node.go`)**:
-  Structured `NodeConfig`, `PeerConfig`, duration unmarshaling (human-readable `"50ms"` or nanoseconds), validation, and standard 3-node cluster layouts.
-- **M1: Persistent Raft Storage Engine (`internal/raft/storage.go`)**:
-  Durable `raft.log` with length-prefixed CRC32 checksums, atomic term/vote metadata persistence via `metadata.json.tmp`, log truncation, and in-memory cache with sentinel at index 0.
-- **M2: Inter-Node Transport Subsystem (`internal/raft/transport.go`, `http_transport.go`, `mock_transport.go`)**:
-  Pluggable transport architecture with HTTP REST transport (`POST /raft/vote`, `POST /raft/append`) and an in-memory `MockNetwork` for deterministic testing with network partition simulation (`Isolate`, `Rejoin`, `DropVotes`).
-- **M3: Randomized Election Timeouts & Leader Election (`internal/raft/raft.go`)**:
-  Randomized jittered election timers, parallel vote solicitation, strict majority vote counting, split-vote resolution, and candidate log up-to-date validation (§5.4.1).
-- **M4: Heartbeat Mechanism & Leadership Maintenance (`internal/raft/raft.go`)**:
-  Periodic leader heartbeats suppressing follower elections, authority validation, and immediate step-down upon discovering higher terms.
-- **M5: Replicated Log Proposals & Catch-Up Replication (`internal/raft/raft.go`)**:
-  Log proposal dispatch, conflict detection, fast backtracking via `ConflictIndex` hints, and log overwriting.
-- **M6: Majority Commitment & State Machine Application (`internal/raft/raft.go`, `tests/raft_commit_test.go`)**:
-  Quorum calculation ($N/2 + 1$), Raft §5.4.2 current-term commitment constraint, sequential asynchronous state machine draining via `applyLoop` and `sync.Cond` advancing `lastApplied` strictly per-entry on callback success, and restart recovery seeding (`InitialLastApplied`).
-- **M7: Client Request Integration (`internal/api/raft_handlers.go`, `tests/raft_api_test.go`)**:
-  Leader-aware HTTP routing: writes to leader block until quorum commit; writes to followers return `307 Temporary Redirect` with `Location` header and structured JSON redirect metadata; **Quorum-Confirmed Reads (ReadIndex Protocol, Raft §6.4)**: linearizable reads execute the Raft ReadIndex protocol—confirming leadership via majority quorum heartbeats, ensuring current-term commitment (Leader Completeness Property), and waiting for `lastApplied >= readIndex` before serving the query.
-- **M8: Failure Handling & Recovery (`tests/raft_failure_test.go`, `tests/raft_hardening_test.go`, `tests/raft_convergence_test.go`, `tests/raft_advanced_consensus_test.go`)**:
-  Survives leader isolation (uncommitted entries do not commit without quorum; remaining 2 nodes elect new leader), minority follower partitions (majority continues without pause), node crash & restart with full WAL replay, disk persistence failure halting (`storageErr`), strict log replay validation, partition heal convergence, state-machine apply error handling, and atomic file replacement crash recovery.
-- **M9: End-to-End Cluster Testing, CI & CLI Runner (`cmd/orbit/main.go`, `configs/`, `.github/workflows/ci.yml`, `tests/raft_e2e_test.go`, `tests/multi_process_cluster_test.go`, `tests/raft_convergence_test.go`, `tests/http_transport_hardening_test.go`, `tests/raft_advanced_consensus_test.go`)**:
-  CLI runner supporting `--config configs/node-X.json`, full concurrent client stress testing with race detector verification, cross-platform GitHub Actions CI matrix (Ubuntu Linux & Windows), HTTP transport hardening (payload size limits, method enforcement, unknown fields disallowance), and actual three-process live cluster failover and restart-convergence testing.
+All physical nodes provide the client HTTP API. When a request arrives at any node in the cluster, the router maps the key to its owning shard and forwards mutations or linearizable queries to the shard's active leader.
+
+| Method | Endpoint | Request Body | Description |
+|---|---|---|---|
+| `PUT` | `/kv/{key}` | `{"value":"Alice"}` | Put key-value pair. Automatically forwards to the shard leader. |
+| `GET` | `/kv/{key}` | _None_ | Linearizable read via Raft ReadIndex. Forwards to leader if received on follower. |
+| `DELETE` | `/kv/{key}` | _None_ | Delete key. Forwards to leader and replicates tombstone. |
+| `GET` | `/cluster/status` | _None_ | Static cluster metadata: cluster ID, epoch, shard count, node list. |
+| `GET` | `/cluster/health` | _None_ | Live real-time cluster health: online nodes, healthy shards, leaderless shards, replication health. |
+| `GET` | `/cluster/shards` | _None_ | Detailed shard topology, replica assignments, and current leaders. |
+| `GET` | `/cluster/nodes` | _None_ | List of physical cluster nodes. |
+| `GET` | `/ws/events` | _None_ | RFC 6455 WebSocket stream for live cluster events. |
 
 ---
 
-## API Endpoints
+## Live Cluster Events (WebSocket)
 
-| Method | Endpoint | Request Body | Status Codes | Description |
-|---|---|---|---|---|
-| `GET` | `/health` | _None_ | `200 OK` / `503 Service Unavailable` | Cluster health, role, leader ID, term, commit/applied index |
-| `POST` | `/api/v1/kv` | `{"key":"user:1","value":"Anshik"}` | `201 Created` / `307 Temporary Redirect` | Write KV pair. Automatically redirects to leader if sent to follower |
-| `GET` | `/api/v1/kv/{key}` | _None_ | `200 OK` / `307 Temporary Redirect` / `404 Not Found` | Consistent read for key |
-| `DELETE` | `/api/v1/kv/{key}` | _None_ | `200 OK` / `307 Temporary Redirect` | Remove key via consensus tombstone |
+Connect to `ws://<node>/ws/events` to receive real-time JSON events:
 
----
-
-## Running a 3-Node Cluster Locally
-
-Configuration files for local 3-node cluster are provided in `configs/`:
-
-### Terminal 1 (Node A)
-```bash
-go run ./cmd/orbit --config configs/node-a.json
-```
-- Client HTTP API: `http://127.0.0.1:2525`
-- Raft Transport: `http://127.0.0.1:3525`
-
-### Terminal 2 (Node B)
-```bash
-go run ./cmd/orbit --config configs/node-b.json
-```
-- Client HTTP API: `http://127.0.0.1:2526`
-- Raft Transport: `http://127.0.0.1:3526`
-
-### Terminal 3 (Node C)
-```bash
-go run ./cmd/orbit --config configs/node-c.json
-```
-- Client HTTP API: `http://127.0.0.1:2527`
-- Raft Transport: `http://127.0.0.1:3527`
-
----
-
-## Interacting with the Cluster
-
-### 1. Check Node Health & Discover Leader
-```bash
-curl http://127.0.0.1:2525/health
-```
-Response:
 ```json
 {
-  "status": "ok",
-  "node": "node-a",
-  "role": "leader",
-  "leader_id": "node-a",
-  "term": 1,
-  "commit_index": 0,
-  "last_applied": 0,
-  "storage": "healthy",
-  "writable": true,
-  "cluster": "raft"
+  "event_id": "a1b2c3d4e5f60718",
+  "type": "LEADER_CHANGED",
+  "timestamp": "2026-11-23T15:00:00Z",
+  "node_id": "node-a",
+  "shard_id": 1,
+  "data": {
+    "previous_leader": "node-b",
+    "current_leader": "node-a"
+  }
 }
 ```
 
-### 2. Write Data to Leader
-```bash
-curl -i -X POST http://127.0.0.1:2525/api/v1/kv \
-  -H "Content-Type: application/json" \
-  -d '{"key":"planet","value":"Saturn"}'
-```
-Response:
-```http
-HTTP/1.1 201 Created
-Content-Type: application/json
-
-{"key":"planet","value":"Saturn"}
-```
-
-### 3. Write Data to Follower (Automatic Leader Redirect)
-Send a request to Node B (follower on port 2526):
-```bash
-curl -i -X POST http://127.0.0.1:2526/api/v1/kv \
-  -H "Content-Type: application/json" \
-  -d '{"key":"galaxy","value":"Milky Way"}'
-```
-Response:
-```http
-HTTP/1.1 307 Temporary Redirect
-Location: http://127.0.0.1:2525/api/v1/kv
-Content-Type: application/json
-
-{"error":"not_leader","leader_id":"node-a","leader_address":"127.0.0.1:2525"}
-```
-Using `curl -L` will automatically follow the redirect to the leader and complete the write!
+### Event Types
+- `NODE_JOINED`: A physical node came online and registered with the cluster.
+- `NODE_DISCONNECTED`: A node heartbeat timed out or node stopped.
+- `LEADER_CHANGED`: A shard consensus group elected a new leader.
+- `TERM_CHANGED`: A Raft group transitioned to a new term.
+- `ENTRY_COMMITTED`: A mutation reached quorum commitment and applied to the state machine.
+- `SHARD_UPDATED`: Shard replica configuration or topology changed.
 
 ---
 
-## Storage Failure & Recovery Model
+## Cluster Observability
 
-In distributed consensus, durability errors create uncertainty between persistent disk records and volatile memory. ORBIT implements strict storage error semantics:
+The `internal/observability` subsystem exposes three levels of real-time operational status built directly from active Raft and node states (without mock or placeholder health values):
 
-1. **Deterministic Halting on Disk Failure (`ErrStorageHalted`)**:
-   - If writing or syncing term/vote state (`metadata.json`) or log entries (`raft.log`) fails, the node immediately enters a fatal error state (`r.storageErr != nil`).
-   - The node steps down from Leader or Candidate role to Follower.
-   - All subsequent proposals and consensus mutations are immediately rejected with `ErrStorageHalted`.
-   - Client `/health` requests report `"storage": "unhealthy: fatal consensus storage error"` and return HTTP 503.
-   - Consensus participation is halted to prevent double-voting or split-brain behavior.
-
-2. **Restart Recovery & State Reconciliation**:
-   - Recovery from the fatal storage error state is accomplished by **restarting the node process**.
-   - Upon restart, `OpenFileStorage()` safely reloads the last fsynced on-disk state (`metadata.json` and `raft.log`) and replays complete CRC32-verified entries.
-   - If a crash interrupted an atomic file replacement (such as log truncation), `OpenFileStorage()` automatically promotes `.tmp` files if the primary file is missing, or cleans up stale uncommitted `.tmp` files if the primary is intact.
-   - The restarted node rejoins the cluster, catches up missing entries from the current leader via AppendEntries replication, and resumes normal consensus participation.
+1. **Node Status**:
+   - `node_id`, `online` / `offline`, `hosted_shard_ids`, `raft_group_count`, `last_observed_activity`.
+2. **Shard Status**:
+   - `shard_id`, `replica_node_ids`, `current_leader`, `current_term`, `commit_index`, `last_applied_index`, per-replica `replication_progress` (`match_index` and `next_index`).
+3. **Cluster Health**:
+   - `total_nodes`, `available_nodes`, `total_shards`, `healthy_shards`, `leaderless_shards`, and `replication_health` (`"healthy"`, `"degraded"`, `"unavailable"`).
 
 ---
 
 ## Running the Automated Test Suite
 
-To run the complete test suite including single-node durability tests, multi-process lock tests, Raft elections, replication, commitments, failure scenarios, and concurrent end-to-end tests with the Go race detector:
+Run the complete multi-group test suite with the Go race detector enabled across all packages:
 
 ```bash
-go test ./tests/... -v -race -count=1
+go test -v -race -timeout 180s ./...
+```
+
+To run specific test packages:
+```bash
+# Core consensus & multi-group tests
+go test -v -race ./internal/raft/...
+
+# Sharding & consistent hashing tests
+go test -v -race ./internal/sharding/...
+
+# Shard routing & forwarder tests
+go test -v -race ./internal/router/...
+
+# Cluster observability & WebSocket tests
+go test -v -race ./internal/observability/...
+
+# End-to-end integration and API tests
+go test -v -race ./tests/...
 ```

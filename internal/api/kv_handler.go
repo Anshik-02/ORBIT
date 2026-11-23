@@ -3,16 +3,21 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
 
+	"orbit/internal/database"
+	"orbit/internal/observability"
 	"orbit/internal/raft"
 	"orbit/internal/router"
 	"orbit/internal/sharding"
 )
+
+const maxRequestBodySize = 1 << 20 // 1 MB
 
 // ShardProvider exposes locally hosted shard replicas to the KV API.
 type ShardProvider interface {
@@ -20,8 +25,9 @@ type ShardProvider interface {
 }
 
 // SetKVRequest is the JSON payload for PUT /kv/:key.
+// Value is a pointer so we can distinguish between an omitted field and an explicit empty string.
 type SetKVRequest struct {
-	Value string `json:"value"`
+	Value *string `json:"value"`
 }
 
 // SetKVResponse is the JSON response for PUT /kv/:key.
@@ -79,6 +85,9 @@ type KVHandler struct {
 	forwarder   *router.RequestForwarder
 	localNodeID string
 	timeout     time.Duration
+	monitor     *observability.ClusterMonitor
+	eventHub    *observability.EventHub
+	wsHub       *observability.WebSocketHub
 }
 
 // NewKVHandler constructs a new KVHandler.
@@ -88,28 +97,65 @@ func NewKVHandler(
 	forwarder *router.RequestForwarder,
 	localNodeID string,
 ) *KVHandler {
+	monitor := observability.NewClusterMonitor(metadata, forwarder.Resolver().Tracker())
+	eventHub := observability.NewEventHub()
+	wsHub := observability.NewWebSocketHub(eventHub)
+
 	return &KVHandler{
 		provider:    provider,
 		metadata:    metadata,
 		forwarder:   forwarder,
 		localNodeID: localNodeID,
 		timeout:     5 * time.Second,
+		monitor:     monitor,
+		eventHub:    eventHub,
+		wsHub:       wsHub,
 	}
+}
+
+// EventHub returns the internal EventHub.
+func (h *KVHandler) EventHub() *observability.EventHub {
+	return h.eventHub
+}
+
+// WebSocketHub returns the WebSocketHub streaming live cluster events.
+func (h *KVHandler) WebSocketHub() *observability.WebSocketHub {
+	return h.wsHub
+}
+
+// ClusterMonitor returns the real-time ClusterMonitor.
+func (h *KVHandler) ClusterMonitor() *observability.ClusterMonitor {
+	return h.monitor
+}
+
+// SetTimeout configures the request processing and forwarding timeout.
+func (h *KVHandler) SetTimeout(d time.Duration) {
+	h.timeout = d
 }
 
 // RegisterKVRoutes registers the shard-aware KV API routes on the provided mux.
 func RegisterKVRoutes(mux *http.ServeMux, h *KVHandler) {
 	mux.HandleFunc("/kv/", h.handleKV)
 	mux.HandleFunc("/cluster/status", h.handleClusterStatus)
+	mux.HandleFunc("/cluster/health", h.handleClusterHealth)
 	mux.HandleFunc("/cluster/shards", h.handleClusterShards)
 	mux.HandleFunc("/cluster/nodes", h.handleClusterNodes)
+
+	if h.wsHub != nil {
+		h.wsHub.RegisterRoutes(mux, "/ws/events")
+		h.wsHub.RegisterRoutes(mux, "/cluster/events")
+	}
+}
+
+func writeJSONError(w http.ResponseWriter, status int, msg string) {
+	writeError(w, status, msg)
 }
 
 func (h *KVHandler) handleKV(w http.ResponseWriter, r *http.Request) {
 	key := strings.TrimPrefix(r.URL.Path, "/kv/")
 	key = strings.TrimPrefix(key, "/")
 	if key == "" {
-		http.Error(w, `{"error":"key cannot be empty"}`, http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "key cannot be empty")
 		return
 	}
 
@@ -121,27 +167,50 @@ func (h *KVHandler) handleKV(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		h.handleDelete(w, r, key)
 	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		w.Header().Set("Allow", "GET, PUT, DELETE")
+		writeJSONError(w, http.StatusMethodNotAllowed, fmt.Sprintf("method %s not allowed", r.Method))
 	}
 }
 
 func (h *KVHandler) handlePut(w http.ResponseWriter, r *http.Request, key string) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodySize)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, `{"error":"failed to read request body"}`, http.StatusBadRequest)
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeJSONError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
+		writeJSONError(w, http.StatusBadRequest, "failed to read request body")
 		return
 	}
 	defer r.Body.Close()
 
-	var req SetKVRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
+	if len(body) == 0 {
+		writeJSONError(w, http.StatusBadRequest, "request body cannot be empty")
 		return
 	}
 
+	var req SetKVRequest
+	dec := json.NewDecoder(strings.NewReader(string(body)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid json body: %v", err))
+		return
+	}
+	if dec.More() {
+		writeJSONError(w, http.StatusBadRequest, "unexpected trailing data in request body")
+		return
+	}
+	if req.Value == nil {
+		writeJSONError(w, http.StatusBadRequest, "field 'value' is required")
+		return
+	}
+	val := *req.Value
+
 	route, err := h.forwarder.Route(key, h.provider.ShardInstances())
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"failed to route key: %s"}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to route key: %v", err))
 		return
 	}
 
@@ -150,21 +219,38 @@ func (h *KVHandler) handlePut(w http.ResponseWriter, r *http.Request, key string
 		ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
 		defer cancel()
 
-		idx, _, err := route.Replica.Raft().Propose("SET", key, req.Value)
+		idx, _, err := route.Replica.Raft().Propose("SET", key, val)
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"failed to propose write: %s"}`, err.Error()), http.StatusInternalServerError)
+			if errors.Is(err, raft.ErrNotLeader) {
+				h.forwarder.Resolver().Tracker().Invalidate(route.GroupID)
+				writeJSONError(w, http.StatusServiceUnavailable, "replica is no longer leader")
+				return
+			}
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to propose write: %v", err))
 			return
 		}
 
 		if err := route.Replica.Raft().WaitForApply(ctx, idx); err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"failed to commit write: %s"}`, err.Error()), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to commit write: %v", err))
 			return
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(SetKVResponse{
+		if h.eventHub != nil {
+			h.eventHub.Publish(observability.NewClusterEvent(
+				observability.EventEntryCommitted,
+				h.localNodeID,
+				&route.ShardID,
+				map[string]any{
+					"key":       key,
+					"index":     idx,
+					"operation": "SET",
+				},
+			))
+		}
+
+		writeJSON(w, http.StatusOK, SetKVResponse{
 			Key:     key,
-			Value:   req.Value,
+			Value:   val,
 			ShardID: route.ShardID,
 			Status:  "ok",
 		})
@@ -174,7 +260,7 @@ func (h *KVHandler) handlePut(w http.ResponseWriter, r *http.Request, key string
 	// 2. Otherwise forward to leader
 	targetNode := route.LeaderID
 	if targetNode == "" || targetNode == h.localNodeID {
-		http.Error(w, `{"error":"no leader currently available for shard"}`, http.StatusServiceUnavailable)
+		writeJSONError(w, http.StatusServiceUnavailable, "no leader currently available for shard")
 		return
 	}
 
@@ -183,10 +269,15 @@ func (h *KVHandler) handlePut(w http.ResponseWriter, r *http.Request, key string
 
 	resp, err := h.forwarder.Forward(ctx, targetNode, http.MethodPut, r.URL.Path, body)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"forward failed: %s"}`, err.Error()), http.StatusBadGateway)
+		h.forwarder.Resolver().Tracker().Invalidate(route.GroupID)
+		writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("forward to leader %s failed: %v", targetNode, err))
 		return
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusServiceUnavailable {
+		h.forwarder.Resolver().Tracker().Invalidate(route.GroupID)
+	}
 
 	h.pipeResponse(w, resp)
 }
@@ -194,22 +285,45 @@ func (h *KVHandler) handlePut(w http.ResponseWriter, r *http.Request, key string
 func (h *KVHandler) handleGet(w http.ResponseWriter, r *http.Request, key string) {
 	route, err := h.forwarder.Route(key, h.provider.ShardInstances())
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"failed to route key: %s"}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to route key: %v", err))
 		return
 	}
 
-	// If local replica is leader for this shard, read directly from the state machine
+	// If local replica is leader for this shard, execute a linearizable read via Raft ReadIndex
 	if route.IsLocal && route.Replica != nil && route.Replica.Raft().Role() == raft.Leader {
-		val, err := route.Replica.DB().Get(key)
+		ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
+		defer cancel()
+
+		// Step 1: Quorum check via ReadIndex
+		readIndex, err := route.Replica.Raft().ReadIndex(ctx)
 		if err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusNotFound)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "key not found"})
+			if errors.Is(err, raft.ErrNotLeader) {
+				h.forwarder.Resolver().Tracker().Invalidate(route.GroupID)
+				writeJSONError(w, http.StatusServiceUnavailable, "replica is no longer leader")
+				return
+			}
+			writeJSONError(w, http.StatusServiceUnavailable, fmt.Sprintf("linearizable read failed: %v", err))
 			return
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(GetKVResponse{
+		// Step 2: Wait until state machine has applied through confirmed readIndex
+		if err := route.Replica.Raft().WaitForApply(ctx, readIndex); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to wait for apply index %d: %v", readIndex, err))
+			return
+		}
+
+		// Step 3: Read linearizable state from local DB
+		val, err := route.Replica.DB().Get(key)
+		if err != nil {
+			if errors.Is(err, database.ErrKeyNotFound) || err.Error() == "key not found" {
+				writeJSONError(w, http.StatusNotFound, "key not found")
+				return
+			}
+			writeJSONError(w, http.StatusNotFound, "key not found")
+			return
+		}
+
+		writeJSON(w, http.StatusOK, GetKVResponse{
 			Key:     key,
 			Value:   val,
 			ShardID: route.ShardID,
@@ -217,26 +331,10 @@ func (h *KVHandler) handleGet(w http.ResponseWriter, r *http.Request, key string
 		return
 	}
 
-	// Forward GET to leader (or fallback to local replica if leader is unknown)
+	// Forward GET to leader to guarantee linearizable read
 	targetNode := route.LeaderID
 	if targetNode == "" || targetNode == h.localNodeID {
-		if route.Replica != nil {
-			val, err := route.Replica.DB().Get(key)
-			if err != nil {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusNotFound)
-				_ = json.NewEncoder(w).Encode(map[string]string{"error": "key not found"})
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(GetKVResponse{
-				Key:     key,
-				Value:   val,
-				ShardID: route.ShardID,
-			})
-			return
-		}
-		http.Error(w, `{"error":"no leader or replica available for shard"}`, http.StatusServiceUnavailable)
+		writeJSONError(w, http.StatusServiceUnavailable, "no leader currently available for shard")
 		return
 	}
 
@@ -245,10 +343,15 @@ func (h *KVHandler) handleGet(w http.ResponseWriter, r *http.Request, key string
 
 	resp, err := h.forwarder.Forward(ctx, targetNode, http.MethodGet, r.URL.Path, nil)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"forward failed: %s"}`, err.Error()), http.StatusBadGateway)
+		h.forwarder.Resolver().Tracker().Invalidate(route.GroupID)
+		writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("forward to leader %s failed: %v", targetNode, err))
 		return
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusServiceUnavailable {
+		h.forwarder.Resolver().Tracker().Invalidate(route.GroupID)
+	}
 
 	h.pipeResponse(w, resp)
 }
@@ -256,7 +359,7 @@ func (h *KVHandler) handleGet(w http.ResponseWriter, r *http.Request, key string
 func (h *KVHandler) handleDelete(w http.ResponseWriter, r *http.Request, key string) {
 	route, err := h.forwarder.Route(key, h.provider.ShardInstances())
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"failed to route key: %s"}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to route key: %v", err))
 		return
 	}
 
@@ -266,17 +369,34 @@ func (h *KVHandler) handleDelete(w http.ResponseWriter, r *http.Request, key str
 
 		idx, _, err := route.Replica.Raft().Propose("DELETE", key, "")
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"failed to propose delete: %s"}`, err.Error()), http.StatusInternalServerError)
+			if errors.Is(err, raft.ErrNotLeader) {
+				h.forwarder.Resolver().Tracker().Invalidate(route.GroupID)
+				writeJSONError(w, http.StatusServiceUnavailable, "replica is no longer leader")
+				return
+			}
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to propose delete: %v", err))
 			return
 		}
 
 		if err := route.Replica.Raft().WaitForApply(ctx, idx); err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"failed to commit delete: %s"}`, err.Error()), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to commit delete: %v", err))
 			return
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(DeleteKVResponse{
+		if h.eventHub != nil {
+			h.eventHub.Publish(observability.NewClusterEvent(
+				observability.EventEntryCommitted,
+				h.localNodeID,
+				&route.ShardID,
+				map[string]any{
+					"key":       key,
+					"index":     idx,
+					"operation": "DELETE",
+				},
+			))
+		}
+
+		writeJSON(w, http.StatusOK, DeleteKVResponse{
 			Key:     key,
 			Deleted: true,
 			ShardID: route.ShardID,
@@ -286,7 +406,7 @@ func (h *KVHandler) handleDelete(w http.ResponseWriter, r *http.Request, key str
 
 	targetNode := route.LeaderID
 	if targetNode == "" || targetNode == h.localNodeID {
-		http.Error(w, `{"error":"no leader currently available for shard"}`, http.StatusServiceUnavailable)
+		writeJSONError(w, http.StatusServiceUnavailable, "no leader currently available for shard")
 		return
 	}
 
@@ -295,22 +415,27 @@ func (h *KVHandler) handleDelete(w http.ResponseWriter, r *http.Request, key str
 
 	resp, err := h.forwarder.Forward(ctx, targetNode, http.MethodDelete, r.URL.Path, nil)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"forward failed: %s"}`, err.Error()), http.StatusBadGateway)
+		h.forwarder.Resolver().Tracker().Invalidate(route.GroupID)
+		writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("forward to leader %s failed: %v", targetNode, err))
 		return
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusServiceUnavailable {
+		h.forwarder.Resolver().Tracker().Invalidate(route.GroupID)
+	}
 
 	h.pipeResponse(w, resp)
 }
 
 func (h *KVHandler) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		w.Header().Set("Allow", "GET")
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(ClusterStatusResponse{
+	writeJSON(w, http.StatusOK, ClusterStatusResponse{
 		ClusterID:  h.metadata.ClusterID,
 		Epoch:      h.metadata.Epoch,
 		ShardCount: h.metadata.ShardCount,
@@ -319,9 +444,25 @@ func (h *KVHandler) handleClusterStatus(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+func (h *KVHandler) handleClusterHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	if h.monitor == nil {
+		h.monitor = observability.NewClusterMonitor(h.metadata, h.forwarder.Resolver().Tracker())
+	}
+
+	status := h.monitor.Collect(h.localNodeID, h.provider.ShardInstances(), nil)
+	writeJSON(w, http.StatusOK, status)
+}
+
 func (h *KVHandler) handleClusterShards(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		w.Header().Set("Allow", "GET")
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
@@ -338,20 +479,19 @@ func (h *KVHandler) handleClusterShards(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(ClusterShardsResponse{
+	writeJSON(w, http.StatusOK, ClusterShardsResponse{
 		Shards: shards,
 	})
 }
 
 func (h *KVHandler) handleClusterNodes(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		w.Header().Set("Allow", "GET")
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(ClusterNodesResponse{
+	writeJSON(w, http.StatusOK, ClusterNodesResponse{
 		Nodes: h.metadata.PhysicalNodes,
 	})
 }

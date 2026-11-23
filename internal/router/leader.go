@@ -61,6 +61,15 @@ func (lt *LeaderTracker) Invalidate(groupID raft.GroupID) {
 	delete(lt.leaders, groupID)
 }
 
+// InvalidateLeaderIf removes the cached leader if it matches expectedLeader.
+func (lt *LeaderTracker) InvalidateLeaderIf(groupID raft.GroupID, expectedLeader string) {
+	lt.mu.Lock()
+	defer lt.mu.Unlock()
+	if current, ok := lt.leaders[groupID]; ok && current == expectedLeader {
+		delete(lt.leaders, groupID)
+	}
+}
+
 // LeaderResolver inspects local shard replicas and cached tracker data to
 // identify current shard leaders.
 type LeaderResolver struct {

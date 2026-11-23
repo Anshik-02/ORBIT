@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"orbit/internal/raft"
@@ -137,6 +138,11 @@ func (f *RequestForwarder) Route(key string, localShards map[sharding.ShardID]Sh
 	return nil, fmt.Errorf("%w for shard %s", ErrNoRoute, shardID)
 }
 
+// SetTimeout overrides the HTTP client timeout for forwarded requests.
+func (f *RequestForwarder) SetTimeout(d time.Duration) {
+	f.httpClient.Timeout = d
+}
+
 // Forward sends an HTTP request to the designated target node.
 func (f *RequestForwarder) Forward(ctx context.Context, targetNodeID, method, path string, body []byte) (*http.Response, error) {
 	addr, ok := f.peerAddrs[targetNodeID]
@@ -144,7 +150,12 @@ func (f *RequestForwarder) Forward(ctx context.Context, targetNodeID, method, pa
 		return nil, fmt.Errorf("%w: node %q", ErrPeerAddressNotFound, targetNodeID)
 	}
 
-	url := fmt.Sprintf("http://%s%s", addr, path)
+	url := addr
+	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		url = "http://" + addr
+	}
+	url = fmt.Sprintf("%s%s", url, path)
+
 	var bodyReader io.Reader
 	if len(body) > 0 {
 		bodyReader = bytes.NewReader(body)
@@ -158,5 +169,9 @@ func (f *RequestForwarder) Forward(ctx context.Context, targetNodeID, method, pa
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Orbit-Forwarded-From", f.localNodeID)
 
-	return f.httpClient.Do(req)
+	resp, err := f.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("forward request to node %s (%s): %w", targetNodeID, url, err)
+	}
+	return resp, nil
 }

@@ -1,7 +1,9 @@
 package router_test
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"orbit/internal/raft"
 	"orbit/internal/router"
@@ -117,3 +119,82 @@ func TestRequestForwarder_Route(t *testing.T) {
 		t.Errorf("expected non-empty candidate LeaderID")
 	}
 }
+
+func TestShardRouter_EmptyRing(t *testing.T) {
+	t.Parallel()
+
+	meta := sharding.NewClusterMetadata("empty-ring-cluster", 1, 1, 1, []string{"node-a"})
+	ring, err := sharding.NewHashRing(sharding.DefaultVirtualNodes)
+	if err != nil {
+		t.Fatalf("NewHashRing: %v", err)
+	}
+
+	r := router.New(meta, ring)
+	_, err = r.GetShardID("test-key")
+	if err == nil {
+		t.Fatal("expected error for empty ring, got nil")
+	}
+
+	_, err = r.GetShardInfo("test-key")
+	if err == nil {
+		t.Fatal("expected error for empty ring in GetShardInfo, got nil")
+	}
+}
+
+func TestShardRouter_ShardNotFoundInMetadata(t *testing.T) {
+	t.Parallel()
+
+	// Ring has shard 0, but metadata is missing shard 0 definition
+	meta := sharding.NewClusterMetadata("missing-shard-cluster", 1, 1, 1, []string{"node-a"})
+	ring, err := sharding.NewHashRing(sharding.DefaultVirtualNodes)
+	if err != nil {
+		t.Fatalf("NewHashRing: %v", err)
+	}
+	_ = ring.AddShard(0)
+
+	r := router.New(meta, ring)
+	_, err = r.GetShardInfo("test-key")
+	if err == nil {
+		t.Fatal("expected ErrShardNotFound, got nil")
+	}
+}
+
+func TestLeaderTracker_InvalidateLeaderIf(t *testing.T) {
+	t.Parallel()
+
+	lt := router.NewLeaderTracker()
+	gid := raft.GroupID("shard-0")
+	lt.SetLeader(gid, "node-a")
+
+	// Invalidating with non-matching leader should NOT delete
+	lt.InvalidateLeaderIf(gid, "node-b")
+	if ldr, ok := lt.GetLeader(gid); !ok || ldr != "node-a" {
+		t.Errorf("expected node-a still cached, got %s (ok=%v)", ldr, ok)
+	}
+
+	// Invalidating with matching leader removes it
+	lt.InvalidateLeaderIf(gid, "node-a")
+	if ldr, ok := lt.GetLeader(gid); ok || ldr != "" {
+		t.Errorf("expected leader deleted, got %s (ok=%v)", ldr, ok)
+	}
+}
+
+func TestRequestForwarder_PeerAddressNotFound(t *testing.T) {
+	t.Parallel()
+
+	r, _, _ := setupTestRouter(t)
+	tracker := router.NewLeaderTracker()
+	resolver := router.NewLeaderResolver(tracker)
+
+	// Empty peer addresses map
+	forwarder := router.NewRequestForwarder(r, resolver, "node-a", map[string]string{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	_, err := forwarder.Forward(ctx, "unknown-node", "GET", "/kv/key", nil)
+	if err == nil {
+		t.Fatal("expected ErrPeerAddressNotFound, got nil")
+	}
+}
+

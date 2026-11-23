@@ -1,6 +1,7 @@
 package node
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -133,6 +134,12 @@ func (s *ShardReplica) Start() error {
 
 // Stop cleanly stops the Raft engine and closes database storage for this shard.
 func (s *ShardReplica) Stop() error {
-	_ = s.raft.Stop()
-	return s.db.Close()
+	var errs []error
+	if err := s.raft.Stop(); err != nil {
+		errs = append(errs, err)
+	}
+	if err := s.db.Close(); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }

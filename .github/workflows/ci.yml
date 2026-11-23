@@ -31,4 +31,4 @@ jobs:
         run: go build -v ./cmd/orbit
 
       - name: Run Test Suite (Race Detector Enabled)
-        run: go test -v ./tests/... -race -count=1 -timeout 180s
+        run: go test -v ./... -race -count=1 -timeout 180s

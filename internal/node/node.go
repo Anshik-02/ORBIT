@@ -258,22 +258,32 @@ func (n *Node) Start() error {
 	for _, sid := range shardIDs {
 		replica := n.shards[sid]
 		if err := replica.Start(); err != nil {
+			var errs []error
+			errs = append(errs, fmt.Errorf("start shard %s: %w", sid, err))
 			// Roll back and stop all shard replicas to release resources
 			for _, s := range n.shards {
-				_ = s.Stop()
+				if stopErr := s.Stop(); stopErr != nil {
+					errs = append(errs, stopErr)
+				}
 			}
 			// Close the transport that was opened in step 1.
-			_ = n.transport.Close()
+			if transErr := n.transport.Close(); transErr != nil {
+				errs = append(errs, transErr)
+			}
 			// Mark node as closed so callers know it is unusable.
 			n.closed = true
-			return fmt.Errorf("start shard %s: %w", sid, err)
+			return errors.Join(errs...)
 		}
 	}
 	if n.raft != nil && len(n.shards) == 0 {
 		if err := n.raft.Start(); err != nil {
-			_ = n.transport.Close()
+			var errs []error
+			errs = append(errs, fmt.Errorf("start raft: %w", err))
+			if transErr := n.transport.Close(); transErr != nil {
+				errs = append(errs, transErr)
+			}
 			n.closed = true
-			return fmt.Errorf("start raft: %w", err)
+			return errors.Join(errs...)
 		}
 	}
 	n.started = true
@@ -318,28 +328,42 @@ func (n *Node) Stop() error {
 	n.closed = true
 	n.started = false
 
+	var errs []error
+
 	// 1. Drain HTTP server
 	if n.httpServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = n.httpServer.Shutdown(ctx)
+		if err := n.httpServer.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errs = append(errs, fmt.Errorf("http server shutdown: %w", err))
+		}
 	}
 
 	// 2. Stop all shard replicas and close their storage
-	for _, replica := range n.shards {
-		_ = replica.Stop()
+	for sid, replica := range n.shards {
+		if err := replica.Stop(); err != nil {
+			errs = append(errs, fmt.Errorf("stop shard %s replica: %w", sid, err))
+		}
 	}
 
 	// 3. Legacy single raft cleanup if not in shards
 	if n.raft != nil && len(n.shards) == 0 {
-		_ = n.raft.Stop()
+		if err := n.raft.Stop(); err != nil {
+			errs = append(errs, fmt.Errorf("stop legacy raft: %w", err))
+		}
 	}
 	if n.db != nil && len(n.shards) == 0 {
-		_ = n.db.Close()
+		if err := n.db.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close legacy db: %w", err))
+		}
 	}
 
 	// 4. Close the shared transport
-	return n.transport.Close()
+	if err := n.transport.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("close transport: %w", err))
+	}
+
+	return errors.Join(errs...)
 }
 
 // Shards returns a copy of the shard replica registry hosted on this physical node.

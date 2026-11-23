@@ -303,6 +303,44 @@ func (r *Raft) ApplyErr() error {
 	return r.applyErr
 }
 
+// ReplicationProgress holds per-peer replication progress tracked by the leader.
+type ReplicationProgress struct {
+	MatchIndex uint64 `json:"match_index"`
+	NextIndex  uint64 `json:"next_index"`
+}
+
+// ReplicationStatus returns a copy of per-peer match and next indexes.
+func (r *Raft) ReplicationStatus() map[string]ReplicationProgress {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	res := make(map[string]ReplicationProgress, len(r.peers))
+	for peerID := range r.peers {
+		res[peerID] = ReplicationProgress{
+			MatchIndex: r.matchIndex[peerID],
+			NextIndex:  r.nextIndex[peerID],
+		}
+	}
+	return res
+}
+
+// LastActivity returns the timestamp of the last heartbeat or RPC processed.
+func (r *Raft) LastActivity() time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.lastHeartbeat
+}
+
+// PeerIDs returns the list of configured remote peer IDs.
+func (r *Raft) PeerIDs() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	res := make([]string, 0, len(r.peers))
+	for id := range r.peers {
+		res = append(res, id)
+	}
+	return res
+}
+
 // StorageErr returns any fatal error encountered during durable state persistence.
 func (r *Raft) StorageErr() error {
 	r.mu.Lock()
