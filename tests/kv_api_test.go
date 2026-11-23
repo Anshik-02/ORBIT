@@ -110,6 +110,15 @@ func setupTestKVCluster(t *testing.T) *testCluster {
 	handlers := make(map[string]*api.KVHandler)
 	peerHTTPAddrs := make(map[string]string)
 	routers := make(map[string]*router.ShardRouter)
+	muxes := make(map[string]*http.ServeMux)
+
+	for _, id := range nodeIDs {
+		mux := http.NewServeMux()
+		muxes[id] = mux
+		srv := httptest.NewServer(mux)
+		servers[id] = srv
+		peerHTTPAddrs[id] = srv.Listener.Addr().String()
+	}
 
 	for _, id := range nodeIDs {
 		r := router.New(meta, ring)
@@ -122,12 +131,7 @@ func setupTestKVCluster(t *testing.T) *testCluster {
 		forwarder := router.NewRequestForwarder(r, resolver, id, peerHTTPAddrs)
 		h := api.NewKVHandler(nodes[id], meta, forwarder, id)
 		handlers[id] = h
-
-		mux := http.NewServeMux()
-		api.RegisterKVRoutes(mux, h)
-		srv := httptest.NewServer(mux)
-		servers[id] = srv
-		peerHTTPAddrs[id] = srv.Listener.Addr().String()
+		api.RegisterKVRoutes(muxes[id], h)
 	}
 
 	t.Cleanup(func() {

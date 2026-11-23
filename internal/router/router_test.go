@@ -115,8 +115,8 @@ func TestRequestForwarder_Route(t *testing.T) {
 	if !res.Forward {
 		t.Errorf("expected forward=true when key not hosted locally, got false")
 	}
-	if res.LeaderID == "" {
-		t.Errorf("expected non-empty candidate LeaderID")
+	if res.TargetNode() == "" {
+		t.Errorf("expected non-empty TargetNode (candidate or leader)")
 	}
 }
 
@@ -192,7 +192,7 @@ func TestRequestForwarder_PeerAddressNotFound(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	_, err := forwarder.Forward(ctx, "unknown-node", "GET", "/kv/key", nil)
+	_, err := forwarder.Forward(ctx, "unknown-node", "GET", "/kv/key", nil, 0)
 	if err == nil {
 		t.Fatal("expected ErrPeerAddressNotFound, got nil")
 	}

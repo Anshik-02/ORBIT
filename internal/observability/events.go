@@ -2,6 +2,7 @@ package observability
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/base64"
@@ -12,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,12 +24,17 @@ import (
 type EventType string
 
 const (
-	EventNodeJoined       EventType = "NODE_JOINED"
-	EventNodeDisconnected EventType = "NODE_DISCONNECTED"
-	EventLeaderChanged    EventType = "LEADER_CHANGED"
-	EventTermChanged      EventType = "TERM_CHANGED"
-	EventEntryCommitted   EventType = "ENTRY_COMMITTED"
-	EventShardUpdated     EventType = "SHARD_UPDATED"
+	EventNodeJoined           EventType = "NODE_JOINED"
+	EventNodeDisconnected     EventType = "NODE_DISCONNECTED"
+	EventNodeSuspectedOffline EventType = "NODE_SUSPECTED_OFFLINE"
+	EventNodeRecovered        EventType = "NODE_RECOVERED"
+	EventLeaderChanged        EventType = "LEADER_CHANGED"
+	EventLeaderElected        EventType = "LEADER_ELECTED"
+	EventLeaderSteppedDown    EventType = "LEADER_STEPPED_DOWN"
+	EventTermChanged          EventType = "TERM_CHANGED"
+	EventEntryCommitted       EventType = "ENTRY_COMMITTED"
+	EventShardUpdated         EventType = "SHARD_UPDATED"
+	EventReplicaCatchupDone   EventType = "REPLICA_CATCHUP_COMPLETED"
 )
 
 const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -103,7 +110,7 @@ func (h *EventHub) Subscribe() chan ClusterEvent {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	ch := make(chan ClusterEvent, 64)
+	ch := make(chan ClusterEvent, 128)
 	if h.closed {
 		close(ch)
 		return ch
@@ -140,10 +147,165 @@ func (h *EventHub) Close() {
 	h.subscribers = nil
 }
 
-// WebSocketClient encapsulates an active RFC 6455 WebSocket client connection.
+// DistributedEventBus coordinates cross-node peer-to-peer event propagation and deduplication.
+type DistributedEventBus struct {
+	localHub   *EventHub
+	localNode  string
+	peerAddrs  map[string]string // nodeID -> HTTP address
+	httpClient *http.Client
+	mu         sync.Mutex
+	seenEvents map[string]time.Time
+}
+
+// NewDistributedEventBus creates a DistributedEventBus with event deduplication.
+func NewDistributedEventBus(localHub *EventHub, localNode string, peerAddrs map[string]string) *DistributedEventBus {
+	return &DistributedEventBus{
+		localHub:   localHub,
+		localNode:  localNode,
+		peerAddrs:  peerAddrs,
+		httpClient: &http.Client{Timeout: 3 * time.Second},
+		seenEvents: make(map[string]time.Time),
+	}
+}
+
+// Broadcast broadcasts an event locally and relays it asynchronously to all peers.
+func (b *DistributedEventBus) Broadcast(evt ClusterEvent) {
+	b.mu.Lock()
+	b.seenEvents[evt.EventID] = time.Now()
+	b.cleanOldSeenLocked()
+	b.mu.Unlock()
+
+	b.localHub.Publish(evt)
+
+	// Relay to peers in background
+	go b.relayToPeers(evt)
+}
+
+func (b *DistributedEventBus) relayToPeers(evt ClusterEvent) {
+	payload, err := json.Marshal(evt)
+	if err != nil {
+		return
+	}
+
+	for peerID, addr := range b.peerAddrs {
+		if peerID == b.localNode || addr == "" {
+			continue
+		}
+
+		targetURL := addr
+		if len(targetURL) < 4 || targetURL[:4] != "http" {
+			targetURL = "http://" + addr
+		}
+		targetURL += "/cluster/events/relay"
+
+		req, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewReader(payload))
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Orbit-Origin-Node", b.localNode)
+
+		resp, err := b.httpClient.Do(req)
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+	}
+}
+
+// HandleRelayHTTP handles an inbound relayed event from a peer node.
+func (b *DistributedEventBus) HandleRelayHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var evt ClusterEvent
+	if err := json.NewDecoder(r.Body).Decode(&evt); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	b.mu.Lock()
+	if _, seen := b.seenEvents[evt.EventID]; seen {
+		b.mu.Unlock()
+		w.WriteHeader(http.StatusOK) // Deduplicated
+		return
+	}
+	b.seenEvents[evt.EventID] = time.Now()
+	b.cleanOldSeenLocked()
+	b.mu.Unlock()
+
+	b.localHub.Publish(evt)
+	w.WriteHeader(http.StatusOK)
+}
+
+func (b *DistributedEventBus) cleanOldSeenLocked() {
+	if len(b.seenEvents) > 5000 {
+		cutoff := time.Now().Add(-10 * time.Minute)
+		for id, t := range b.seenEvents {
+			if t.Before(cutoff) {
+				delete(b.seenEvents, id)
+			}
+		}
+	}
+}
+
+// WebSocketClient encapsulates an active RFC 6455 WebSocket client with slow-client isolation.
 type WebSocketClient struct {
-	conn net.Conn
-	rw   *bufio.ReadWriter
+	conn    net.Conn
+	rw      *bufio.ReadWriter
+	sendCh  chan []byte
+	closeCh chan struct{}
+	mu      sync.Mutex
+	closed  bool
+}
+
+func newWebSocketClient(conn net.Conn, rw *bufio.ReadWriter) *WebSocketClient {
+	c := &WebSocketClient{
+		conn:    conn,
+		rw:      rw,
+		sendCh:  make(chan []byte, 64),
+		closeCh: make(chan struct{}),
+	}
+	go c.writePump()
+	return c
+}
+
+func (c *WebSocketClient) writePump() {
+	for {
+		select {
+		case <-c.closeCh:
+			return
+		case msg, ok := <-c.sendCh:
+			if !ok {
+				return
+			}
+			c.mu.Lock()
+			_ = c.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			_, err := c.rw.Write(msg)
+			if err == nil {
+				err = c.rw.Flush()
+			}
+			c.mu.Unlock()
+
+			if err != nil {
+				c.Close()
+				return
+			}
+		}
+	}
+}
+
+// Close cleanly terminates the client writer.
+func (c *WebSocketClient) Close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return
+	}
+	c.closed = true
+	close(c.closeCh)
+	_ = c.conn.Close()
 }
 
 // WebSocketHub manages live WebSocket connections streaming cluster events to dashboard clients.
@@ -201,14 +363,11 @@ func (wsh *WebSocketHub) broadcastEvent(evt ClusterEvent) {
 	defer wsh.mu.Unlock()
 
 	for client := range wsh.clients {
-		_ = client.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-		if _, err := client.rw.Write(frame); err != nil {
-			_ = client.conn.Close()
-			delete(wsh.clients, client)
-			continue
-		}
-		if err := client.rw.Flush(); err != nil {
-			_ = client.conn.Close()
+		select {
+		case client.sendCh <- frame:
+		default:
+			// Client buffer is full (slow client): isolate and disconnect cleanly
+			client.Close()
 			delete(wsh.clients, client)
 		}
 	}
@@ -221,7 +380,7 @@ func (wsh *WebSocketHub) HandleWebSocket(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if r.Header.Get("Upgrade") != "websocket" && r.Header.Get("Upgrade") != "Websocket" {
+	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 		http.Error(w, "Expected websocket upgrade", http.StatusBadRequest)
 		return
 	}
@@ -264,22 +423,19 @@ func (wsh *WebSocketHub) HandleWebSocket(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	client := &WebSocketClient{
-		conn: conn,
-		rw:   rw,
-	}
+	client := newWebSocketClient(conn, rw)
 
 	wsh.mu.Lock()
 	wsh.clients[client] = struct{}{}
 	wsh.mu.Unlock()
 
-	// Drain incoming frames until client disconnects or sends close frame
+	// Drain incoming client frames until disconnection
 	go func() {
 		defer func() {
 			wsh.mu.Lock()
 			delete(wsh.clients, client)
 			wsh.mu.Unlock()
-			_ = conn.Close()
+			client.Close()
 		}()
 
 		for {
@@ -288,13 +444,17 @@ func (wsh *WebSocketHub) HandleWebSocket(w http.ResponseWriter, r *http.Request)
 				return
 			}
 			if opcode == 0x8 { // Close frame
+				client.mu.Lock()
 				_, _ = client.rw.Write(encodeCloseFrame(payload))
 				_ = client.rw.Flush()
+				client.mu.Unlock()
 				return
 			}
 			if opcode == 0x9 { // Ping -> Pong
+				client.mu.Lock()
 				_, _ = client.rw.Write(encodePongFrame(payload))
 				_ = client.rw.Flush()
+				client.mu.Unlock()
 			}
 		}
 	}()
@@ -307,7 +467,7 @@ func (wsh *WebSocketHub) Close() {
 		wsh.mu.Lock()
 		defer wsh.mu.Unlock()
 		for client := range wsh.clients {
-			_ = client.conn.Close()
+			client.Close()
 		}
 		wsh.clients = nil
 	})

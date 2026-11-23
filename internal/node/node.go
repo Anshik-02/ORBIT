@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -35,6 +36,8 @@ type Node struct {
 	raftLog raft.Storage
 	raft    *raft.Raft
 
+	kvHandler  *api.KVHandler
+	listener   net.Listener
 	httpServer *http.Server
 	started    bool
 	closed     bool
@@ -258,32 +261,12 @@ func (n *Node) Start() error {
 	for _, sid := range shardIDs {
 		replica := n.shards[sid]
 		if err := replica.Start(); err != nil {
-			var errs []error
-			errs = append(errs, fmt.Errorf("start shard %s: %w", sid, err))
-			// Roll back and stop all shard replicas to release resources
-			for _, s := range n.shards {
-				if stopErr := s.Stop(); stopErr != nil {
-					errs = append(errs, stopErr)
-				}
-			}
-			// Close the transport that was opened in step 1.
-			if transErr := n.transport.Close(); transErr != nil {
-				errs = append(errs, transErr)
-			}
-			// Mark node as closed so callers know it is unusable.
-			n.closed = true
-			return errors.Join(errs...)
+			return n.rollbackStartupLocked(fmt.Errorf("start shard %s: %w", sid, err))
 		}
 	}
 	if n.raft != nil && len(n.shards) == 0 {
 		if err := n.raft.Start(); err != nil {
-			var errs []error
-			errs = append(errs, fmt.Errorf("start raft: %w", err))
-			if transErr := n.transport.Close(); transErr != nil {
-				errs = append(errs, transErr)
-			}
-			n.closed = true
-			return errors.Join(errs...)
+			return n.rollbackStartupLocked(fmt.Errorf("start raft: %w", err))
 		}
 	}
 	n.started = true
@@ -291,15 +274,46 @@ func (n *Node) Start() error {
 	// 3. Start client HTTP API server if address provided
 	if n.config.Address != "" {
 		mux := http.NewServeMux()
-		peerHTTPAddrs := make(map[string]string)
-		for _, p := range n.config.Peers {
-			peerHTTPAddrs[p.ID] = p.Address
+
+		if n.kvHandler != nil {
+			api.RegisterKVRoutes(mux, n.kvHandler)
+		} else if n.metadata != nil {
+			// Auto-construct sharded router & KVHandler
+			ring, err := sharding.NewHashRing(sharding.DefaultVirtualNodes)
+			if err != nil {
+				return n.rollbackStartupLocked(fmt.Errorf("create hash ring: %w", err))
+			}
+			for sid := sharding.ShardID(0); sid < sharding.ShardID(n.metadata.ShardCount); sid++ {
+				_ = ring.AddShard(sid)
+			}
+			r := router.New(n.metadata, ring)
+			tracker := router.NewLeaderTracker()
+			resolver := router.NewLeaderResolver(tracker)
+			peerHTTPAddrs := make(map[string]string)
+			for _, p := range n.config.Peers {
+				peerHTTPAddrs[p.ID] = p.Address
+			}
+			fwd := router.NewRequestForwarder(r, resolver, n.config.ID, peerHTTPAddrs)
+			n.kvHandler = api.NewKVHandler(n, n.metadata, fwd, n.config.ID)
+			api.RegisterKVRoutes(mux, n.kvHandler)
+		} else {
+			// Legacy fallback for single-raft node tests
+			peerHTTPAddrs := make(map[string]string)
+			for _, p := range n.config.Peers {
+				peerHTTPAddrs[p.ID] = p.Address
+			}
+			handler := api.NewRaftHandler(n.raft, n.db, n.config.ID, n.config.Address, peerHTTPAddrs)
+			api.RegisterRaftRoutes(mux, handler)
 		}
-		handler := api.NewRaftHandler(n.raft, n.db, n.config.ID, n.config.Address, peerHTTPAddrs)
-		api.RegisterRaftRoutes(mux, handler)
+
+		ln, err := net.Listen("tcp", n.config.Address)
+		if err != nil {
+			return n.rollbackStartupLocked(fmt.Errorf("listen on %s: %w", n.config.Address, err))
+		}
+		n.listener = ln
+		n.config.Address = ln.Addr().String()
 
 		n.httpServer = &http.Server{
-			Addr:         n.config.Address,
 			Handler:      mux,
 			ReadTimeout:  10 * time.Second,
 			WriteTimeout: 10 * time.Second,
@@ -307,13 +321,34 @@ func (n *Node) Start() error {
 		}
 
 		go func() {
-			if err := n.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			if err := n.httpServer.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				// Server shut down
 			}
 		}()
 	}
 
 	return nil
+}
+
+// rollbackStartupLocked rolls back running components during a failed Start().
+func (n *Node) rollbackStartupLocked(cause error) error {
+	var errs []error
+	errs = append(errs, cause)
+	for _, s := range n.shards {
+		if stopErr := s.Stop(); stopErr != nil {
+			errs = append(errs, stopErr)
+		}
+	}
+	if n.raft != nil && len(n.shards) == 0 {
+		if stopErr := n.raft.Stop(); stopErr != nil {
+			errs = append(errs, stopErr)
+		}
+	}
+	if transErr := n.transport.Close(); transErr != nil {
+		errs = append(errs, transErr)
+	}
+	n.closed = true
+	return errors.Join(errs...)
 }
 
 // Stop cleanly terminates HTTP server, all shard replicas, and closes the shared transport.
@@ -330,13 +365,16 @@ func (n *Node) Stop() error {
 
 	var errs []error
 
-	// 1. Drain HTTP server
+	// 1. Drain HTTP server and close listener
 	if n.httpServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		if err := n.httpServer.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errs = append(errs, fmt.Errorf("http server shutdown: %w", err))
 		}
+	}
+	if n.listener != nil {
+		_ = n.listener.Close()
 	}
 
 	// 2. Stop all shard replicas and close their storage
@@ -424,4 +462,28 @@ func (n *Node) Engine() *storage.Engine {
 // ID returns the node ID.
 func (n *Node) ID() string {
 	return n.config.ID
+}
+
+// SetKVHandler attaches the shard-aware KV API handler to this Node.
+func (n *Node) SetKVHandler(h *api.KVHandler) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.kvHandler = h
+}
+
+// KVHandler returns the attached shard-aware KV API handler, if any.
+func (n *Node) KVHandler() *api.KVHandler {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.kvHandler
+}
+
+// ListenerAddr returns the actual network address this node's HTTP server is listening on.
+func (n *Node) ListenerAddr() string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.listener != nil {
+		return n.listener.Addr().String()
+	}
+	return n.config.Address
 }

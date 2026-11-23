@@ -51,6 +51,13 @@ func NewDatabase(engine StorageEngine) (*Database, error) {
 	return &Database{engine: engine}, nil
 }
 
+// IsClosed reports whether the database has been closed.
+func (db *Database) IsClosed() bool {
+	db.closeMu.RLock()
+	defer db.closeMu.RUnlock()
+	return db.closed
+}
+
 // Close gracefully shuts down the database:
 //  1. Acquires closeMu.Lock(), blocking until all active operations finish.
 //  2. Sets closed = true so future operations are rejected.

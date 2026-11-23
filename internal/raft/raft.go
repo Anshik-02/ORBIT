@@ -56,8 +56,9 @@ type Raft struct {
 	storageErr  error // fatal error during durable persistence
 
 	// Volatile state on leaders
-	nextIndex  map[string]uint64
-	matchIndex map[string]uint64
+	nextIndex       map[string]uint64
+	matchIndex      map[string]uint64
+	peerLastContact map[string]time.Time
 
 	// Timers and timing parameters
 	heartbeatInterval  time.Duration
@@ -121,6 +122,7 @@ func New(cfg Config) (*Raft, error) {
 		commitCallback:     cfg.CommitCallback,
 		nextIndex:          make(map[string]uint64),
 		matchIndex:         make(map[string]uint64),
+		peerLastContact:    make(map[string]time.Time),
 		stopCh:             make(chan struct{}),
 		stoppedCh:          make(chan struct{}),
 		rng:                rand.New(rand.NewSource(time.Now().UnixNano() + int64(len(cfg.ID)))),
@@ -305,8 +307,9 @@ func (r *Raft) ApplyErr() error {
 
 // ReplicationProgress holds per-peer replication progress tracked by the leader.
 type ReplicationProgress struct {
-	MatchIndex uint64 `json:"match_index"`
-	NextIndex  uint64 `json:"next_index"`
+	MatchIndex  uint64    `json:"match_index"`
+	NextIndex   uint64    `json:"next_index"`
+	LastContact time.Time `json:"last_contact,omitempty"`
 }
 
 // ReplicationStatus returns a copy of per-peer match and next indexes.
@@ -316,8 +319,9 @@ func (r *Raft) ReplicationStatus() map[string]ReplicationProgress {
 	res := make(map[string]ReplicationProgress, len(r.peers))
 	for peerID := range r.peers {
 		res[peerID] = ReplicationProgress{
-			MatchIndex: r.matchIndex[peerID],
-			NextIndex:  r.nextIndex[peerID],
+			MatchIndex:  r.matchIndex[peerID],
+			NextIndex:   r.nextIndex[peerID],
+			LastContact: r.peerLastContact[peerID],
 		}
 	}
 	return res
@@ -610,6 +614,7 @@ func (r *Raft) startElectionLocked() {
 
 			r.mu.Lock()
 			defer r.mu.Unlock()
+			r.peerLastContact[targetID] = time.Now()
 
 			// Check if higher term seen
 			if resp.Term > r.currentTerm {
@@ -747,6 +752,7 @@ func (r *Raft) sendAppendEntriesToPeer(peerID, peerAddr string, req *AppendEntri
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.peerLastContact[peerID] = time.Now()
 
 	// Check if remote peer operates on higher term
 	if resp.Term > r.currentTerm {
@@ -882,6 +888,10 @@ func (r *Raft) HandleRequestVote(ctx context.Context, req *RequestVoteRequest) (
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if req.CandidateID != "" {
+		r.peerLastContact[req.CandidateID] = time.Now()
+	}
+
 	if r.storageErr != nil {
 		return nil, fmt.Errorf("%w: %w", ErrStorageHalted, r.storageErr)
 	}
@@ -944,6 +954,10 @@ func (r *Raft) HandleRequestVote(ctx context.Context, req *RequestVoteRequest) (
 func (r *Raft) HandleAppendEntries(ctx context.Context, req *AppendEntriesRequest) (*AppendEntriesResponse, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	if req.LeaderID != "" {
+		r.peerLastContact[req.LeaderID] = time.Now()
+	}
 
 	if r.storageErr != nil {
 		return nil, fmt.Errorf("%w: %w", ErrStorageHalted, r.storageErr)
