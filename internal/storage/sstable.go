@@ -38,11 +38,13 @@ type IndexEntry struct {
 type SSTableMetadata struct {
 	ID         uint64    `json:"id"`
 	Path       string    `json:"path"`
+	Filename   string    `json:"filename"`
 	Level      uint32    `json:"level"`
 	NumEntries uint64    `json:"num_entries"`
 	MinKey     string    `json:"min_key"`
 	MaxKey     string    `json:"max_key"`
 	SizeBytes  int64     `json:"size_bytes"`
+	Checksum   uint32    `json:"checksum"`
 	CreatedAt  time.Time `json:"created_at"`
 }
 
@@ -51,6 +53,7 @@ type SSTableWriter struct {
 	path           string
 	tmpPath        string
 	file           *os.File
+	id             uint64
 	level          uint32
 	sparseInterval int
 	bloomFPRate    float64
@@ -76,6 +79,10 @@ func NewSSTableWriter(path string, level uint32, sparseInterval int, bloomFPRate
 		bloomFPRate = DefaultBloomFPRate
 	}
 
+	var id uint64
+	base := filepath.Base(path)
+	_, _ = fmt.Sscanf(base, "%06d.sst", &id)
+
 	tmpPath := path + ".tmp"
 	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
@@ -86,6 +93,7 @@ func NewSSTableWriter(path string, level uint32, sparseInterval int, bloomFPRate
 		path:           path,
 		tmpPath:        tmpPath,
 		file:           f,
+		id:             id,
 		level:          level,
 		sparseInterval: sparseInterval,
 		bloomFPRate:    bloomFPRate,
@@ -281,12 +289,15 @@ func (w *SSTableWriter) Finish() (*SSTableMetadata, error) {
 	}
 
 	return &SSTableMetadata{
+		ID:         w.id,
 		Path:       w.path,
+		Filename:   filepath.Base(w.path),
 		Level:      w.level,
 		NumEntries: w.entriesWritten,
 		MinKey:     w.minKey,
 		MaxKey:     w.maxKey,
 		SizeBytes:  int64(w.currentOffset),
+		Checksum:   finalChecksum,
 		CreatedAt:  createdAt,
 	}, nil
 }
@@ -424,18 +435,27 @@ func OpenSSTableReader(path string) (*SSTableReader, error) {
 	var minKey, maxKey string
 	if len(sparseIndex) > 0 {
 		minKey = sparseIndex[0].Key
+		maxKey = sparseIndex[len(sparseIndex)-1].Key
 	}
+
+	var sstID uint64
+	baseName := filepath.Base(path)
+	_, _ = fmt.Sscanf(baseName, "%06d.sst", &sstID)
+	storedCRC := binary.BigEndian.Uint32(footerBuf[56:60])
 
 	reader := &SSTableReader{
 		path: path,
 		file: f,
 		meta: SSTableMetadata{
+			ID:         sstID,
 			Path:       path,
+			Filename:   baseName,
 			Level:      level,
 			NumEntries: numEntries,
 			MinKey:     minKey,
 			MaxKey:     maxKey,
 			SizeBytes:  fileSize,
+			Checksum:   storedCRC,
 			CreatedAt:  time.Unix(0, createdAtUnix),
 		},
 		sparseIndex: sparseIndex,

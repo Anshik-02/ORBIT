@@ -212,8 +212,11 @@ func (l *Log) Replay(handler HandlerFunc) error {
 					return fmt.Errorf("wal: corrupt record at offset %d: unexpected trailing content on record line", currentOffset)
 				}
 
-				// Sequence validation: contiguous progression (1, 2, 3...)
+				// Sequence validation: contiguous progression (e.g. 1, 2, 3... or starting after truncation)
 				expectedSeq := lastReplayedSeq + 1
+				if lastReplayedSeq == 0 {
+					expectedSeq = r.Sequence
+				}
 				if r.Sequence != expectedSeq {
 					return fmt.Errorf("wal: non-contiguous sequence at offset %d: got %d, expected %d", currentOffset, r.Sequence, expectedSeq)
 				}
@@ -322,6 +325,102 @@ func (l *Log) Reset() error {
 
 	l.writer.Reset(l.file)
 	l.sequence = 0
+	return nil
+}
+
+// TruncateBefore removes records with Sequence <= seq from the WAL, reclaiming disk space.
+// If all records are <= seq, the file is truncated to zero while preserving the current sequence baseline.
+func (l *Log) TruncateBefore(seq uint64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.closed {
+		return ErrWALClosed
+	}
+	if l.err != nil {
+		return fmt.Errorf("%w: %v", ErrWALPoisoned, l.err)
+	}
+	if seq == 0 {
+		return nil
+	}
+
+	// 1. Flush any pending buffered writes
+	if err := l.writer.Flush(); err != nil {
+		l.err = err
+		return fmt.Errorf("wal: flush before truncate: %w", err)
+	}
+
+	// 2. If the target sequence is >= highest committed sequence, all records are obsolete
+	if seq >= l.sequence {
+		if err := l.file.Truncate(0); err != nil {
+			l.err = err
+			return fmt.Errorf("wal: truncate on reclaim: %w", err)
+		}
+		if _, err := l.file.Seek(0, io.SeekStart); err != nil {
+			l.err = err
+			return fmt.Errorf("wal: seek on reclaim: %w", err)
+		}
+		if err := l.file.Sync(); err != nil {
+			l.err = err
+			return fmt.Errorf("wal: sync on reclaim: %w", err)
+		}
+		l.writer.Reset(l.file)
+		return nil
+	}
+
+	// 3. Otherwise, some records are still active (> seq).
+	// Read records > seq into memory and rewrite the log cleanly.
+	if _, err := l.file.Seek(0, io.SeekStart); err != nil {
+		l.err = err
+		return fmt.Errorf("wal: seek start for rewrite: %w", err)
+	}
+
+	reader := bufio.NewReader(l.file)
+	var retainedLines [][]byte
+
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		if len(line) > 0 && line[len(line)-1] == '\n' {
+			trimmed := bytes.TrimSpace(line)
+			if len(trimmed) > 0 {
+				var r Record
+				if err := json.Unmarshal(trimmed, &r); err == nil {
+					if r.Sequence > seq {
+						cpy := make([]byte, len(line))
+						copy(cpy, line)
+						retainedLines = append(retainedLines, cpy)
+					}
+				}
+			}
+		}
+		if readErr != nil {
+			break
+		}
+	}
+
+	// Truncate file and rewrite retained lines from byte offset 0
+	if err := l.file.Truncate(0); err != nil {
+		l.err = err
+		return fmt.Errorf("wal: truncate for rewrite: %w", err)
+	}
+	if _, err := l.file.Seek(0, io.SeekStart); err != nil {
+		l.err = err
+		return fmt.Errorf("wal: seek for rewrite: %w", err)
+	}
+
+	for _, lBytes := range retainedLines {
+		if _, err := l.file.Write(lBytes); err != nil {
+			l.err = err
+			return fmt.Errorf("wal: write retained record: %w", err)
+		}
+	}
+
+	if err := l.file.Sync(); err != nil {
+		l.err = err
+		return fmt.Errorf("wal: sync rewritten log: %w", err)
+	}
+
+	l.writer.Reset(l.file)
 	return nil
 }
 

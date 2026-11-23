@@ -25,9 +25,11 @@ type MemtableEntry struct {
 //   - Tombstones are tracked explicitly so deletions shadow values in immutable memtables & SSTables.
 //   - Entries can be extracted in deterministic lexicographically sorted order for SSTable flushing.
 type Memtable struct {
-	mu        sync.RWMutex
-	data      map[string]MemtableEntry
-	sizeBytes int64
+	mu         sync.RWMutex
+	data       map[string]MemtableEntry
+	sizeBytes  int64
+	maxWALSeq  uint64
+	maxRaftIdx uint64
 }
 
 // NewMemtable creates an empty, ready-to-use Memtable.
@@ -41,8 +43,20 @@ func NewMemtable() *Memtable {
 // Set stores key -> value in the Memtable.
 // Updates the size tracking accounting for key, value, and entry overhead.
 func (m *Memtable) Set(key, value string) {
+	m.SetWithSeq(key, value, 0, 0)
+}
+
+// SetWithSeq stores key -> value in the Memtable and tracks the highest WAL sequence and Raft index.
+func (m *Memtable) SetWithSeq(key, value string, walSeq, raftIdx uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	if walSeq > m.maxWALSeq {
+		m.maxWALSeq = walSeq
+	}
+	if raftIdx > m.maxRaftIdx {
+		m.maxRaftIdx = raftIdx
+	}
 
 	old, exists := m.data[key]
 	if exists {
@@ -66,8 +80,20 @@ func (m *Memtable) Set(key, value string) {
 // Delete stores a tombstone for key in the Memtable.
 // The tombstone shadows older values in immutable memtables and SSTables.
 func (m *Memtable) Delete(key string) {
+	m.DeleteWithSeq(key, 0, 0)
+}
+
+// DeleteWithSeq stores a tombstone for key and tracks the highest WAL sequence and Raft index.
+func (m *Memtable) DeleteWithSeq(key string, walSeq, raftIdx uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	if walSeq > m.maxWALSeq {
+		m.maxWALSeq = walSeq
+	}
+	if raftIdx > m.maxRaftIdx {
+		m.maxRaftIdx = raftIdx
+	}
 
 	old, exists := m.data[key]
 	if exists {
@@ -85,6 +111,13 @@ func (m *Memtable) Delete(key string) {
 		Value:       "",
 		IsTombstone: true,
 	}
+}
+
+// MaxOffsets returns the highest WAL sequence number and Raft index incorporated into this Memtable.
+func (m *Memtable) MaxOffsets() (walSeq, raftIdx uint64) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.maxWALSeq, m.maxRaftIdx
 }
 
 // Get retrieves the value for a key from this Memtable.
