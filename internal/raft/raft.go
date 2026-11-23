@@ -19,6 +19,7 @@ type Config struct {
 	ElectionTimeoutMin time.Duration
 	ElectionTimeoutMax time.Duration
 	CommitCallback     func(LogEntry) error // Invoked sequentially when an entry is committed
+	LeaderCallback     func(GroupID, string) // Invoked asynchronously whenever leader changes or is discovered
 
 	// InitialLastApplied seeds lastApplied on startup from a recovered storage engine.
 	// Set this to engine.LastAppliedIndex() so the applyLoop skips already-applied entries
@@ -69,6 +70,7 @@ type Raft struct {
 
 	// Coordination & lifecycle
 	commitCallback func(LogEntry) error
+	leaderCallback func(GroupID, string)
 	stopCh         chan struct{}
 	stoppedCh      chan struct{}
 	applyCond      *sync.Cond
@@ -120,6 +122,7 @@ func New(cfg Config) (*Raft, error) {
 		electionTimeoutMin: cfg.ElectionTimeoutMin,
 		electionTimeoutMax: cfg.ElectionTimeoutMax,
 		commitCallback:     cfg.CommitCallback,
+		leaderCallback:     cfg.LeaderCallback,
 		nextIndex:          make(map[string]uint64),
 		matchIndex:         make(map[string]uint64),
 		peerLastContact:    make(map[string]time.Time),
@@ -214,6 +217,13 @@ func (r *Raft) LeaderID() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.leaderID
+}
+
+// SetLeaderCallback dynamically registers a callback invoked when leadership changes.
+func (r *Raft) SetLeaderCallback(cb func(GroupID, string)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.leaderCallback = cb
 }
 
 // CurrentTerm returns the current election term.
@@ -499,6 +509,15 @@ func (r *Raft) resetElectionTimeoutLocked() {
 	r.electionTimeout = r.electionTimeoutMin + time.Duration(r.rng.Int63n(int64(jitter)))
 }
 
+func (r *Raft) notifyLeaderChangeLocked(newLeader string) {
+	if r.leaderCallback == nil {
+		return
+	}
+	cb := r.leaderCallback
+	gid := r.groupID
+	go cb(gid, newLeader)
+}
+
 // stepDownLocked transitions the node to Follower for a new, higher term.
 func (r *Raft) stepDownLocked(newTerm uint64) error {
 	if err := r.storage.SaveState(newTerm, ""); err != nil {
@@ -507,6 +526,7 @@ func (r *Raft) stepDownLocked(newTerm uint64) error {
 	r.currentTerm = newTerm
 	r.role = Follower
 	r.leaderID = ""
+	r.notifyLeaderChangeLocked("")
 	r.votedFor = ""
 	r.lastHeartbeat = time.Now()
 	r.resetElectionTimeoutLocked()
@@ -568,6 +588,7 @@ func (r *Raft) startElectionLocked() {
 
 	r.role = Candidate
 	r.leaderID = ""
+	r.notifyLeaderChangeLocked("")
 	r.currentTerm = newTerm
 	r.votedFor = r.id
 	r.lastHeartbeat = time.Now()
@@ -643,6 +664,7 @@ func (r *Raft) startElectionLocked() {
 func (r *Raft) becomeLeaderLocked() {
 	r.role = Leader
 	r.leaderID = r.id
+	r.notifyLeaderChangeLocked(r.id)
 	lastLogIndex, _ := r.storage.LastLogInfo()
 
 	for peerID := range r.peers {
@@ -984,7 +1006,11 @@ func (r *Raft) HandleAppendEntries(ctx context.Context, req *AppendEntriesReques
 		// Valid leader recognized for current term
 		r.role = Follower
 	}
+	prevLeader := r.leaderID
 	r.leaderID = req.LeaderID
+	if req.LeaderID != "" && req.LeaderID != prevLeader {
+		r.notifyLeaderChangeLocked(req.LeaderID)
+	}
 
 	// Valid heartbeat recognized: reset election timer
 	r.lastHeartbeat = time.Now()

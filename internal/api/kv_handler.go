@@ -99,6 +99,7 @@ type KVHandler struct {
 	monitor     *observability.ClusterMonitor
 	eventHub    *observability.EventHub
 	wsHub       *observability.WebSocketHub
+	eventBus    *observability.DistributedEventBus
 }
 
 // NewKVHandler constructs a new KVHandler.
@@ -139,6 +140,30 @@ func (h *KVHandler) ClusterMonitor() *observability.ClusterMonitor {
 	return h.monitor
 }
 
+// Forwarder returns the request forwarder.
+func (h *KVHandler) Forwarder() *router.RequestForwarder {
+	return h.forwarder
+}
+
+// EventBus returns the DistributedEventBus.
+func (h *KVHandler) EventBus() *observability.DistributedEventBus {
+	return h.eventBus
+}
+
+// SetEventBus configures the DistributedEventBus.
+func (h *KVHandler) SetEventBus(bus *observability.DistributedEventBus) {
+	h.eventBus = bus
+}
+
+// BroadcastEvent publishes an event locally and relays it across the distributed cluster.
+func (h *KVHandler) BroadcastEvent(evt observability.ClusterEvent) {
+	if h.eventBus != nil {
+		h.eventBus.Broadcast(evt)
+	} else if h.eventHub != nil {
+		h.eventHub.Publish(evt)
+	}
+}
+
 // SetTimeout configures the request processing and forwarding timeout.
 func (h *KVHandler) SetTimeout(d time.Duration) {
 	h.timeout = d
@@ -155,6 +180,10 @@ func RegisterKVRoutes(mux *http.ServeMux, h *KVHandler) {
 	if h.wsHub != nil {
 		h.wsHub.RegisterRoutes(mux, "/ws/events")
 		h.wsHub.RegisterRoutes(mux, "/cluster/events")
+	}
+
+	if h.eventBus != nil {
+		mux.HandleFunc("/cluster/events/relay", h.eventBus.HandleRelayHTTP)
 	}
 }
 
@@ -309,18 +338,16 @@ func (h *KVHandler) handlePut(w http.ResponseWriter, r *http.Request, key, reqID
 			return
 		}
 
-		if h.eventHub != nil {
-			h.eventHub.Publish(observability.NewClusterEvent(
-				observability.EventEntryCommitted,
-				h.localNodeID,
-				&route.ShardID,
-				map[string]any{
-					"key":       key,
-					"index":     idx,
-					"operation": "SET",
-				},
-			))
-		}
+		h.BroadcastEvent(observability.NewClusterEvent(
+			observability.EventEntryCommitted,
+			h.localNodeID,
+			&route.ShardID,
+			map[string]any{
+				"key":       key,
+				"index":     idx,
+				"operation": "SET",
+			},
+		))
 
 		writeJSON(w, http.StatusOK, SetKVResponse{
 			Key:     key,
@@ -475,18 +502,16 @@ func (h *KVHandler) handleDelete(w http.ResponseWriter, r *http.Request, key, re
 			return
 		}
 
-		if h.eventHub != nil {
-			h.eventHub.Publish(observability.NewClusterEvent(
-				observability.EventEntryCommitted,
-				h.localNodeID,
-				&route.ShardID,
-				map[string]any{
-					"key":       key,
-					"index":     idx,
-					"operation": "DELETE",
-				},
-			))
-		}
+		h.BroadcastEvent(observability.NewClusterEvent(
+			observability.EventEntryCommitted,
+			h.localNodeID,
+			&route.ShardID,
+			map[string]any{
+				"key":       key,
+				"index":     idx,
+				"operation": "DELETE",
+			},
+		))
 
 		writeJSON(w, http.StatusOK, DeleteKVResponse{
 			Key:     key,

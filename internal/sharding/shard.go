@@ -31,6 +31,15 @@ func (s ShardID) GroupID() string {
 	return s.String()
 }
 
+// ParseShardID parses a canonical shard string like "shard-0" into a ShardID.
+func ParseShardID(s string) (ShardID, error) {
+	var id uint32
+	if _, err := fmt.Sscanf(s, "shard-%d", &id); err != nil {
+		return 0, fmt.Errorf("%w: %q", ErrInvalidShardID, s)
+	}
+	return ShardID(id), nil
+}
+
 // ShardInfo describes the logical identity and replica assignment of one shard.
 // It is the authoritative descriptor stored in ClusterMetadata and distributed
 // to all physical nodes.

@@ -10,10 +10,12 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"orbit/internal/api"
 	"orbit/internal/database"
+	"orbit/internal/observability"
 	"orbit/internal/raft"
 	"orbit/internal/router"
 	"orbit/internal/sharding"
@@ -39,6 +41,7 @@ type Node struct {
 	kvHandler  *api.KVHandler
 	listener   net.Listener
 	httpServer *http.Server
+	serverErr  atomic.Pointer[error]
 	started    bool
 	closed     bool
 }
@@ -322,11 +325,12 @@ func (n *Node) Start() error {
 
 		go func() {
 			if err := n.httpServer.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				// Server shut down
+				n.serverErr.Store(&err)
 			}
 		}()
 	}
 
+	n.wireShardLeaderCallbacksLocked()
 	return nil
 }
 
@@ -371,10 +375,14 @@ func (n *Node) Stop() error {
 		defer cancel()
 		if err := n.httpServer.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errs = append(errs, fmt.Errorf("http server shutdown: %w", err))
+			_ = n.httpServer.Close()
 		}
 	}
 	if n.listener != nil {
 		_ = n.listener.Close()
+	}
+	if n.kvHandler != nil && n.kvHandler.EventHub() != nil {
+		n.kvHandler.EventHub().Close()
 	}
 
 	// 2. Stop all shard replicas and close their storage
@@ -464,11 +472,66 @@ func (n *Node) ID() string {
 	return n.config.ID
 }
 
-// SetKVHandler attaches the shard-aware KV API handler to this Node.
+// SetKVHandler attaches the shard-aware KV API handler to this Node and wires leadership callbacks.
 func (n *Node) SetKVHandler(h *api.KVHandler) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.kvHandler = h
+	n.wireShardLeaderCallbacksLocked()
+}
+
+func (n *Node) wireShardLeaderCallbacksLocked() {
+	if n.kvHandler == nil {
+		return
+	}
+	for sid, replica := range n.shards {
+		shardID := sid
+		replica.Raft().SetLeaderCallback(func(gid raft.GroupID, leaderID string) {
+			n.onLeaderChanged(shardID, gid, leaderID)
+		})
+	}
+}
+
+func (n *Node) onLeaderChanged(sid sharding.ShardID, gid raft.GroupID, leaderID string) {
+	n.mu.Lock()
+	handler := n.kvHandler
+	n.mu.Unlock()
+
+	if handler == nil {
+		return
+	}
+
+	if leaderID != "" {
+		handler.Forwarder().Resolver().Tracker().SetLeader(gid, leaderID)
+	} else {
+		handler.Forwarder().Resolver().Tracker().Invalidate(gid)
+	}
+
+	evtType := observability.EventLeaderChanged
+	if leaderID == n.config.ID {
+		evtType = observability.EventLeaderElected
+	} else if leaderID == "" {
+		evtType = observability.EventLeaderSteppedDown
+	}
+
+	handler.BroadcastEvent(observability.NewClusterEvent(
+		evtType,
+		n.config.ID,
+		&sid,
+		map[string]any{
+			"group_id":  string(gid),
+			"leader_id": leaderID,
+		},
+	))
+}
+
+// ServerError returns the last fatal runtime error reported by the HTTP server, if any.
+func (n *Node) ServerError() error {
+	p := n.serverErr.Load()
+	if p == nil {
+		return nil
+	}
+	return *p
 }
 
 // KVHandler returns the attached shard-aware KV API handler, if any.

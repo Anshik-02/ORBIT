@@ -15,6 +15,7 @@ import (
 	"orbit/internal/api"
 	"orbit/internal/database"
 	"orbit/internal/node"
+	"orbit/internal/observability"
 	"orbit/internal/router"
 	"orbit/internal/sharding"
 	"orbit/internal/storage"
@@ -101,6 +102,10 @@ func runClusterNode(configPath, clusterConfigPath string) {
 
 		// 8. Initialize shard-aware KV handler
 		kvHandler := api.NewKVHandler(shardedNode, meta, forwarder, cfg.ID)
+
+		// 8b. Wire DistributedEventBus for cross-node event propagation
+		eventBus := observability.NewDistributedEventBus(kvHandler.EventHub(), cfg.ID, peerHTTPAddrs)
+		kvHandler.SetEventBus(eventBus)
 
 		// 9. Register the KV, cluster health and WebSocket routes
 		shardedNode.SetKVHandler(kvHandler)

@@ -70,6 +70,11 @@ func BuildShardStatus(
 			st.Healthy = true
 			st.State = ShardHealthy
 			st.QuorumAvailable = true
+			st.AvailableReplicas = []string{knownLeader}
+		} else {
+			st.State = ShardUnavailable
+			st.Healthy = false
+			st.QuorumAvailable = false
 		}
 		return st
 	}
@@ -121,14 +126,26 @@ func BuildShardStatus(
 		return st
 	}
 
-	// Follower path
-	if r.LeaderID() != "" {
-		st.CurrentLeader = r.LeaderID()
+	// Follower or Candidate path
+	if r.Role() == raft.Candidate {
+		st.State = ShardUnavailable
+		st.Healthy = false
+		st.QuorumAvailable = false
+		st.CurrentLeader = ""
+		return st
 	}
 
-	if st.CurrentLeader != "" {
+	// Follower: check whether active communication with leader exists
+	leaderID := r.LeaderID()
+	if leaderID != "" {
+		st.CurrentLeader = leaderID
+	}
+
+	timeSinceActivity := time.Since(st.LastCommunication)
+	if st.CurrentLeader != "" && timeSinceActivity <= 3*time.Second {
 		st.QuorumAvailable = true
 		st.Healthy = true
+		st.AvailableReplicas = []string{r.ID(), st.CurrentLeader}
 
 		// Check if follower is recovering/catching up (commitIndex far ahead of lastApplied)
 		if st.CommitIndex > st.LastAppliedIndex+10 {
@@ -137,8 +154,10 @@ func BuildShardStatus(
 			st.State = ShardHealthy
 		}
 	} else {
+		// Follower disconnected from leader or leader inactive
 		st.State = ShardUnavailable
 		st.Healthy = false
+		st.QuorumAvailable = false
 	}
 
 	return st

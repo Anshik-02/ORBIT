@@ -22,6 +22,7 @@ type NodeStatus struct {
 type NodeLivenessTracker struct {
 	mu               sync.RWMutex
 	lastHeartbeat    map[string]time.Time
+	onlineState      map[string]bool
 	heartbeatTimeout time.Duration
 	onStateChange    func(nodeID string, online bool)
 }
@@ -33,6 +34,7 @@ func NewNodeLivenessTracker(heartbeatTimeout time.Duration) *NodeLivenessTracker
 	}
 	return &NodeLivenessTracker{
 		lastHeartbeat:    make(map[string]time.Time),
+		onlineState:      make(map[string]bool),
 		heartbeatTimeout: heartbeatTimeout,
 	}
 }
@@ -49,11 +51,11 @@ func (t *NodeLivenessTracker) RecordHeartbeat(nodeID string, ts time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	prev, exists := t.lastHeartbeat[nodeID]
-	wasOnline := exists && time.Since(prev) <= t.heartbeatTimeout
+	prevOnline := t.onlineState[nodeID]
 	t.lastHeartbeat[nodeID] = ts
+	t.onlineState[nodeID] = true
 
-	if !wasOnline && t.onStateChange != nil {
+	if !prevOnline && t.onStateChange != nil {
 		cb := t.onStateChange
 		go cb(nodeID, true)
 	}
@@ -78,20 +80,21 @@ func (t *NodeLivenessTracker) LastSeen(nodeID string) time.Time {
 	return t.lastHeartbeat[nodeID]
 }
 
-// CheckTransitions inspects all registered nodes for offline timeouts.
+// CheckTransitions inspects all registered nodes for offline timeouts and triggers callbacks strictly on edge transitions.
 func (t *NodeLivenessTracker) CheckTransitions(now time.Time) {
-	t.mu.RLock()
+	t.mu.Lock()
 	cb := t.onStateChange
-	var offlineNodes []string
+	var transitionedOffline []string
 	for nid, last := range t.lastHeartbeat {
-		if now.Sub(last) > t.heartbeatTimeout {
-			offlineNodes = append(offlineNodes, nid)
+		if t.onlineState[nid] && now.Sub(last) > t.heartbeatTimeout {
+			t.onlineState[nid] = false
+			transitionedOffline = append(transitionedOffline, nid)
 		}
 	}
-	t.mu.RUnlock()
+	t.mu.Unlock()
 
 	if cb != nil {
-		for _, nid := range offlineNodes {
+		for _, nid := range transitionedOffline {
 			cb(nid, false)
 		}
 	}
