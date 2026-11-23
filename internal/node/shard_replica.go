@@ -80,9 +80,8 @@ func NewShardReplica(
 		})
 	}
 
-	snapshotCallback := func() ([]byte, error) {
-		_, data, err := eng.ExportSnapshotBytes()
-		return data, err
+	snapshotCallback := func() (uint64, []byte, error) {
+		return eng.ExportSnapshotBytes()
 	}
 
 	snapshotRestoreCallback := func(meta raft.SnapshotMetadata, data []byte) error {

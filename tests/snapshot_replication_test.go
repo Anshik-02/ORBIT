@@ -50,9 +50,8 @@ func createTestRaftNode(t *testing.T, id string, peers map[string]string, transp
 		})
 	}
 
-	snapshotCallback := func() ([]byte, error) {
-		_, data, err := eng.ExportSnapshotBytes()
-		return data, err
+	snapshotCallback := func() (uint64, []byte, error) {
+		return eng.ExportSnapshotBytes()
 	}
 
 	snapshotRestoreCallback := func(meta raft.SnapshotMetadata, data []byte) error {
@@ -190,23 +189,29 @@ func TestInstallSnapshot_LaggingFollowerCatchesUp(t *testing.T) {
 		lastProposedIdx = pIdx
 	}
 
-	// Wait for leader to commit entries up to lastProposedIdx
-	if err := waitForApplied(leader, lastProposedIdx, 3*time.Second); err != nil {
-		t.Fatal(err)
+	// Wait for active nodes to commit and apply entries up to lastProposedIdx
+	for _, n := range nodes {
+		if n.id != followerToIsolate.id {
+			if err := waitForApplied(n, lastProposedIdx, 3*time.Second); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 
-	// 5. Leader takes a snapshot at lastProposedIdx and compacts its log!
-	snapMeta, err := leader.raft.TakeSnapshot()
-	if err != nil {
-		t.Fatalf("leader TakeSnapshot failed: %v", err)
-	}
-	if snapMeta.LastIncludedIndex != lastProposedIdx {
-		t.Fatalf("expected snapshot LastIncludedIndex %d, got %d", lastProposedIdx, snapMeta.LastIncludedIndex)
-	}
-
-	// Verify leader log is compacted
-	if leader.raft.FirstIndex() != lastProposedIdx {
-		t.Fatalf("expected leader FirstIndex %d, got %d", lastProposedIdx, leader.raft.FirstIndex())
+	// 5. Active quorum nodes take snapshots at lastProposedIdx and compact their logs!
+	for _, n := range nodes {
+		if n.id != followerToIsolate.id {
+			snapMeta, err := n.raft.TakeSnapshot()
+			if err != nil {
+				t.Fatalf("node %s TakeSnapshot failed: %v", n.id, err)
+			}
+			if snapMeta.LastIncludedIndex != lastProposedIdx {
+				t.Fatalf("expected node %s snapshot LastIncludedIndex %d, got %d", n.id, lastProposedIdx, snapMeta.LastIncludedIndex)
+			}
+			if n.raft.FirstIndex() != lastProposedIdx {
+				t.Fatalf("expected node %s FirstIndex %d, got %d", n.id, lastProposedIdx, n.raft.FirstIndex())
+			}
+		}
 	}
 
 	// 6. Propose 3 more entries after snapshot (these exist in leader log)
@@ -290,6 +295,44 @@ func TestInstallSnapshot_LaggingFollowerCatchesUp(t *testing.T) {
 		t.Fatalf("reopened follower snapshot index: got %d, want %d",
 			snap.Metadata.LastIncludedIndex, lastProposedIdx)
 	}
+
+	// Verify follower engine and database recovery directly from engine.snapshot and remaining WAL
+	reopenedEng, err := storage.NewEngine(filepath.Join(folDir, "wal.log"))
+	if err != nil {
+		t.Fatalf("reopen follower engine: %v", err)
+	}
+	defer reopenedEng.Close()
+
+	reopenedDB, err := database.NewDatabase(reopenedEng)
+	if err != nil {
+		t.Fatalf("reopen follower database: %v", err)
+	}
+	defer reopenedDB.Close()
+
+	if reopenedEng.LastAppliedIndex() != postSnapIdx {
+		t.Fatalf("reopened follower engine last applied: got %d, want %d",
+			reopenedEng.LastAppliedIndex(), postSnapIdx)
+	}
+
+	for i := 1; i <= 15; i++ {
+		k := fmt.Sprintf("snap-key-%d", i)
+		expectedVal := fmt.Sprintf("val-%d", i)
+		gotVal, err := reopenedDB.Get(k)
+		if err != nil || gotVal != expectedVal {
+			t.Fatalf("reopened follower missing snapshot key %q: got %q (err=%v), want %q",
+				k, gotVal, err, expectedVal)
+		}
+	}
+	for i := 16; i <= 18; i++ {
+		k := fmt.Sprintf("post-snap-key-%d", i)
+		expectedVal := fmt.Sprintf("val-%d", i)
+		gotVal, err := reopenedDB.Get(k)
+		if err != nil || gotVal != expectedVal {
+			t.Fatalf("reopened follower missing post-snapshot key %q: got %q (err=%v), want %q",
+				k, gotVal, err, expectedVal)
+		}
+	}
+
 	_ = folID
 	_ = folPeers
 }
@@ -302,7 +345,11 @@ func TestHTTPTransport_InstallSnapshot(t *testing.T) {
 	handler := &mockSnapshotHandler{
 		onInstallSnapshot: func(req *raft.InstallSnapshotRequest) (*raft.InstallSnapshotResponse, error) {
 			receivedReq = req
-			return &raft.InstallSnapshotResponse{Term: req.Term}, nil
+			return &raft.InstallSnapshotResponse{
+				Term:           req.Term,
+				Success:        true,
+				AcceptedOffset: req.Offset + int64(len(req.Data)),
+			}, nil
 		},
 	}
 
@@ -317,14 +364,19 @@ func TestHTTPTransport_InstallSnapshot(t *testing.T) {
 	clientTransport := raft.NewHTTPTransport("127.0.0.1:0")
 	defer clientTransport.Close()
 
+	payload := []byte(`{"key1":"value1"}`)
 	req := &raft.InstallSnapshotRequest{
+		GroupID:           raft.GroupID("shard-0"),
 		Term:              5,
 		LeaderID:          "node-leader",
+		SnapshotID:        "test-snap-001",
 		LastIncludedIndex: 100,
 		LastIncludedTerm:  4,
 		Offset:            0,
-		Data:              []byte(`{"key1":"value1"}`),
+		Data:              payload,
 		Done:              true,
+		TotalSize:         int64(len(payload)),
+		Checksum:          raft.ComputeSnapshotChecksum(payload),
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -336,6 +388,12 @@ func TestHTTPTransport_InstallSnapshot(t *testing.T) {
 	}
 	if resp.Term != 5 {
 		t.Fatalf("expected term 5, got %d", resp.Term)
+	}
+	if !resp.Success {
+		t.Fatalf("expected success true, got false (err: %s)", resp.Error)
+	}
+	if resp.AcceptedOffset != int64(len(payload)) {
+		t.Fatalf("expected accepted offset %d, got %d", len(payload), resp.AcceptedOffset)
 	}
 	if receivedReq == nil || receivedReq.LastIncludedIndex != 100 {
 		t.Fatalf("handler did not receive expected request: %+v", receivedReq)
@@ -450,5 +508,266 @@ func (m *mockSnapshotHandler) HandleInstallSnapshot(ctx context.Context, req *ra
 	if m.onInstallSnapshot != nil {
 		return m.onInstallSnapshot(req)
 	}
-	return &raft.InstallSnapshotResponse{Term: req.Term}, nil
+	return &raft.InstallSnapshotResponse{
+		Term:           req.Term,
+		Success:        true,
+		AcceptedOffset: req.Offset + int64(len(req.Data)),
+	}, nil
+}
+
+// TestInstallSnapshot_ChunkProtocolHardening verifies strict chunk offset continuity,
+// session identity enforcement, checksum validation, and size limit checks.
+func TestInstallSnapshot_ChunkProtocolHardening(t *testing.T) {
+	dir := t.TempDir()
+	rStorage, err := raft.OpenFileStorage(dir)
+	if err != nil {
+		t.Fatalf("open storage: %v", err)
+	}
+	defer rStorage.Close()
+
+	net := raft.NewMockNetwork()
+	transport := net.CreateTransport("node-target")
+
+	r, err := raft.New(raft.Config{
+		ID:                 "node-target",
+		GroupID:            raft.DefaultGroupID,
+		Peers:              map[string]string{"node-leader": "node-leader"},
+		Storage:            rStorage,
+		Transport:          transport,
+		HeartbeatInterval:  50 * time.Millisecond,
+		ElectionTimeoutMin: 150 * time.Millisecond,
+		ElectionTimeoutMax: 300 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("new raft: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// 1. Chunk out of order at start (offset 100 != 0)
+	resp, err := r.HandleInstallSnapshot(ctx, &raft.InstallSnapshotRequest{
+		GroupID:           raft.DefaultGroupID,
+		Term:              1,
+		LeaderID:          "node-leader",
+		SnapshotID:        "session-1",
+		LastIncludedIndex: 5,
+		LastIncludedTerm:  1,
+		Offset:            100,
+		Data:              []byte("chunk"),
+		Done:              false,
+		TotalSize:         200,
+		Checksum:          12345,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Success {
+		t.Fatal("expected failure for out-of-order initial offset 100")
+	}
+
+	// 2. Valid first chunk (offset 0, len 5)
+	resp, err = r.HandleInstallSnapshot(ctx, &raft.InstallSnapshotRequest{
+		GroupID:           raft.DefaultGroupID,
+		Term:              1,
+		LeaderID:          "node-leader",
+		SnapshotID:        "session-1",
+		LastIncludedIndex: 5,
+		LastIncludedTerm:  1,
+		Offset:            0,
+		Data:              []byte("hello"),
+		Done:              false,
+		TotalSize:         10,
+		Checksum:          12345,
+	})
+	if err != nil || !resp.Success || resp.AcceptedOffset != 5 {
+		t.Fatalf("valid chunk 1 failed: resp=%+v, err=%v", resp, err)
+	}
+
+	// 3. Gap in chunks (offset 8 != 5)
+	resp, err = r.HandleInstallSnapshot(ctx, &raft.InstallSnapshotRequest{
+		GroupID:           raft.DefaultGroupID,
+		Term:              1,
+		LeaderID:          "node-leader",
+		SnapshotID:        "session-1",
+		LastIncludedIndex: 5,
+		LastIncludedTerm:  1,
+		Offset:            8,
+		Data:              []byte("world"),
+		Done:              false,
+		TotalSize:         10,
+		Checksum:          12345,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Success {
+		t.Fatal("expected failure for offset gap")
+	}
+	if resp.AcceptedOffset != 5 {
+		t.Fatalf("expected AcceptedOffset 5, got %d", resp.AcceptedOffset)
+	}
+
+	// 4. Session ID mismatch mid-transfer
+	resp, err = r.HandleInstallSnapshot(ctx, &raft.InstallSnapshotRequest{
+		GroupID:           raft.DefaultGroupID,
+		Term:              1,
+		LeaderID:          "node-leader",
+		SnapshotID:        "session-DIFFERENT",
+		LastIncludedIndex: 5,
+		LastIncludedTerm:  1,
+		Offset:            5,
+		Data:              []byte("world"),
+		Done:              true,
+		TotalSize:         10,
+		Checksum:          12345,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Success {
+		t.Fatal("expected failure for session mismatch")
+	}
+
+	// 5. Corrupted checksum on Done: true
+	payload := []byte("helloworld")
+	correctChecksum := raft.ComputeSnapshotChecksum(payload)
+	badChecksum := correctChecksum ^ 0xFFFF
+
+	// Re-send from offset 0 with bad checksum
+	resp, err = r.HandleInstallSnapshot(ctx, &raft.InstallSnapshotRequest{
+		GroupID:           raft.DefaultGroupID,
+		Term:              1,
+		LeaderID:          "node-leader",
+		SnapshotID:        "session-2",
+		LastIncludedIndex: 5,
+		LastIncludedTerm:  1,
+		Offset:            0,
+		Data:              payload,
+		Done:              true,
+		TotalSize:         int64(len(payload)),
+		Checksum:          badChecksum,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Success {
+		t.Fatal("expected failure for corrupted checksum")
+	}
+
+	// 6. Oversized chunk rejection (> MaxSnapshotChunkBytes)
+	resp, err = r.HandleInstallSnapshot(ctx, &raft.InstallSnapshotRequest{
+		GroupID:           raft.DefaultGroupID,
+		Term:              1,
+		LeaderID:          "node-leader",
+		SnapshotID:        "session-3",
+		LastIncludedIndex: 5,
+		LastIncludedTerm:  1,
+		Offset:            0,
+		Data:              make([]byte, raft.MaxSnapshotChunkBytes+1),
+		Done:              false,
+		TotalSize:         raft.MaxSnapshotChunkBytes + 1,
+		Checksum:          0,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Success {
+		t.Fatal("expected failure for oversized chunk")
+	}
+}
+
+// TestTakeSnapshot_AtomicIndexConsistency verifies that TakeSnapshot() captures
+// the exact applied index reported by the state machine and compacts the log to that exact index.
+func TestTakeSnapshot_AtomicIndexConsistency(t *testing.T) {
+	dir := t.TempDir()
+	rStorage, err := raft.OpenFileStorage(dir)
+	if err != nil {
+		t.Fatalf("open storage: %v", err)
+	}
+	defer rStorage.Close()
+
+	// Append entries 1..10
+	entries := make([]raft.LogEntry, 10)
+	for i := 1; i <= 10; i++ {
+		entries[i-1] = raft.LogEntry{
+			Index:     uint64(i),
+			Term:      1,
+			Operation: "SET",
+			Key:       fmt.Sprintf("k%d", i),
+			Value:     fmt.Sprintf("v%d", i),
+		}
+	}
+	if err := rStorage.AppendEntries(entries); err != nil {
+		t.Fatalf("append entries: %v", err)
+	}
+
+	// State machine represents state through index 8
+	var currentEngineIndex uint64 = 8
+	snapshotData := []byte(`{"k8":"v8"}`)
+
+	net := raft.NewMockNetwork()
+	transport := net.CreateTransport("node-snap")
+
+	r, err := raft.New(raft.Config{
+		ID:                 "node-snap",
+		GroupID:            raft.DefaultGroupID,
+		Peers:              map[string]string{},
+		Storage:            rStorage,
+		Transport:          transport,
+		HeartbeatInterval:  50 * time.Millisecond,
+		ElectionTimeoutMin: 150 * time.Millisecond,
+		ElectionTimeoutMax: 300 * time.Millisecond,
+		InitialLastApplied: 5, // simulate lastApplied lagging behind engine
+		SnapshotCallback: func() (uint64, []byte, error) {
+			return currentEngineIndex, snapshotData, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("new raft: %v", err)
+	}
+
+	// Commit index must be at least currentEngineIndex for snapshot validity
+	// In Raft, commitIndex is advanced by consensus. We simulate committed up to 10.
+	// Since r is unexported, we can call TakeSnapshot directly after setting commitIndex.
+	// In single node cluster or leader, commitIndex is tracked.
+	// Let's elect this node as single leader so commitIndex advances.
+	if err := r.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer r.Stop()
+
+	// Wait for election
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && r.Role() != raft.Leader {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if r.Role() != raft.Leader {
+		t.Fatal("failed to elect leader")
+	}
+
+	// Propose entry to establish leader readiness and advance commit index
+	idx, _, err := r.Propose("SET", "sync-k", "sync-v")
+	if err != nil {
+		t.Fatalf("propose: %v", err)
+	}
+
+	// Update currentEngineIndex to the newly committed index
+	currentEngineIndex = idx
+
+	meta, err := r.TakeSnapshot()
+	if err != nil {
+		t.Fatalf("TakeSnapshot failed: %v", err)
+	}
+
+	if meta.LastIncludedIndex != idx {
+		t.Fatalf("expected snapshot LastIncludedIndex %d, got %d", idx, meta.LastIncludedIndex)
+	}
+
+	if r.LastApplied() != idx {
+		t.Fatalf("expected lastApplied to advance to %d, got %d", idx, r.LastApplied())
+	}
+
+	if rStorage.FirstIndex() != idx {
+		t.Fatalf("expected storage FirstIndex %d, got %d", idx, rStorage.FirstIndex())
+	}
 }

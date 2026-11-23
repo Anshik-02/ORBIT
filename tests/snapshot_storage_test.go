@@ -136,15 +136,15 @@ func TestSnapshotChecksumBitrotDetected(t *testing.T) {
 		t.Fatalf("close storage: %v", err)
 	}
 
-	// Corrupt snapshot.data file
-	dataPath := filepath.Join(dir, "raft", "snapshot.data")
-	content, err := os.ReadFile(dataPath)
+	// Corrupt snapshot.snap file
+	snapPath := filepath.Join(dir, "raft", "snapshot.snap")
+	content, err := os.ReadFile(snapPath)
 	if err != nil {
-		t.Fatalf("read snapshot data: %v", err)
+		t.Fatalf("read snapshot container: %v", err)
 	}
-	content[len(content)-2] ^= 0xFF
-	if err := os.WriteFile(dataPath, content, 0600); err != nil {
-		t.Fatalf("corrupt snapshot data: %v", err)
+	content[len(content)-5] ^= 0xFF
+	if err := os.WriteFile(snapPath, content, 0600); err != nil {
+		t.Fatalf("corrupt snapshot container: %v", err)
 	}
 
 	// Reopen storage: must fail with checksum error

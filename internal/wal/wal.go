@@ -288,6 +288,43 @@ func (l *Log) ReadAll() ([]Record, error) {
 	return records, err
 }
 
+// Reset truncates the WAL file to zero bytes, flushes the writer, and resets sequence to zero.
+func (l *Log) Reset() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.closed {
+		return ErrWALClosed
+	}
+	if l.err != nil {
+		return fmt.Errorf("%w: %v", ErrWALPoisoned, l.err)
+	}
+
+	if err := l.writer.Flush(); err != nil {
+		l.err = err
+		return fmt.Errorf("wal: flush before reset: %w", err)
+	}
+
+	if err := l.file.Truncate(0); err != nil {
+		l.err = err
+		return fmt.Errorf("wal: truncate on reset: %w", err)
+	}
+
+	if _, err := l.file.Seek(0, 0); err != nil {
+		l.err = err
+		return fmt.Errorf("wal: seek on reset: %w", err)
+	}
+
+	if err := l.file.Sync(); err != nil {
+		l.err = err
+		return fmt.Errorf("wal: sync on reset: %w", err)
+	}
+
+	l.writer.Reset(l.file)
+	l.sequence = 0
+	return nil
+}
+
 // Health checks whether the WAL is open and unpoisoned.
 func (l *Log) Health() error {
 	l.mu.Lock()

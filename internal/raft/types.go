@@ -117,18 +117,25 @@ type GroupAppendEntriesRequest struct {
 
 // InstallSnapshotRequest is invoked by the leader to send chunks of a snapshot to a lagging follower (Section 7).
 type InstallSnapshotRequest struct {
+	GroupID           GroupID `json:"group_id"`
 	Term              uint64  `json:"term"`
 	LeaderID          string  `json:"leader_id"`
+	SnapshotID        string  `json:"snapshot_id"` // Unique transfer session identity
 	LastIncludedIndex uint64  `json:"last_included_index"`
 	LastIncludedTerm  uint64  `json:"last_included_term"`
 	Offset            int64   `json:"offset"`
 	Data              []byte  `json:"data"`
 	Done              bool    `json:"done"`
+	TotalSize         int64   `json:"total_size"` // Total byte size of full snapshot payload
+	Checksum          uint32  `json:"checksum"`   // CRC32 of full snapshot payload
 }
 
 // InstallSnapshotResponse is returned by followers in response to InstallSnapshotRequest.
 type InstallSnapshotResponse struct {
-	Term uint64 `json:"term"`
+	Term           uint64 `json:"term"`
+	AcceptedOffset int64  `json:"accepted_offset"` // Highest consecutive byte offset accepted
+	Success        bool   `json:"success"`
+	Error          string `json:"error,omitempty"`
 }
 
 // GroupInstallSnapshotRequest is the RPC envelope tagging an InstallSnapshot request with its target consensus group.

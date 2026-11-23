@@ -27,7 +27,11 @@ func (m *mockRaftHandler) HandleAppendEntries(ctx context.Context, req *raft.App
 }
 
 func (m *mockRaftHandler) HandleInstallSnapshot(ctx context.Context, req *raft.InstallSnapshotRequest) (*raft.InstallSnapshotResponse, error) {
-	return &raft.InstallSnapshotResponse{Term: req.Term}, nil
+	return &raft.InstallSnapshotResponse{
+		Term:           req.Term,
+		Success:        true,
+		AcceptedOffset: req.Offset + int64(len(req.Data)),
+	}, nil
 }
 
 func TestHTTPTransport_MethodNotAllowed(t *testing.T) {
@@ -236,7 +240,11 @@ func (s *slowRaftHandler) HandleAppendEntries(ctx context.Context, req *raft.App
 func (s *slowRaftHandler) HandleInstallSnapshot(ctx context.Context, req *raft.InstallSnapshotRequest) (*raft.InstallSnapshotResponse, error) {
 	select {
 	case <-time.After(s.delay):
-		return &raft.InstallSnapshotResponse{Term: req.Term}, nil
+		return &raft.InstallSnapshotResponse{
+			Term:           req.Term,
+			Success:        true,
+			AcceptedOffset: req.Offset + int64(len(req.Data)),
+		}, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}

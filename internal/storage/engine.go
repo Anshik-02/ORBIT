@@ -4,9 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"math"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"orbit/internal/wal"
 )
@@ -17,7 +21,18 @@ var (
 	ErrRaftIndexGap            = errors.New("storage: raft index gap detected")
 	ErrRaftIndexOverflow       = errors.New("storage: raft index overflow")
 	ErrSnapshotIndexRegression = errors.New("storage: snapshot index must be greater than or equal to last applied index")
+	ErrCorruptEngineSnapshot   = errors.New("storage: engine snapshot is corrupted")
 )
+
+// EngineSnapshotContainer represents a durable on-disk snapshot of the state machine.
+type EngineSnapshotContainer struct {
+	Version   uint32            `json:"version"`
+	Index     uint64            `json:"index"`
+	Term      uint64            `json:"term"`
+	State     map[string]string `json:"state"`
+	CreatedAt time.Time         `json:"created_at"`
+	Checksum  uint32            `json:"checksum"`
+}
 
 // CommittedCommand represents an entry that has reached majority consensus
 // (e.g. via Raft in Section 2) and is ready to be committed to local storage.
@@ -44,17 +59,20 @@ type CommittedCommand struct {
 //   - Read operations (Get) are non-blocking and concurrent via Memtable RLock.
 //   - Single-pass streaming WAL replay on boot reconstructs Memtable AND restores lastAppliedIndex.
 //   - Enforces contiguous sequential application for consensus commands (no gaps allowed).
+//   - Durable snapshots in engine.snapshot survive node restarts without WAL dependency.
 type Engine struct {
 	memtable         *Memtable
 	wal              *wal.Log
+	snapPath         string
 	writeMu          sync.Mutex  // serializes WAL append + Memtable update transaction
 	closed           atomic.Bool // tracks shutdown state
 	closeErr         error       // sticky error from Close()
 	lastAppliedIndex uint64      // highest applied Raft index for idempotency
 }
 
-// NewEngine opens the WAL at walPath, executes a single streaming replay pass
-// to reconstruct the Memtable and consensus metadata, and returns a ready-to-use Engine.
+// NewEngine opens the WAL at walPath, recovers durable snapshot state if present,
+// executes a single streaming replay pass to reconstruct the Memtable and consensus metadata,
+// and returns a ready-to-use Engine.
 func NewEngine(walPath string) (*Engine, error) {
 	w, err := wal.Open(walPath)
 	if err != nil {
@@ -64,9 +82,10 @@ func NewEngine(walPath string) (*Engine, error) {
 	engine := &Engine{
 		memtable: NewMemtable(),
 		wal:      w,
+		snapPath: filepath.Join(filepath.Dir(walPath), "engine.snapshot"),
 	}
 
-	// Single streaming replay pass: populates Memtable and recovers consensus progress
+	// Reconstruct state machine from durable snapshot and subsequent WAL entries
 	if err := engine.recover(); err != nil {
 		w.Close()
 		return nil, fmt.Errorf("storage: recovery failed: %w", err)
@@ -75,10 +94,48 @@ func NewEngine(walPath string) (*Engine, error) {
 	return engine, nil
 }
 
-// recover streams all WAL records directly into the Memtable and restores lastAppliedIndex.
-// Memory overhead is strictly O(1) regardless of WAL size.
+// recover restores Memtable and lastAppliedIndex from engine.snapshot (if present),
+// then streams subsequent WAL records.
 func (e *Engine) recover() error {
+	// 0. Crash recovery for engine.snapshot.tmp
+	tmpSnap := e.snapPath + ".tmp"
+	if _, err := os.Stat(tmpSnap); err == nil {
+		if _, err := os.Stat(e.snapPath); errors.Is(err, os.ErrNotExist) {
+			_ = os.Rename(tmpSnap, e.snapPath)
+		} else {
+			_ = os.Remove(tmpSnap)
+		}
+	}
+
+	// 1. Recover engine.snapshot if present
+	if data, err := os.ReadFile(e.snapPath); err == nil && len(data) > 0 {
+		var container EngineSnapshotContainer
+		if err := json.Unmarshal(data, &container); err != nil {
+			return fmt.Errorf("%w: %v", ErrCorruptEngineSnapshot, err)
+		}
+
+		stateBytes, err := json.Marshal(container.State)
+		if err != nil {
+			return fmt.Errorf("storage: marshal snapshot state for checksum: %w", err)
+		}
+		computed := crc32.ChecksumIEEE(stateBytes)
+		if computed != container.Checksum {
+			return fmt.Errorf("%w: checksum mismatch (stored %d, computed %d)",
+				ErrCorruptEngineSnapshot, container.Checksum, computed)
+		}
+
+		for k, v := range container.State {
+			e.memtable.Set(k, v)
+		}
+		e.lastAppliedIndex = container.Index
+	}
+
+	// 2. Stream WAL records, skipping entries already incorporated into the snapshot
 	return e.wal.Replay(func(r wal.Record) error {
+		if r.RaftIndex > 0 && r.RaftIndex <= e.lastAppliedIndex {
+			return nil
+		}
+
 		switch r.Operation {
 		case wal.OperationSet:
 			e.memtable.Set(r.Key, r.Value)
@@ -207,8 +264,10 @@ type SnapshotMetadata struct {
 // InstallSnapshot atomically installs a snapshot into the storage engine:
 //  1. Validates that the engine is open.
 //  2. Enforces monotonicity: rejects regressions where meta.Index < e.lastAppliedIndex.
-//  3. Atomically replaces the in-memory Memtable with the snapshot state.
-//  4. Advances lastAppliedIndex to meta.Index.
+//  3. Durably persists the snapshot container to engine.snapshot on disk.
+//  4. Truncates and resets the WAL to discard obsolete records.
+//  5. Atomically replaces the in-memory Memtable with the snapshot state.
+//  6. Advances lastAppliedIndex to meta.Index.
 func (e *Engine) InstallSnapshot(meta SnapshotMetadata, state map[string]string) error {
 	if e.closed.Load() {
 		return ErrClosed
@@ -226,6 +285,33 @@ func (e *Engine) InstallSnapshot(meta SnapshotMetadata, state map[string]string)
 			ErrSnapshotIndexRegression, meta.Index, e.lastAppliedIndex)
 	}
 
+	// 1. Serialize and persist durable engine snapshot container
+	stateBytes, err := json.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("storage: marshal state for snapshot: %w", err)
+	}
+	container := EngineSnapshotContainer{
+		Version:   1,
+		Index:     meta.Index,
+		Term:      meta.Term,
+		State:     state,
+		CreatedAt: time.Now(),
+		Checksum:  crc32.ChecksumIEEE(stateBytes),
+	}
+	containerBytes, err := json.MarshalIndent(container, "", "  ")
+	if err != nil {
+		return fmt.Errorf("storage: marshal snapshot container: %w", err)
+	}
+	if err := atomicWriteFileWithDirSync(e.snapPath, containerBytes, 0600); err != nil {
+		return fmt.Errorf("storage: persist engine snapshot: %w", err)
+	}
+
+	// 2. Truncate/reset WAL to purge obsolete log records
+	if err := e.wal.Reset(); err != nil {
+		return fmt.Errorf("storage: reset wal after snapshot install: %w", err)
+	}
+
+	// 3. Atomically update in-memory state
 	newMem := NewMemtable()
 	for k, v := range state {
 		newMem.Set(k, v)
@@ -234,6 +320,39 @@ func (e *Engine) InstallSnapshot(meta SnapshotMetadata, state map[string]string)
 	e.memtable = newMem
 	e.lastAppliedIndex = meta.Index
 	return nil
+}
+
+// SaveSnapshot durably persists the current in-memory database state and applied index to disk.
+func (e *Engine) SaveSnapshot(meta SnapshotMetadata) error {
+	if e.closed.Load() {
+		return ErrClosed
+	}
+
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+
+	if e.closed.Load() {
+		return ErrClosed
+	}
+
+	state := e.memtable.All()
+	stateBytes, err := json.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("storage: marshal state for snapshot: %w", err)
+	}
+	container := EngineSnapshotContainer{
+		Version:   1,
+		Index:     meta.Index,
+		Term:      meta.Term,
+		State:     state,
+		CreatedAt: time.Now(),
+		Checksum:  crc32.ChecksumIEEE(stateBytes),
+	}
+	containerBytes, err := json.MarshalIndent(container, "", "  ")
+	if err != nil {
+		return fmt.Errorf("storage: marshal snapshot container: %w", err)
+	}
+	return atomicWriteFileWithDirSync(e.snapPath, containerBytes, 0600)
 }
 
 // ExportSnapshot returns the current applied Raft index and a point-in-time copy of memtable state.
@@ -253,6 +372,7 @@ func (e *Engine) ExportSnapshot() (uint64, map[string]string, error) {
 }
 
 // ExportSnapshotBytes exports the current state machine data as serialized JSON bytes with its applied Raft index.
+// Also durably checkpoints engine.snapshot on disk.
 func (e *Engine) ExportSnapshotBytes() (uint64, []byte, error) {
 	idx, state, err := e.ExportSnapshot()
 	if err != nil {
@@ -262,6 +382,20 @@ func (e *Engine) ExportSnapshotBytes() (uint64, []byte, error) {
 	if err != nil {
 		return 0, nil, fmt.Errorf("storage: marshal snapshot state: %w", err)
 	}
+
+	// Persist engine snapshot durably on disk as a checkpoint
+	container := EngineSnapshotContainer{
+		Version:   1,
+		Index:     idx,
+		Term:      0,
+		State:     state,
+		CreatedAt: time.Now(),
+		Checksum:  crc32.ChecksumIEEE(data),
+	}
+	if containerBytes, mErr := json.MarshalIndent(container, "", "  "); mErr == nil {
+		_ = atomicWriteFileWithDirSync(e.snapPath, containerBytes, 0600)
+	}
+
 	return idx, data, nil
 }
 
@@ -272,6 +406,47 @@ func (e *Engine) RestoreSnapshotBytes(meta SnapshotMetadata, data []byte) error 
 		return fmt.Errorf("storage: unmarshal snapshot state: %w", err)
 	}
 	return e.InstallSnapshot(meta, state)
+}
+
+// atomicWriteFileWithDirSync safely writes data using a deterministic .tmp file,
+// fsync, atomic rename, and directory sync.
+func atomicWriteFileWithDirSync(path string, data []byte, perm os.FileMode) error {
+	tmpPath := path + ".tmp"
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, perm)
+	if err != nil {
+		return err
+	}
+
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+
+	if _, err := os.Stat(path); err == nil {
+		_ = os.Remove(path)
+	}
+
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+
+	dir := filepath.Dir(path)
+	if df, err := os.Open(dir); err == nil {
+		_ = df.Sync()
+		_ = df.Close()
+	}
+
+	return nil
 }
 
 // Set stores key -> value in the database.

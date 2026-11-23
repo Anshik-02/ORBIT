@@ -745,6 +745,71 @@ func TestSnapshotMonotonicityAndInstallation(t *testing.T) {
 	}
 }
 
+// TestEngine_SnapshotRecoveryAcrossRestart verifies that an engine persisted via SaveSnapshot
+// survives node restart, loads engine.snapshot, and replays only subsequent WAL records.
+func TestEngine_SnapshotRecoveryAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	walPath := dir + "/wal.log"
+
+	engine1, err := storage.NewEngine(walPath)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+
+	for i := 1; i <= 5; i++ {
+		if err := engine1.ApplyCommitted(storage.CommittedCommand{
+			RaftIndex: uint64(i),
+			RaftTerm:  1,
+			Operation: wal.OperationSet,
+			Key:       fmt.Sprintf("k%d", i),
+			Value:     fmt.Sprintf("v%d", i),
+		}); err != nil {
+			t.Fatalf("ApplyCommitted %d: %v", i, err)
+		}
+	}
+
+	// Persist snapshot at index 5
+	if err := engine1.SaveSnapshot(storage.SnapshotMetadata{Index: 5, Term: 1}); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+
+	// Apply entries 6..8 to WAL after snapshot
+	for i := 6; i <= 8; i++ {
+		if err := engine1.ApplyCommitted(storage.CommittedCommand{
+			RaftIndex: uint64(i),
+			RaftTerm:  1,
+			Operation: wal.OperationSet,
+			Key:       fmt.Sprintf("k%d", i),
+			Value:     fmt.Sprintf("v%d", i),
+		}); err != nil {
+			t.Fatalf("ApplyCommitted %d: %v", i, err)
+		}
+	}
+
+	if err := engine1.Close(); err != nil {
+		t.Fatalf("close engine1: %v", err)
+	}
+
+	// Reopen engine from disk
+	engine2, err := storage.NewEngine(walPath)
+	if err != nil {
+		t.Fatalf("reopen engine2: %v", err)
+	}
+	defer engine2.Close()
+
+	if engine2.LastAppliedIndex() != 8 {
+		t.Fatalf("expected lastAppliedIndex 8, got %d", engine2.LastAppliedIndex())
+	}
+
+	// Verify all keys 1..8 exist with correct values
+	for i := 1; i <= 8; i++ {
+		v, ok := engine2.Get(fmt.Sprintf("k%d", i))
+		if !ok || v != fmt.Sprintf("v%d", i) {
+			t.Fatalf("key k%d mismatch: got %q, ok=%v", i, v, ok)
+		}
+	}
+}
+
 // TestWALCloseStickyError verifies that if wal.Close() fails, subsequent Close()
 // invocations return the exact same error.
 func TestWALCloseStickyError(t *testing.T) {

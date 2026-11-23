@@ -63,20 +63,19 @@ type metadataState struct {
 //   - Index 0 is a sentinel representing the base state (term 0).
 //   - All operations are thread-safe protected by mu.
 type FileStorage struct {
-	mu           sync.Mutex
-	dir          string
-	metaPath     string
-	logPath      string
-	snapMetaPath string
-	snapDataPath string
-	logFile      *os.File
-	currentTerm  uint64
-	votedFor     string
-	entries      []LogEntry // entries[0] is sentinel at FirstIndex()
-	snapshot     *Snapshot
-	closed       bool
-	poisoned     bool
-	poisonErr    error
+	mu          sync.Mutex
+	dir         string
+	metaPath    string
+	logPath     string
+	snapPath    string
+	logFile     *os.File
+	currentTerm uint64
+	votedFor    string
+	entries     []LogEntry // entries[0] is sentinel at FirstIndex()
+	snapshot    *Snapshot
+	closed      bool
+	poisoned    bool
+	poisonErr   error
 }
 
 // computeEntryChecksum calculates a length-prefixed CRC32-IEEE checksum over an entry's fields.
@@ -104,6 +103,12 @@ func computeEntryChecksum(index, term uint64, op, key, val string) uint32 {
 	return h.Sum32()
 }
 
+// snapshotContainer physically bundles metadata and payload into a single atomic file.
+type snapshotContainer struct {
+	Metadata SnapshotMetadata `json:"metadata"`
+	Data     []byte           `json:"data"`
+}
+
 // OpenFileStorage initializes or recovers Raft storage from the specified directory.
 func OpenFileStorage(dataDir string) (*FileStorage, error) {
 	raftDir := filepath.Join(dataDir, "raft")
@@ -112,18 +117,17 @@ func OpenFileStorage(dataDir string) (*FileStorage, error) {
 	}
 
 	fs := &FileStorage{
-		dir:          raftDir,
-		metaPath:     filepath.Join(raftDir, "metadata.json"),
-		logPath:      filepath.Join(raftDir, "raft.log"),
-		snapMetaPath: filepath.Join(raftDir, "snapshot.meta"),
-		snapDataPath: filepath.Join(raftDir, "snapshot.data"),
-		entries:      []LogEntry{{Index: 0, Term: 0}}, // Default sentinel entry at index 0
+		dir:      raftDir,
+		metaPath: filepath.Join(raftDir, "metadata.json"),
+		logPath:  filepath.Join(raftDir, "raft.log"),
+		snapPath: filepath.Join(raftDir, "snapshot.snap"),
+		entries:  []LogEntry{{Index: 0, Term: 0}}, // Default sentinel entry at index 0
 	}
 
 	// 0. Crash recovery during atomic replacement:
 	// If a crash occurred after removing the original file but before renaming the .tmp replacement,
 	// promote the fully synced .tmp replacement. If the original file is intact, clean up any stale .tmp.
-	for _, target := range []string{fs.logPath, fs.metaPath, fs.snapMetaPath, fs.snapDataPath} {
+	for _, target := range []string{fs.logPath, fs.metaPath, fs.snapPath} {
 		tmpTarget := target + ".tmp"
 		if _, err := os.Stat(tmpTarget); err == nil {
 			if _, err := os.Stat(target); errors.Is(err, os.ErrNotExist) {
@@ -159,9 +163,9 @@ func OpenFileStorage(dataDir string) (*FileStorage, error) {
 	return fs, nil
 }
 
-// recoverSnapshot loads snapshot.meta and snapshot.data if present and validates integrity.
+// recoverSnapshot loads snapshot.snap if present and validates integrity.
 func (fs *FileStorage) recoverSnapshot() error {
-	metaBytes, err := os.ReadFile(fs.snapMetaPath)
+	dataBytes, err := os.ReadFile(fs.snapPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -169,19 +173,14 @@ func (fs *FileStorage) recoverSnapshot() error {
 		return err
 	}
 
-	var meta SnapshotMetadata
-	if err := json.Unmarshal(metaBytes, &meta); err != nil {
-		return fmt.Errorf("%w: parse snapshot metadata: %v", ErrCorruptSnapshot, err)
-	}
-
-	dataBytes, err := os.ReadFile(fs.snapDataPath)
-	if err != nil {
-		return fmt.Errorf("%w: read snapshot data: %v", ErrCorruptSnapshot, err)
+	var container snapshotContainer
+	if err := json.Unmarshal(dataBytes, &container); err != nil {
+		return fmt.Errorf("%w: parse snapshot container: %v", ErrCorruptSnapshot, err)
 	}
 
 	snap := &Snapshot{
-		Metadata: meta,
-		Data:     dataBytes,
+		Metadata: container.Metadata,
+		Data:     container.Data,
 	}
 	if err := snap.Validate(); err != nil {
 		return err
@@ -190,8 +189,8 @@ func (fs *FileStorage) recoverSnapshot() error {
 	fs.snapshot = snap
 	// Sentinel entry reflects the snapshot baseline
 	fs.entries = []LogEntry{{
-		Index: meta.LastIncludedIndex,
-		Term:  meta.LastIncludedTerm,
+		Index: container.Metadata.LastIncludedIndex,
+		Term:  container.Metadata.LastIncludedTerm,
 	}}
 	return nil
 }
@@ -622,25 +621,23 @@ func (fs *FileStorage) SaveSnapshot(meta SnapshotMetadata, data []byte) error {
 		meta.CreatedAt = time.Now()
 	}
 
-	// 1. Write snapshot data atomically
-	if err := atomicWriteFile(fs.snapDataPath, data, 0600); err != nil {
-		fs.poisoned = true
-		fs.poisonErr = err
-		return fmt.Errorf("write snapshot data: %w", err)
+	// 1. Physically bundle metadata and payload in single container file
+	container := snapshotContainer{
+		Metadata: meta,
+		Data:     data,
 	}
-
-	// 2. Write snapshot metadata atomically
-	metaBytes, err := json.MarshalIndent(meta, "", "  ")
+	containerBytes, err := json.MarshalIndent(container, "", "  ")
 	if err != nil {
-		return fmt.Errorf("marshal snapshot metadata: %w", err)
-	}
-	if err := atomicWriteFile(fs.snapMetaPath, metaBytes, 0600); err != nil {
-		fs.poisoned = true
-		fs.poisonErr = err
-		return fmt.Errorf("write snapshot metadata: %w", err)
+		return fmt.Errorf("marshal snapshot container: %w", err)
 	}
 
-	// 3. Cache in-memory
+	if err := atomicWriteFile(fs.snapPath, containerBytes, 0600); err != nil {
+		fs.poisoned = true
+		fs.poisonErr = err
+		return fmt.Errorf("write snapshot container: %w", err)
+	}
+
+	// 2. Cache in-memory
 	dataCopy := make([]byte, len(data))
 	copy(dataCopy, data)
 	fs.snapshot = &Snapshot{
@@ -825,5 +822,15 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 		_ = os.Remove(path)
 	}
 
-	return os.Rename(tmpPath, path)
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+
+	dir := filepath.Dir(path)
+	if df, err := os.Open(dir); err == nil {
+		_ = df.Sync()
+		_ = df.Close()
+	}
+
+	return nil
 }

@@ -7,7 +7,11 @@ import (
 	"time"
 )
 
-const SnapshotCurrentVersion uint32 = 1
+const (
+	SnapshotCurrentVersion uint32 = 1
+	MaxSnapshotSizeBytes   int64  = 256 * 1024 * 1024 // 256 MB maximum snapshot payload size
+	MaxSnapshotChunkBytes  int64  = 1024 * 1024       // 1 MB maximum chunk size
+)
 
 // SnapshotMetadata captures the consensus indexing and integrity metadata of a snapshot.
 type SnapshotMetadata struct {

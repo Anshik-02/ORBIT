@@ -27,18 +27,23 @@ type Config struct {
 	// after a node restart, preventing duplicate state-machine application.
 	InitialLastApplied uint64
 
-	// SnapshotCallback captures state machine state for log compaction.
-	SnapshotCallback func() ([]byte, error)
+	// SnapshotCallback captures state machine state and returns the exact applied index and serialized payload.
+	SnapshotCallback func() (uint64, []byte, error)
 
 	// SnapshotRestoreCallback restores state machine state when an InstallSnapshot RPC is received.
 	SnapshotRestoreCallback func(SnapshotMetadata, []byte) error
 }
 
 type snapshotAssembly struct {
+	snapshotID        string
+	leaderID          string
 	lastIncludedIndex uint64
 	lastIncludedTerm  uint64
+	totalSize         int64
+	checksum          uint32
+	expectedOffset    int64
 	data              []byte
-	lastOffset        int64
+	lastActivity      time.Time
 }
 
 // Raft implements a consensus engine following the Raft consensus algorithm.
@@ -50,7 +55,8 @@ type snapshotAssembly struct {
 //   - Entries are committed only when replicated across a strict majority quorum.
 //   - A dummy sentinel entry is preserved at index 0 (term 0) in the log.
 type Raft struct {
-	mu sync.Mutex
+	mu         sync.Mutex
+	snapshotMu sync.Mutex // serializes heavy disk persistence and state machine restore outside mu
 
 	id        string
 	groupID   GroupID
@@ -71,9 +77,10 @@ type Raft struct {
 	storageErr  error // fatal error during durable persistence
 
 	// Volatile state on leaders
-	nextIndex       map[string]uint64
-	matchIndex      map[string]uint64
-	peerLastContact map[string]time.Time
+	nextIndex               map[string]uint64
+	matchIndex              map[string]uint64
+	peerLastContact         map[string]time.Time
+	activeSnapshotTransfers map[string]bool // prevents duplicate concurrent snapshot transfers to the same peer
 
 	// Timers and timing parameters
 	heartbeatInterval  time.Duration
@@ -85,7 +92,7 @@ type Raft struct {
 	// Coordination & lifecycle
 	commitCallback          func(LogEntry) error
 	leaderCallback          func(GroupID, string, uint64)
-	snapshotCallback        func() ([]byte, error)
+	snapshotCallback        func() (uint64, []byte, error)
 	snapshotRestoreCallback func(SnapshotMetadata, []byte) error
 	snapshotAssembly        *snapshotAssembly
 	stopCh                  chan struct{}
@@ -143,9 +150,10 @@ func New(cfg Config) (*Raft, error) {
 		snapshotCallback:        cfg.SnapshotCallback,
 		snapshotRestoreCallback: cfg.SnapshotRestoreCallback,
 		nextIndex:               make(map[string]uint64),
-		matchIndex:         make(map[string]uint64),
-		peerLastContact:    make(map[string]time.Time),
-		stopCh:             make(chan struct{}),
+		matchIndex:              make(map[string]uint64),
+		peerLastContact:         make(map[string]time.Time),
+		activeSnapshotTransfers: make(map[string]bool),
+		stopCh:                  make(chan struct{}),
 		stoppedCh:          make(chan struct{}),
 		rng:                rand.New(rand.NewSource(time.Now().UnixNano() + int64(len(cfg.ID)))),
 	}
@@ -759,7 +767,10 @@ func (r *Raft) broadcastAppendEntriesLocked(isHeartbeat bool) {
 
 		if nextIdx <= firstIndex {
 			// Follower is behind the compacted log boundary; stream snapshot
-			go r.sendInstallSnapshotToPeer(peerID, peerAddr, term)
+			if !r.activeSnapshotTransfers[peerID] {
+				r.activeSnapshotTransfers[peerID] = true
+				go r.sendInstallSnapshotToPeer(peerID, peerAddr, term)
+			}
 			continue
 		}
 
@@ -838,7 +849,10 @@ func (r *Raft) sendAppendEntriesToPeer(peerID, peerAddr string, req *AppendEntri
 		firstIndex := r.storage.FirstIndex()
 		if r.nextIndex[peerID] <= firstIndex {
 			// Next index fell behind the compacted log boundary; stream snapshot
-			go r.sendInstallSnapshotToPeer(peerID, peerAddr, r.currentTerm)
+			if !r.activeSnapshotTransfers[peerID] {
+				r.activeSnapshotTransfers[peerID] = true
+				go r.sendInstallSnapshotToPeer(peerID, peerAddr, r.currentTerm)
+			}
 			return
 		}
 
@@ -864,33 +878,43 @@ func (r *Raft) sendAppendEntriesToPeer(peerID, peerAddr string, req *AppendEntri
 
 // sendInstallSnapshotToPeer streams snapshot data chunks to a lagging follower (Section 7).
 func (r *Raft) sendInstallSnapshotToPeer(peerID, peerAddr string, term uint64) {
+	defer func() {
+		r.mu.Lock()
+		delete(r.activeSnapshotTransfers, peerID)
+		r.mu.Unlock()
+	}()
+
 	snap, err := r.storage.GetSnapshot()
 	if err != nil || snap == nil {
 		return
 	}
 
-	const chunkSize = 512 * 1024 // 512KB chunks
-	data := snap.Data
-	dataLen := int64(len(data))
+	snapshotID := fmt.Sprintf("snap-%s-%d-%d", r.id, snap.Metadata.LastIncludedIndex, time.Now().UnixNano())
+	totalSize := snap.Metadata.Size
+	checksum := snap.Metadata.Checksum
+	const chunkSize = 256 * 1024 // 256KB chunks
+
 	var offset int64 = 0
-
-	for {
+	for offset < totalSize || (totalSize == 0 && offset == 0) {
 		end := offset + chunkSize
-		done := false
-		if end >= dataLen {
-			end = dataLen
-			done = true
+		if end > totalSize {
+			end = totalSize
 		}
+		done := (end == totalSize)
+		chunk := snap.Data[offset:end]
 
-		chunk := data[offset:end]
 		req := &InstallSnapshotRequest{
+			GroupID:           r.groupID,
 			Term:              term,
 			LeaderID:          r.id,
+			SnapshotID:        snapshotID,
 			LastIncludedIndex: snap.Metadata.LastIncludedIndex,
 			LastIncludedTerm:  snap.Metadata.LastIncludedTerm,
 			Offset:            offset,
 			Data:              chunk,
 			Done:              done,
+			TotalSize:         totalSize,
+			Checksum:          checksum,
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), r.heartbeatInterval*5)
@@ -917,6 +941,19 @@ func (r *Raft) sendInstallSnapshotToPeer(peerID, peerAddr string, term uint64) {
 			return
 		}
 
+		if !resp.Success {
+			// If follower requested resync to accepted offset, adjust offset and retry
+			if resp.AcceptedOffset >= 0 && resp.AcceptedOffset < totalSize && resp.AcceptedOffset != offset {
+				offset = resp.AcceptedOffset
+				r.mu.Unlock()
+				continue
+			}
+			r.mu.Unlock()
+			return
+		}
+
+		offset = resp.AcceptedOffset
+
 		if done {
 			if snap.Metadata.LastIncludedIndex > r.matchIndex[peerID] {
 				r.matchIndex[peerID] = snap.Metadata.LastIncludedIndex
@@ -934,7 +971,6 @@ func (r *Raft) sendInstallSnapshotToPeer(peerID, peerAddr string, term uint64) {
 		}
 
 		r.mu.Unlock()
-		offset = end
 	}
 }
 
@@ -1227,20 +1263,26 @@ func (r *Raft) HandleAppendEntries(ctx context.Context, req *AppendEntriesReques
 // HandleInstallSnapshot processes inbound InstallSnapshot RPCs from leaders (Section 7).
 func (r *Raft) HandleInstallSnapshot(ctx context.Context, req *InstallSnapshotRequest) (*InstallSnapshotResponse, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	if req.LeaderID != "" {
 		r.peerLastContact[req.LeaderID] = time.Now()
 	}
 
 	if r.storageErr != nil {
-		return nil, fmt.Errorf("%w: %w", ErrStorageHalted, r.storageErr)
+		err := r.storageErr
+		r.mu.Unlock()
+		return nil, fmt.Errorf("%w: %w", ErrStorageHalted, err)
 	}
 
 	// 1. Reply immediately if req.Term < currentTerm
 	if req.Term < r.currentTerm {
+		term := r.currentTerm
+		r.mu.Unlock()
 		return &InstallSnapshotResponse{
-			Term: r.currentTerm,
+			Term:           term,
+			Success:        false,
+			AcceptedOffset: 0,
+			Error:          "term outdated",
 		}, nil
 	}
 
@@ -1248,8 +1290,13 @@ func (r *Raft) HandleInstallSnapshot(ctx context.Context, req *InstallSnapshotRe
 	if req.Term > r.currentTerm {
 		if err := r.stepDownLocked(req.Term); err != nil {
 			r.storageErr = err
+			term := r.currentTerm
+			r.mu.Unlock()
 			return &InstallSnapshotResponse{
-				Term: r.currentTerm,
+				Term:           term,
+				Success:        false,
+				AcceptedOffset: 0,
+				Error:          err.Error(),
 			}, fmt.Errorf("step down to term %d: %w", req.Term, err)
 		}
 	} else if r.role == Candidate {
@@ -1264,171 +1311,303 @@ func (r *Raft) HandleInstallSnapshot(ctx context.Context, req *InstallSnapshotRe
 	// Valid heartbeat recognized: reset election timer
 	r.lastHeartbeat = time.Now()
 
-	// If snapshot is already behind our applied state, reply success without re-installing
+	// 3. If snapshot is already behind our applied state, reply success without re-installing
 	if req.LastIncludedIndex <= r.lastApplied {
+		term := r.currentTerm
+		acceptedOffset := req.Offset + int64(len(req.Data))
+		r.mu.Unlock()
 		return &InstallSnapshotResponse{
-			Term: r.currentTerm,
+			Term:           term,
+			Success:        true,
+			AcceptedOffset: acceptedOffset,
 		}, nil
 	}
 
-	// Chunk assembly
+	// 4. Size limits check
+	if req.TotalSize > MaxSnapshotSizeBytes || int64(len(req.Data)) > MaxSnapshotChunkBytes {
+		term := r.currentTerm
+		r.mu.Unlock()
+		return &InstallSnapshotResponse{
+			Term:           term,
+			Success:        false,
+			AcceptedOffset: 0,
+			Error:          fmt.Sprintf("snapshot size limit exceeded: total=%d (max %d), chunk=%d (max %d)", req.TotalSize, MaxSnapshotSizeBytes, len(req.Data), MaxSnapshotChunkBytes),
+		}, nil
+	}
+
+	// 5. Chunk assembly & session validation
 	if req.Offset == 0 {
 		r.snapshotAssembly = &snapshotAssembly{
+			snapshotID:        req.SnapshotID,
+			leaderID:          req.LeaderID,
 			lastIncludedIndex: req.LastIncludedIndex,
 			lastIncludedTerm:  req.LastIncludedTerm,
-			data:              make([]byte, 0, len(req.Data)),
+			totalSize:         req.TotalSize,
+			checksum:          req.Checksum,
+			expectedOffset:    0,
+			data:              make([]byte, 0, req.TotalSize),
+			lastActivity:      time.Now(),
 		}
 	}
 
-	if r.snapshotAssembly == nil || r.snapshotAssembly.lastIncludedIndex != req.LastIncludedIndex {
+	if r.snapshotAssembly == nil || r.snapshotAssembly.snapshotID != req.SnapshotID || r.snapshotAssembly.leaderID != req.LeaderID || r.snapshotAssembly.lastIncludedIndex != req.LastIncludedIndex {
+		term := r.currentTerm
+		r.mu.Unlock()
 		return &InstallSnapshotResponse{
-			Term: r.currentTerm,
+			Term:           term,
+			Success:        false,
+			AcceptedOffset: 0,
+			Error:          "snapshot session mismatch or missing assembly",
+		}, nil
+	}
+
+	if req.Offset != r.snapshotAssembly.expectedOffset {
+		term := r.currentTerm
+		expected := r.snapshotAssembly.expectedOffset
+		r.mu.Unlock()
+		return &InstallSnapshotResponse{
+			Term:           term,
+			Success:        false,
+			AcceptedOffset: expected,
+			Error:          fmt.Sprintf("chunk offset mismatch: expected %d, got %d", expected, req.Offset),
 		}, nil
 	}
 
 	r.snapshotAssembly.data = append(r.snapshotAssembly.data, req.Data...)
-	r.snapshotAssembly.lastOffset += int64(len(req.Data))
+	r.snapshotAssembly.expectedOffset += int64(len(req.Data))
+	r.snapshotAssembly.lastActivity = time.Now()
 
 	if !req.Done {
+		term := r.currentTerm
+		acceptedOffset := r.snapshotAssembly.expectedOffset
+		r.mu.Unlock()
 		return &InstallSnapshotResponse{
-			Term: r.currentTerm,
+			Term:           term,
+			Success:        true,
+			AcceptedOffset: acceptedOffset,
 		}, nil
 	}
 
 	// Full snapshot data assembled
 	fullData := r.snapshotAssembly.data
+	expectedChecksum := r.snapshotAssembly.checksum
+	lastIncludedIndex := r.snapshotAssembly.lastIncludedIndex
+	lastIncludedTerm := r.snapshotAssembly.lastIncludedTerm
+	finalOffset := r.snapshotAssembly.expectedOffset
+	installTerm := r.currentTerm
 	r.snapshotAssembly = nil
+
+	// Verify checksum before proceeding to disk operations
+	computedChecksum := ComputeSnapshotChecksum(fullData)
+	if expectedChecksum != 0 && computedChecksum != expectedChecksum {
+		r.mu.Unlock()
+		return &InstallSnapshotResponse{
+			Term:           installTerm,
+			Success:        false,
+			AcceptedOffset: 0,
+			Error:          fmt.Sprintf("snapshot checksum mismatch: computed %d, expected %d", computedChecksum, expectedChecksum),
+		}, nil
+	}
+
+	// Release r.mu during slow disk persistence, compaction, and state-machine restore
+	r.mu.Unlock()
+
+	r.snapshotMu.Lock()
+	defer r.snapshotMu.Unlock()
 
 	meta := SnapshotMetadata{
 		Version:           SnapshotCurrentVersion,
 		GroupID:           r.groupID,
-		LastIncludedIndex: req.LastIncludedIndex,
-		LastIncludedTerm:  req.LastIncludedTerm,
+		LastIncludedIndex: lastIncludedIndex,
+		LastIncludedTerm:  lastIncludedTerm,
 		CreatedAt:         time.Now(),
 		Size:              int64(len(fullData)),
-		Checksum:          ComputeSnapshotChecksum(fullData),
+		Checksum:          computedChecksum,
 	}
 
-	// 1. Durably persist snapshot
+	// 1. Durably persist snapshot to disk
 	if err := r.storage.SaveSnapshot(meta, fullData); err != nil {
+		r.mu.Lock()
 		r.storageErr = fmt.Errorf("install snapshot save: %w", err)
-		return nil, r.storageErr
+		r.mu.Unlock()
+		return nil, fmt.Errorf("install snapshot save: %w", err)
 	}
 
 	// 2. Discard/compact Raft log
-	if err := r.storage.CompactLog(req.LastIncludedIndex, req.LastIncludedTerm); err != nil {
+	if err := r.storage.CompactLog(lastIncludedIndex, lastIncludedTerm); err != nil {
+		r.mu.Lock()
 		r.storageErr = fmt.Errorf("install snapshot compact log: %w", err)
-		return nil, r.storageErr
+		r.mu.Unlock()
+		return nil, fmt.Errorf("install snapshot compact log: %w", err)
 	}
 
 	// 3. Reset state machine
 	if r.snapshotRestoreCallback != nil {
 		if err := r.snapshotRestoreCallback(meta, fullData); err != nil {
+			r.mu.Lock()
 			r.applyErr = fmt.Errorf("install snapshot restore state machine: %w", err)
-			return nil, r.applyErr
+			r.applyCond.Broadcast()
+			r.mu.Unlock()
+			return nil, fmt.Errorf("install snapshot restore state machine: %w", err)
 		}
 	}
 
-	// 4. Advance commitIndex and lastApplied
-	if req.LastIncludedIndex > r.commitIndex {
-		r.commitIndex = req.LastIncludedIndex
+	// 4. Re-acquire r.mu and finalize indices
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.closed {
+		return nil, ErrStopped
 	}
-	if req.LastIncludedIndex > r.lastApplied {
-		r.lastApplied = req.LastIncludedIndex
+
+	if lastIncludedIndex > r.commitIndex {
+		r.commitIndex = lastIncludedIndex
+	}
+	if lastIncludedIndex > r.lastApplied {
+		r.lastApplied = lastIncludedIndex
 	}
 	r.applyCond.Broadcast()
 
 	return &InstallSnapshotResponse{
-		Term: r.currentTerm,
+		Term:           r.currentTerm,
+		Success:        true,
+		AcceptedOffset: finalOffset,
 	}, nil
 }
 
 // CreateSnapshot creates and persists a snapshot with provided data up to appliedIndex,
 // compacting obsolete Raft log entries.
 func (r *Raft) CreateSnapshot(appliedIndex uint64, data []byte) (*SnapshotMetadata, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.snapshotMu.Lock()
+	defer r.snapshotMu.Unlock()
 
+	r.mu.Lock()
 	if r.closed {
+		r.mu.Unlock()
 		return nil, ErrStopped
 	}
 	if r.storageErr != nil {
-		return nil, fmt.Errorf("%w: %w", ErrStorageHalted, r.storageErr)
+		err := r.storageErr
+		r.mu.Unlock()
+		return nil, fmt.Errorf("%w: %w", ErrStorageHalted, err)
 	}
 
 	firstIndex := r.storage.FirstIndex()
 	if appliedIndex <= firstIndex {
+		r.mu.Unlock()
 		return nil, fmt.Errorf("%w: snapshot index %d <= first log index %d", ErrSnapshotBehind, appliedIndex, firstIndex)
 	}
 
 	entry, ok := r.storage.GetEntry(appliedIndex)
 	if !ok {
+		r.mu.Unlock()
 		return nil, fmt.Errorf("raft: entry at applied index %d not found", appliedIndex)
 	}
+	lastTerm := entry.Term
+	r.mu.Unlock()
 
 	meta := SnapshotMetadata{
 		Version:           SnapshotCurrentVersion,
 		GroupID:           r.groupID,
 		LastIncludedIndex: appliedIndex,
-		LastIncludedTerm:  entry.Term,
+		LastIncludedTerm:  lastTerm,
 		CreatedAt:         time.Now(),
 		Size:              int64(len(data)),
 		Checksum:          ComputeSnapshotChecksum(data),
 	}
 
 	if err := r.storage.SaveSnapshot(meta, data); err != nil {
+		r.mu.Lock()
 		r.storageErr = err
+		r.mu.Unlock()
 		return nil, fmt.Errorf("save snapshot: %w", err)
 	}
 
-	if err := r.storage.CompactLog(appliedIndex, entry.Term); err != nil {
+	if err := r.storage.CompactLog(appliedIndex, lastTerm); err != nil {
+		r.mu.Lock()
 		r.storageErr = err
+		r.mu.Unlock()
 		return nil, fmt.Errorf("compact log: %w", err)
 	}
 
 	return &meta, nil
 }
 
-// TakeSnapshot captures a snapshot of the current state machine up to lastApplied
-// using the registered SnapshotCallback and compacts the Raft log.
+// TakeSnapshot captures a snapshot of the state machine using the registered SnapshotCallback
+// and compacts the Raft log up to the exact index returned by the state machine.
 func (r *Raft) TakeSnapshot() (*SnapshotMetadata, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.snapshotMu.Lock()
+	defer r.snapshotMu.Unlock()
 
+	r.mu.Lock()
 	if r.closed {
+		r.mu.Unlock()
 		return nil, ErrStopped
 	}
 	if r.storageErr != nil {
-		return nil, fmt.Errorf("%w: %w", ErrStorageHalted, r.storageErr)
+		err := r.storageErr
+		r.mu.Unlock()
+		return nil, fmt.Errorf("%w: %w", ErrStorageHalted, err)
 	}
 	if r.snapshotCallback == nil {
+		r.mu.Unlock()
 		return nil, errors.New("raft: snapshot callback not configured")
 	}
+	cb := r.snapshotCallback
+	r.mu.Unlock()
 
-	lastApplied := r.lastApplied
-	firstIndex := r.storage.FirstIndex()
-	if lastApplied <= firstIndex {
-		if snap, _ := r.storage.GetSnapshot(); snap != nil {
-			return &snap.Metadata, nil
-		}
-		return nil, errors.New("raft: nothing to snapshot; no entries applied")
-	}
-
-	entry, ok := r.storage.GetEntry(lastApplied)
-	if !ok {
-		return nil, fmt.Errorf("raft: entry at last applied index %d not found", lastApplied)
-	}
-	lastAppliedTerm := entry.Term
-
-	data, err := r.snapshotCallback()
+	// Capture engine snapshot and its exact applied index outside r.mu
+	appliedIndex, data, err := cb()
 	if err != nil {
 		return nil, fmt.Errorf("raft: snapshot callback: %w", err)
 	}
 
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil, ErrStopped
+	}
+	if r.storageErr != nil {
+		err := r.storageErr
+		r.mu.Unlock()
+		return nil, fmt.Errorf("%w: %w", ErrStorageHalted, err)
+	}
+
+	firstIndex := r.storage.FirstIndex()
+	if appliedIndex <= firstIndex {
+		if snap, _ := r.storage.GetSnapshot(); snap != nil {
+			r.mu.Unlock()
+			return &snap.Metadata, nil
+		}
+		r.mu.Unlock()
+		return nil, fmt.Errorf("%w: state machine applied index %d <= first log index %d",
+			ErrSnapshotBehind, appliedIndex, firstIndex)
+	}
+
+	// Raft invariant: state machine cannot represent an index higher than commitIndex
+	if appliedIndex > r.commitIndex {
+		r.mu.Unlock()
+		return nil, fmt.Errorf("raft: state machine applied index %d exceeds commit index %d",
+			appliedIndex, r.commitIndex)
+	}
+
+	// Advance lastApplied to reflect the state machine's progress
+	if appliedIndex > r.lastApplied {
+		r.lastApplied = appliedIndex
+	}
+
+	entry, ok := r.storage.GetEntry(appliedIndex)
+	if !ok {
+		r.mu.Unlock()
+		return nil, fmt.Errorf("raft: entry at applied index %d not found in storage", appliedIndex)
+	}
+	lastAppliedTerm := entry.Term
+	r.mu.Unlock()
+
 	meta := SnapshotMetadata{
 		Version:           SnapshotCurrentVersion,
 		GroupID:           r.groupID,
-		LastIncludedIndex: lastApplied,
+		LastIncludedIndex: appliedIndex,
 		LastIncludedTerm:  lastAppliedTerm,
 		CreatedAt:         time.Now(),
 		Size:              int64(len(data)),
@@ -1436,12 +1615,16 @@ func (r *Raft) TakeSnapshot() (*SnapshotMetadata, error) {
 	}
 
 	if err := r.storage.SaveSnapshot(meta, data); err != nil {
+		r.mu.Lock()
 		r.storageErr = err
+		r.mu.Unlock()
 		return nil, fmt.Errorf("save snapshot: %w", err)
 	}
 
-	if err := r.storage.CompactLog(lastApplied, lastAppliedTerm); err != nil {
+	if err := r.storage.CompactLog(appliedIndex, lastAppliedTerm); err != nil {
+		r.mu.Lock()
 		r.storageErr = err
+		r.mu.Unlock()
 		return nil, fmt.Errorf("compact log: %w", err)
 	}
 
