@@ -32,6 +32,10 @@ type Config struct {
 
 	// SnapshotRestoreCallback restores state machine state when an InstallSnapshot RPC is received.
 	SnapshotRestoreCallback func(SnapshotMetadata, []byte) error
+
+	// MaxBatchEntries caps the maximum number of LogEntries replicated in a single AppendEntries RPC.
+	// Defaults to 1000 entries.
+	MaxBatchEntries uint64
 }
 
 type snapshotAssembly struct {
@@ -92,6 +96,7 @@ type Raft struct {
 	electionTimeoutMax time.Duration
 	electionTimeout    time.Duration
 	lastHeartbeat      time.Time
+	maxBatchEntries    uint64
 
 	// Coordination & lifecycle
 	commitCallback          func(LogEntry) error
@@ -125,6 +130,9 @@ func New(cfg Config) (*Raft, error) {
 	if cfg.ElectionTimeoutMax == 0 {
 		cfg.ElectionTimeoutMax = 300 * time.Millisecond
 	}
+	if cfg.MaxBatchEntries == 0 {
+		cfg.MaxBatchEntries = 1000
+	}
 
 	term, votedFor, err := cfg.Storage.GetState()
 	if err != nil {
@@ -149,6 +157,7 @@ func New(cfg Config) (*Raft, error) {
 		heartbeatInterval:  cfg.HeartbeatInterval,
 		electionTimeoutMin: cfg.ElectionTimeoutMin,
 		electionTimeoutMax: cfg.ElectionTimeoutMax,
+		maxBatchEntries:    cfg.MaxBatchEntries,
 		commitCallback:          cfg.CommitCallback,
 		leaderCallback:          cfg.LeaderCallback,
 		snapshotCallback:        cfg.SnapshotCallback,
@@ -269,6 +278,38 @@ func (r *Raft) VotedFor() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.votedFor
+}
+
+// SetMaxBatchEntries dynamically updates the maximum log entries replicated per AppendEntries RPC.
+func (r *Raft) SetMaxBatchEntries(limit uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if limit > 0 {
+		r.maxBatchEntries = limit
+	}
+}
+
+// ReplicationLag returns a map of peerID -> number of entries behind the leader's lastLogIndex.
+// If the node is not the leader, it returns an empty map.
+func (r *Raft) ReplicationLag() map[string]uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	lags := make(map[string]uint64)
+	if r.role != Leader {
+		return lags
+	}
+
+	lastIdx, _ := r.storage.LastLogInfo()
+	for peerID := range r.peers {
+		match := r.matchIndex[peerID]
+		if lastIdx > match {
+			lags[peerID] = lastIdx - match
+		} else {
+			lags[peerID] = 0
+		}
+	}
+	return lags
 }
 
 // CommitIndex returns the highest log index known to be committed.
@@ -789,6 +830,9 @@ func (r *Raft) broadcastAppendEntriesLocked(isHeartbeat bool) {
 		var entries []LogEntry
 		if !isHeartbeat || nextIdx <= lastLogIndex {
 			entries = r.storage.GetEntries(nextIdx)
+			if r.maxBatchEntries > 0 && uint64(len(entries)) > r.maxBatchEntries {
+				entries = entries[:r.maxBatchEntries]
+			}
 		}
 
 		req := &AppendEntriesRequest{

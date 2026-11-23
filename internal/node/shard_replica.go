@@ -140,6 +140,11 @@ func (s *ShardReplica) Engine() *storage.Engine {
 	return s.engine
 }
 
+// ReplicationLag returns follower replication lag metrics if this replica is the leader.
+func (s *ShardReplica) ReplicationLag() map[string]uint64 {
+	return s.raft.ReplicationLag()
+}
+
 // Start begins consensus activity for this shard replica.
 func (s *ShardReplica) Start() error {
 	return s.raft.Start()
