@@ -13,6 +13,8 @@ type StorageEngine interface {
 	Set(key, value string) error
 	Get(key string) (string, bool)
 	Delete(key string) error
+	Scan(startKey, endKey string, limit int) ([]storage.KVPair, error)
+	PrefixScan(prefix string, limit int) ([]storage.KVPair, error)
 	ApplyCommitted(cmd storage.CommittedCommand) error
 	Close() error
 	Health() error

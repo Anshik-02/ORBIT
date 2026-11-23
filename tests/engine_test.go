@@ -377,6 +377,8 @@ func (m *mockBlockingEngine) Set(k, v string) error {
 }
 func (m *mockBlockingEngine) Get(k string) (string, bool)                       { return "", false }
 func (m *mockBlockingEngine) Delete(k string) error                             { return nil }
+func (m *mockBlockingEngine) Scan(start, end string, limit int) ([]storage.KVPair, error) { return nil, nil }
+func (m *mockBlockingEngine) PrefixScan(prefix string, limit int) ([]storage.KVPair, error) { return nil, nil }
 func (m *mockBlockingEngine) ApplyCommitted(cmd storage.CommittedCommand) error { return nil }
 func (m *mockBlockingEngine) Close() error                                      { return nil }
 func (m *mockBlockingEngine) Health() error                                     { return nil }
@@ -392,6 +394,8 @@ type mockFailingEngine struct {
 func (m *mockFailingEngine) Set(k, v string) error                             { return nil }
 func (m *mockFailingEngine) Get(k string) (string, bool)                       { return "", false }
 func (m *mockFailingEngine) Delete(k string) error                             { return nil }
+func (m *mockFailingEngine) Scan(start, end string, limit int) ([]storage.KVPair, error) { return nil, nil }
+func (m *mockFailingEngine) PrefixScan(prefix string, limit int) ([]storage.KVPair, error) { return nil, nil }
 func (m *mockFailingEngine) ApplyCommitted(cmd storage.CommittedCommand) error { return nil }
 func (m *mockFailingEngine) Close() error                                      { return m.closeErr }
 func (m *mockFailingEngine) Health() error                                     { return nil }

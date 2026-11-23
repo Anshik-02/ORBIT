@@ -36,6 +36,14 @@ func (m *mockShardInstance) ID() sharding.ShardID    { return m.shardID }
 func (m *mockShardInstance) GroupID() raft.GroupID   { return m.groupID }
 func (m *mockShardInstance) Raft() *raft.Raft        { return m.raft }
 func (m *mockShardInstance) DB() *database.Database  { return m.db }
+func (m *mockShardInstance) Engine() *storage.Engine {
+	if m.db != nil {
+		if eng, ok := m.db.Engine().(*storage.Engine); ok {
+			return eng
+		}
+	}
+	return nil
+}
 
 func setupTestKVHandler(t *testing.T) (*api.KVHandler, *sharding.ClusterMetadata, *mockShardProvider) {
 	t.Helper()

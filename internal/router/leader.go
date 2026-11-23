@@ -8,6 +8,7 @@ import (
 	"orbit/internal/database"
 	"orbit/internal/raft"
 	"orbit/internal/sharding"
+	"orbit/internal/storage"
 )
 
 // ShardInstance abstracts a hosted shard consensus replica with its DB and Raft engine.
@@ -16,6 +17,7 @@ type ShardInstance interface {
 	GroupID() raft.GroupID
 	Raft() *raft.Raft
 	DB() *database.Database
+	Engine() *storage.Engine
 }
 
 var (

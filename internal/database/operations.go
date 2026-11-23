@@ -101,3 +101,30 @@ func (db *Database) RestoreSnapshotBytes(meta storage.SnapshotMetadata, data []b
 	}
 	return db.engine.RestoreSnapshotBytes(meta, data)
 }
+
+// Scan returns key-value entries in [startKey, endKey) up to limit entries.
+func (db *Database) Scan(startKey, endKey string, limit int) ([]storage.KVPair, error) {
+	db.closeMu.RLock()
+	defer db.closeMu.RUnlock()
+
+	if db.closed {
+		return nil, ErrClosed
+	}
+	return db.engine.Scan(startKey, endKey, limit)
+}
+
+// PrefixScan returns all key-value entries matching prefix up to limit entries.
+func (db *Database) PrefixScan(prefix string, limit int) ([]storage.KVPair, error) {
+	db.closeMu.RLock()
+	defer db.closeMu.RUnlock()
+
+	if db.closed {
+		return nil, ErrClosed
+	}
+	return db.engine.PrefixScan(prefix, limit)
+}
+
+// Engine returns the underlying storage engine.
+func (db *Database) Engine() StorageEngine {
+	return db.engine
+}

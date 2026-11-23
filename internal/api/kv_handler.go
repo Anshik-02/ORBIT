@@ -11,8 +11,10 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"orbit/internal/database"
@@ -20,6 +22,7 @@ import (
 	"orbit/internal/raft"
 	"orbit/internal/router"
 	"orbit/internal/sharding"
+	"orbit/internal/storage"
 )
 
 const maxRequestBodySize = 1 << 20 // 1 MB
@@ -29,10 +32,105 @@ type ShardProvider interface {
 	ShardInstances() map[sharding.ShardID]router.ShardInstance
 }
 
-// ErrorResponseWithReq represents a standardized JSON error response including request ID.
+// ErrorResponseWithReq represents a standardized JSON error response including request ID and error code.
 type ErrorResponseWithReq struct {
+	Code      string `json:"code,omitempty"`
 	Error     string `json:"error"`
 	RequestID string `json:"request_id,omitempty"`
+}
+
+// IdempotencyCache caches completed mutation responses by idempotency key.
+type idempotencyRecord struct {
+	statusCode int
+	body       []byte
+	timestamp  time.Time
+}
+
+type IdempotencyCache struct {
+	mu      sync.Mutex
+	entries map[string]idempotencyRecord
+}
+
+func NewIdempotencyCache() *IdempotencyCache {
+	return &IdempotencyCache{
+		entries: make(map[string]idempotencyRecord),
+	}
+}
+
+func (c *IdempotencyCache) Get(key string) (idempotencyRecord, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	rec, ok := c.entries[key]
+	if !ok {
+		return idempotencyRecord{}, false
+	}
+	if time.Since(rec.timestamp) > 10*time.Minute {
+		delete(c.entries, key)
+		return idempotencyRecord{}, false
+	}
+	return rec, true
+}
+
+func (c *IdempotencyCache) Set(key string, code int, body []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries[key] = idempotencyRecord{
+		statusCode: code,
+		body:       body,
+		timestamp:  time.Now(),
+	}
+}
+
+// BatchWriteOp describes a single mutation inside a batch request.
+type BatchWriteOp struct {
+	Operation string  `json:"operation"` // "SET" or "DELETE"
+	Key       string  `json:"key"`
+	Value     *string `json:"value,omitempty"`
+}
+
+// BatchWriteRequest is the JSON payload for POST /kv/batch write operations.
+type BatchWriteRequest struct {
+	Ops []BatchWriteOp `json:"ops"`
+}
+
+// BatchOpResult reports the per-key execution outcome of a batch operation.
+type BatchOpResult struct {
+	Key    string `json:"key"`
+	Status string `json:"status"` // "COMMITTED", "NOT_FOUND", "ERROR"
+	Error  string `json:"error,omitempty"`
+}
+
+// BatchWriteResponse is the JSON response for POST /kv/batch write operations.
+type BatchWriteResponse struct {
+	Results   []BatchOpResult `json:"results"`
+	RequestID string          `json:"request_id"`
+}
+
+// BatchReadRequest is the JSON payload for batch read requests.
+type BatchReadRequest struct {
+	Keys []string `json:"keys"`
+}
+
+// BatchReadResult reports the lookup outcome for a single key in a batch read.
+type BatchReadResult struct {
+	Key   string `json:"key"`
+	Value string `json:"value,omitempty"`
+	Found bool   `json:"found"`
+	Error string `json:"error,omitempty"`
+}
+
+// BatchReadResponse is the JSON response for batch read requests.
+type BatchReadResponse struct {
+	Results   []BatchReadResult `json:"results"`
+	RequestID string            `json:"request_id"`
+}
+
+// ScanResponse is the paginated response for /kv/scan and /kv/prefix queries.
+type ScanResponse struct {
+	Items      []storage.KVPair `json:"items"`
+	HasMore    bool             `json:"has_more"`
+	NextCursor string           `json:"next_cursor,omitempty"`
+	RequestID  string           `json:"request_id"`
 }
 
 // SetKVRequest is the JSON payload for PUT /kv/:key.
@@ -100,6 +198,7 @@ type KVHandler struct {
 	eventHub    *observability.EventHub
 	wsHub       *observability.WebSocketHub
 	eventBus    *observability.DistributedEventBus
+	idempotency *IdempotencyCache
 }
 
 // NewKVHandler constructs a new KVHandler.
@@ -122,6 +221,7 @@ func NewKVHandler(
 		monitor:     monitor,
 		eventHub:    eventHub,
 		wsHub:       wsHub,
+		idempotency: NewIdempotencyCache(),
 	}
 }
 
@@ -172,19 +272,55 @@ func (h *KVHandler) SetTimeout(d time.Duration) {
 // RegisterKVRoutes registers the shard-aware KV API routes on the provided mux.
 func RegisterKVRoutes(mux *http.ServeMux, h *KVHandler) {
 	mux.HandleFunc("/kv/", h.handleKV)
+	mux.HandleFunc("/kv/batch", func(w http.ResponseWriter, r *http.Request) {
+		h.handleBatch(w, r, getOrGenerateReqID(r))
+	})
+	mux.HandleFunc("/kv/scan", func(w http.ResponseWriter, r *http.Request) {
+		h.handleScan(w, r, getOrGenerateReqID(r))
+	})
+	mux.HandleFunc("/kv/prefix", func(w http.ResponseWriter, r *http.Request) {
+		h.handlePrefixScan(w, r, getOrGenerateReqID(r))
+	})
 	mux.HandleFunc("/cluster/status", h.handleClusterStatus)
 	mux.HandleFunc("/cluster/health", h.handleClusterHealth)
 	mux.HandleFunc("/cluster/shards", h.handleClusterShards)
 	mux.HandleFunc("/cluster/nodes", h.handleClusterNodes)
 
+	// Versioned v1 API routes (/api/v1/...)
+	mux.HandleFunc("/api/v1/kv/", h.handleKV)
+	mux.HandleFunc("/api/v1/kv/batch", func(w http.ResponseWriter, r *http.Request) {
+		h.handleBatch(w, r, getOrGenerateReqID(r))
+	})
+	mux.HandleFunc("/api/v1/kv/scan", func(w http.ResponseWriter, r *http.Request) {
+		h.handleScan(w, r, getOrGenerateReqID(r))
+	})
+	mux.HandleFunc("/api/v1/kv/prefix", func(w http.ResponseWriter, r *http.Request) {
+		h.handlePrefixScan(w, r, getOrGenerateReqID(r))
+	})
+	mux.HandleFunc("/api/v1/cluster/status", h.handleClusterStatus)
+	mux.HandleFunc("/api/v1/cluster/health", h.handleClusterHealth)
+	mux.HandleFunc("/api/v1/cluster/shards", h.handleClusterShards)
+	mux.HandleFunc("/api/v1/cluster/nodes", h.handleClusterNodes)
+
 	if h.wsHub != nil {
 		h.wsHub.RegisterRoutes(mux, "/ws/events")
 		h.wsHub.RegisterRoutes(mux, "/cluster/events")
+		h.wsHub.RegisterRoutes(mux, "/api/v1/ws/events")
 	}
 
 	if h.eventBus != nil {
 		mux.HandleFunc("/cluster/events/relay", h.eventBus.HandleRelayHTTP)
 	}
+}
+
+func getOrGenerateReqID(r *http.Request) string {
+	reqID := r.Header.Get("X-Request-ID")
+	if reqID == "" {
+		b := make([]byte, 8)
+		_, _ = rand.Read(b)
+		reqID = hex.EncodeToString(b)
+	}
+	return reqID
 }
 
 func writeJSONErrorWithReq(w http.ResponseWriter, status int, msg, reqID string) {
@@ -194,6 +330,7 @@ func writeJSONErrorWithReq(w http.ResponseWriter, status int, msg, reqID string)
 	}
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(ErrorResponseWithReq{
+		Code:      http.StatusText(status),
 		Error:     msg,
 		RequestID: reqID,
 	})
@@ -204,19 +341,32 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 }
 
 func (h *KVHandler) handleKV(w http.ResponseWriter, r *http.Request) {
-	reqID := r.Header.Get("X-Request-ID")
-	if reqID == "" {
-		b := make([]byte, 8)
-		_, _ = rand.Read(b)
-		reqID = hex.EncodeToString(b)
-	}
+	reqID := getOrGenerateReqID(r)
 	w.Header().Set("X-Request-ID", reqID)
 
-	rawKey := strings.TrimPrefix(r.URL.Path, "/kv/")
+	rawKey := r.URL.Path
+	if strings.HasPrefix(rawKey, "/api/v1/kv/") {
+		rawKey = strings.TrimPrefix(rawKey, "/api/v1/kv/")
+	} else if strings.HasPrefix(rawKey, "/kv/") {
+		rawKey = strings.TrimPrefix(rawKey, "/kv/")
+	}
 	rawKey = strings.TrimPrefix(rawKey, "/")
 	key, err := url.PathUnescape(rawKey)
 	if err != nil || strings.Contains(key, "\x00") {
 		writeJSONErrorWithReq(w, http.StatusBadRequest, "key is invalid", reqID)
+		return
+	}
+
+	if key == "batch" {
+		h.handleBatch(w, r, reqID)
+		return
+	}
+	if key == "scan" {
+		h.handleScan(w, r, reqID)
+		return
+	}
+	if key == "prefix" {
+		h.handlePrefixScan(w, r, reqID)
 		return
 	}
 	if key == "" {
@@ -253,6 +403,21 @@ func (h *KVHandler) handleKV(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *KVHandler) handlePut(w http.ResponseWriter, r *http.Request, key, reqID string, hops int) {
+	idempotencyKey := r.Header.Get("X-Idempotency-Key")
+	if idempotencyKey == "" {
+		idempotencyKey = r.Header.Get("Idempotency-Key")
+	}
+	if idempotencyKey != "" {
+		if rec, found := h.idempotency.Get(idempotencyKey); found {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Request-ID", reqID)
+			w.Header().Set("X-Idempotent-Replay", "true")
+			w.WriteHeader(rec.statusCode)
+			_, _ = w.Write(rec.body)
+			return
+		}
+	}
+
 	// 1. Content-Type validation
 	ct := r.Header.Get("Content-Type")
 	if ct != "" {
@@ -353,12 +518,18 @@ func (h *KVHandler) handlePut(w http.ResponseWriter, r *http.Request, key, reqID
 			},
 		))
 
-		writeJSON(w, http.StatusOK, SetKVResponse{
+		respObj := SetKVResponse{
 			Key:     key,
 			Value:   val,
 			ShardID: route.ShardID,
 			Status:  "ok",
-		})
+		}
+		if idempotencyKey != "" {
+			if b, mErr := json.Marshal(respObj); mErr == nil {
+				h.idempotency.Set(idempotencyKey, http.StatusOK, b)
+			}
+		}
+		writeJSON(w, http.StatusOK, respObj)
 		return
 	}
 
@@ -469,6 +640,21 @@ func (h *KVHandler) handleGet(w http.ResponseWriter, r *http.Request, key, reqID
 }
 
 func (h *KVHandler) handleDelete(w http.ResponseWriter, r *http.Request, key, reqID string, hops int) {
+	idempotencyKey := r.Header.Get("X-Idempotency-Key")
+	if idempotencyKey == "" {
+		idempotencyKey = r.Header.Get("Idempotency-Key")
+	}
+	if idempotencyKey != "" {
+		if rec, found := h.idempotency.Get(idempotencyKey); found {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Request-ID", reqID)
+			w.Header().Set("X-Idempotent-Replay", "true")
+			w.WriteHeader(rec.statusCode)
+			_, _ = w.Write(rec.body)
+			return
+		}
+	}
+
 	route, err := h.forwarder.Route(key, h.provider.ShardInstances())
 	if err != nil {
 		writeJSONErrorWithReq(w, http.StatusInternalServerError, fmt.Sprintf("failed to route key: %v", err), reqID)
@@ -519,11 +705,17 @@ func (h *KVHandler) handleDelete(w http.ResponseWriter, r *http.Request, key, re
 			},
 		))
 
-		writeJSON(w, http.StatusOK, DeleteKVResponse{
+		respObj := DeleteKVResponse{
 			Key:     key,
 			Deleted: true,
 			ShardID: route.ShardID,
-		})
+		}
+		if idempotencyKey != "" {
+			if b, mErr := json.Marshal(respObj); mErr == nil {
+				h.idempotency.Set(idempotencyKey, http.StatusOK, b)
+			}
+		}
+		writeJSON(w, http.StatusOK, respObj)
 		return
 	}
 
@@ -687,4 +879,339 @@ func (h *KVHandler) pipeResponse(w http.ResponseWriter, resp *http.Response) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+func (h *KVHandler) handleBatch(w http.ResponseWriter, r *http.Request, reqID string) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeJSONErrorWithReq(w, http.StatusMethodNotAllowed, "method not allowed", reqID)
+		return
+	}
+
+	ct := r.Header.Get("Content-Type")
+	if ct != "" {
+		mediaType, _, _ := mime.ParseMediaType(ct)
+		if mediaType != "application/json" {
+			writeJSONErrorWithReq(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json", reqID)
+			return
+		}
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodySize)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSONErrorWithReq(w, http.StatusBadRequest, "failed to read request body", reqID)
+		return
+	}
+	defer r.Body.Close()
+
+	// 1. Try BatchWriteRequest
+	var writeReq BatchWriteRequest
+	if err := json.Unmarshal(body, &writeReq); err == nil && len(writeReq.Ops) > 0 {
+		var results []BatchOpResult
+		for _, op := range writeReq.Ops {
+			if strings.TrimSpace(op.Key) == "" {
+				results = append(results, BatchOpResult{
+					Key:    op.Key,
+					Status: "ERROR",
+					Error:  "empty key not allowed",
+				})
+				continue
+			}
+
+			val := ""
+			if op.Value != nil {
+				val = *op.Value
+			}
+
+			opType := strings.ToUpper(op.Operation)
+			if opType != "SET" && opType != "DELETE" {
+				results = append(results, BatchOpResult{
+					Key:    op.Key,
+					Status: "ERROR",
+					Error:  fmt.Sprintf("unsupported operation %q", op.Operation),
+				})
+				continue
+			}
+
+			route, err := h.forwarder.Route(op.Key, h.provider.ShardInstances())
+			if err != nil {
+				results = append(results, BatchOpResult{
+					Key:    op.Key,
+					Status: "ERROR",
+					Error:  fmt.Sprintf("routing error: %v", err),
+				})
+				continue
+			}
+
+			if route.IsLocal && route.Replica != nil && route.Replica.Raft().Role() == raft.Leader {
+				ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
+				idx, _, err := route.Replica.Raft().Propose(opType, op.Key, val)
+				if err != nil {
+					cancel()
+					results = append(results, BatchOpResult{
+						Key:    op.Key,
+						Status: "ERROR",
+						Error:  err.Error(),
+					})
+					continue
+				}
+				if err := route.Replica.Raft().WaitForApply(ctx, idx); err != nil {
+					cancel()
+					results = append(results, BatchOpResult{
+						Key:    op.Key,
+						Status: "ERROR",
+						Error:  err.Error(),
+					})
+					continue
+				}
+				cancel()
+				results = append(results, BatchOpResult{
+					Key:    op.Key,
+					Status: "COMMITTED",
+				})
+			} else {
+				subBody, _ := json.Marshal(SetKVRequest{Value: &val})
+				httpMethod := http.MethodPut
+				if opType == "DELETE" {
+					httpMethod = http.MethodDelete
+					subBody = nil
+				}
+				ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
+				fResp, fErr := h.forwardWithFailover(ctx, route, route.Candidates(h.localNodeID), httpMethod, "/kv/"+url.PathEscape(op.Key), subBody, 0, reqID)
+				cancel()
+				if fErr != nil {
+					results = append(results, BatchOpResult{
+						Key:    op.Key,
+						Status: "ERROR",
+						Error:  fErr.Error(),
+					})
+				} else {
+					_ = fResp.Body.Close()
+					if fResp.StatusCode >= 200 && fResp.StatusCode < 300 {
+						results = append(results, BatchOpResult{
+							Key:    op.Key,
+							Status: "COMMITTED",
+						})
+					} else {
+						results = append(results, BatchOpResult{
+							Key:    op.Key,
+							Status: "ERROR",
+							Error:  fmt.Sprintf("forward returned status %d", fResp.StatusCode),
+						})
+					}
+				}
+			}
+		}
+
+		writeJSON(w, http.StatusOK, BatchWriteResponse{
+			Results:   results,
+			RequestID: reqID,
+		})
+		return
+	}
+
+	// 2. Try BatchReadRequest
+	var readReq BatchReadRequest
+	if err := json.Unmarshal(body, &readReq); err == nil && len(readReq.Keys) > 0 {
+		var results []BatchReadResult
+		for _, k := range readReq.Keys {
+			if strings.TrimSpace(k) == "" {
+				results = append(results, BatchReadResult{
+					Key:   k,
+					Found: false,
+					Error: "empty key",
+				})
+				continue
+			}
+
+			route, err := h.forwarder.Route(k, h.provider.ShardInstances())
+			if err != nil {
+				results = append(results, BatchReadResult{
+					Key:   k,
+					Found: false,
+					Error: err.Error(),
+				})
+				continue
+			}
+
+			if route.IsLocal && route.Replica != nil && route.Replica.Raft().Role() == raft.Leader {
+				val, err := route.Replica.DB().Get(k)
+				if err != nil {
+					results = append(results, BatchReadResult{
+						Key:   k,
+						Found: false,
+					})
+				} else {
+					results = append(results, BatchReadResult{
+						Key:   k,
+						Value: val,
+						Found: true,
+					})
+				}
+			} else {
+				ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
+				fResp, fErr := h.forwardWithFailover(ctx, route, route.Candidates(h.localNodeID), http.MethodGet, "/kv/"+url.PathEscape(k), nil, 0, reqID)
+				cancel()
+				if fErr != nil || fResp.StatusCode != http.StatusOK {
+					if fResp != nil {
+						_ = fResp.Body.Close()
+					}
+					results = append(results, BatchReadResult{
+						Key:   k,
+						Found: false,
+					})
+				} else {
+					var getResp GetKVResponse
+					_ = json.NewDecoder(fResp.Body).Decode(&getResp)
+					_ = fResp.Body.Close()
+					results = append(results, BatchReadResult{
+						Key:   k,
+						Value: getResp.Value,
+						Found: true,
+					})
+				}
+			}
+		}
+
+		writeJSON(w, http.StatusOK, BatchReadResponse{
+			Results:   results,
+			RequestID: reqID,
+		})
+		return
+	}
+
+	writeJSONErrorWithReq(w, http.StatusBadRequest, "invalid batch payload: must contain 'ops' or 'keys'", reqID)
+}
+
+func (h *KVHandler) handleScan(w http.ResponseWriter, r *http.Request, reqID string) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		writeJSONErrorWithReq(w, http.StatusMethodNotAllowed, "method not allowed", reqID)
+		return
+	}
+
+	start := r.URL.Query().Get("start")
+	end := r.URL.Query().Get("end")
+	limit := 50
+	if lStr := r.URL.Query().Get("limit"); lStr != "" {
+		if l, err := strconv.Atoi(lStr); err == nil && l > 0 {
+			limit = l
+		}
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+
+	allPairs := make(map[string]string)
+	localInstances := h.provider.ShardInstances()
+
+	for sid := sharding.ShardID(0); sid < sharding.ShardID(h.metadata.ShardCount); sid++ {
+		inst, ok := localInstances[sid]
+		if ok && inst.DB() != nil {
+			pairs, err := inst.DB().Scan(start, end, limit+1)
+			if err == nil {
+				for _, p := range pairs {
+					allPairs[p.Key] = p.Value
+				}
+			}
+		}
+	}
+
+	sortedKeys := make([]string, 0, len(allPairs))
+	for k := range allPairs {
+		sortedKeys = append(sortedKeys, k)
+	}
+	sort.Strings(sortedKeys)
+
+	hasMore := false
+	nextCursor := ""
+	if len(sortedKeys) > limit {
+		hasMore = true
+		nextCursor = sortedKeys[limit]
+		sortedKeys = sortedKeys[:limit]
+	}
+
+	var items []storage.KVPair
+	for _, k := range sortedKeys {
+		items = append(items, storage.KVPair{
+			Key:   k,
+			Value: allPairs[k],
+		})
+	}
+
+	writeJSON(w, http.StatusOK, ScanResponse{
+		Items:      items,
+		HasMore:    hasMore,
+		NextCursor: nextCursor,
+		RequestID:  reqID,
+	})
+}
+
+func (h *KVHandler) handlePrefixScan(w http.ResponseWriter, r *http.Request, reqID string) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		writeJSONErrorWithReq(w, http.StatusMethodNotAllowed, "method not allowed", reqID)
+		return
+	}
+
+	prefix := r.URL.Query().Get("prefix")
+	if prefix == "" {
+		h.handleScan(w, r, reqID)
+		return
+	}
+
+	limit := 50
+	if lStr := r.URL.Query().Get("limit"); lStr != "" {
+		if l, err := strconv.Atoi(lStr); err == nil && l > 0 {
+			limit = l
+		}
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+
+	allPairs := make(map[string]string)
+	localInstances := h.provider.ShardInstances()
+
+	for sid := sharding.ShardID(0); sid < sharding.ShardID(h.metadata.ShardCount); sid++ {
+		inst, ok := localInstances[sid]
+		if ok && inst.DB() != nil {
+			pairs, err := inst.DB().PrefixScan(prefix, limit+1)
+			if err == nil {
+				for _, p := range pairs {
+					allPairs[p.Key] = p.Value
+				}
+			}
+		}
+	}
+
+	sortedKeys := make([]string, 0, len(allPairs))
+	for k := range allPairs {
+		sortedKeys = append(sortedKeys, k)
+	}
+	sort.Strings(sortedKeys)
+
+	hasMore := false
+	nextCursor := ""
+	if len(sortedKeys) > limit {
+		hasMore = true
+		nextCursor = sortedKeys[limit]
+		sortedKeys = sortedKeys[:limit]
+	}
+
+	var items []storage.KVPair
+	for _, k := range sortedKeys {
+		items = append(items, storage.KVPair{
+			Key:   k,
+			Value: allPairs[k],
+		})
+	}
+
+	writeJSON(w, http.StatusOK, ScanResponse{
+		Items:      items,
+		HasMore:    hasMore,
+		NextCursor: nextCursor,
+		RequestID:  reqID,
+	})
 }
