@@ -198,3 +198,26 @@ func TestRequestForwarder_PeerAddressNotFound(t *testing.T) {
 	}
 }
 
+func TestRouteResult_Candidates(t *testing.T) {
+	t.Parallel()
+
+	res := &router.RouteResult{
+		ShardID:           0,
+		GroupID:           "shard-0",
+		LeaderID:          "node-a",
+		CandidateReplicas: []string{"node-a", "node-b", "node-c"},
+	}
+
+	// From client/outside (no exclude)
+	cands := res.Candidates("")
+	if len(cands) != 3 || cands[0] != "node-a" {
+		t.Errorf("expected [node-a, node-b, node-c], got %+v", cands)
+	}
+
+	// Excluding node-a (node-a died or is self)
+	candsExcludeA := res.Candidates("node-a")
+	if len(candsExcludeA) != 2 || candsExcludeA[0] != "node-b" || candsExcludeA[1] != "node-c" {
+		t.Errorf("expected [node-b, node-c], got %+v", candsExcludeA)
+	}
+}
+

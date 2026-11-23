@@ -334,6 +334,10 @@ func (h *KVHandler) handlePut(w http.ResponseWriter, r *http.Request, key, reqID
 		}
 
 		if err := route.Replica.Raft().WaitForApply(ctx, idx); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				writeJSONErrorWithReq(w, http.StatusServiceUnavailable, "write timed out waiting for consensus quorum", reqID)
+				return
+			}
 			writeJSONErrorWithReq(w, http.StatusInternalServerError, fmt.Sprintf("failed to commit write: %v", err), reqID)
 			return
 		}
@@ -358,9 +362,9 @@ func (h *KVHandler) handlePut(w http.ResponseWriter, r *http.Request, key, reqID
 		return
 	}
 
-	// 2. Otherwise forward to target leader or candidate replica
-	targetNode := route.TargetNode()
-	if targetNode == "" || targetNode == h.localNodeID {
+	// 2. Otherwise forward to target leader or candidate replicas with failover
+	candidates := route.Candidates(h.localNodeID)
+	if len(candidates) == 0 {
 		writeJSONErrorWithReq(w, http.StatusServiceUnavailable, "no leader or replica currently available for shard", reqID)
 		return
 	}
@@ -368,17 +372,12 @@ func (h *KVHandler) handlePut(w http.ResponseWriter, r *http.Request, key, reqID
 	ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
 	defer cancel()
 
-	resp, err := h.forwarder.Forward(ctx, targetNode, http.MethodPut, r.URL.Path, body, hops)
+	resp, err := h.forwardWithFailover(ctx, route, candidates, http.MethodPut, r.URL.Path, body, hops)
 	if err != nil {
-		h.forwarder.Resolver().Tracker().Invalidate(route.GroupID)
-		writeJSONErrorWithReq(w, http.StatusBadGateway, fmt.Sprintf("forward to %s failed: %v", targetNode, err), reqID)
+		writeJSONErrorWithReq(w, http.StatusBadGateway, fmt.Sprintf("forwarding failed: %v", err), reqID)
 		return
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusServiceUnavailable {
-		h.forwarder.Resolver().Tracker().Invalidate(route.GroupID)
-	}
 
 	h.pipeResponse(w, resp)
 }
@@ -414,6 +413,10 @@ func (h *KVHandler) handleGet(w http.ResponseWriter, r *http.Request, key, reqID
 
 		// Step 2: Wait until state machine has applied through confirmed readIndex
 		if err := route.Replica.Raft().WaitForApply(ctx, readIndex); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				writeJSONErrorWithReq(w, http.StatusServiceUnavailable, "read timed out waiting for consensus quorum", reqID)
+				return
+			}
 			writeJSONErrorWithReq(w, http.StatusInternalServerError, fmt.Sprintf("failed to wait for apply index %d: %v", readIndex, err), reqID)
 			return
 		}
@@ -441,9 +444,9 @@ func (h *KVHandler) handleGet(w http.ResponseWriter, r *http.Request, key, reqID
 		return
 	}
 
-	// Forward GET to leader or candidate replica
-	targetNode := route.TargetNode()
-	if targetNode == "" || targetNode == h.localNodeID {
+	// Forward GET to leader or candidate replica with failover
+	candidates := route.Candidates(h.localNodeID)
+	if len(candidates) == 0 {
 		writeJSONErrorWithReq(w, http.StatusServiceUnavailable, "no leader or replica currently available for shard", reqID)
 		return
 	}
@@ -451,17 +454,12 @@ func (h *KVHandler) handleGet(w http.ResponseWriter, r *http.Request, key, reqID
 	ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
 	defer cancel()
 
-	resp, err := h.forwarder.Forward(ctx, targetNode, http.MethodGet, r.URL.Path, nil, hops)
+	resp, err := h.forwardWithFailover(ctx, route, candidates, http.MethodGet, r.URL.Path, nil, hops)
 	if err != nil {
-		h.forwarder.Resolver().Tracker().Invalidate(route.GroupID)
-		writeJSONErrorWithReq(w, http.StatusBadGateway, fmt.Sprintf("forward to %s failed: %v", targetNode, err), reqID)
+		writeJSONErrorWithReq(w, http.StatusBadGateway, fmt.Sprintf("forwarding failed: %v", err), reqID)
 		return
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusServiceUnavailable {
-		h.forwarder.Resolver().Tracker().Invalidate(route.GroupID)
-	}
 
 	h.pipeResponse(w, resp)
 }
@@ -498,6 +496,10 @@ func (h *KVHandler) handleDelete(w http.ResponseWriter, r *http.Request, key, re
 		}
 
 		if err := route.Replica.Raft().WaitForApply(ctx, idx); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				writeJSONErrorWithReq(w, http.StatusServiceUnavailable, "delete timed out waiting for consensus quorum", reqID)
+				return
+			}
 			writeJSONErrorWithReq(w, http.StatusInternalServerError, fmt.Sprintf("failed to commit delete: %v", err), reqID)
 			return
 		}
@@ -521,8 +523,8 @@ func (h *KVHandler) handleDelete(w http.ResponseWriter, r *http.Request, key, re
 		return
 	}
 
-	targetNode := route.TargetNode()
-	if targetNode == "" || targetNode == h.localNodeID {
+	candidates := route.Candidates(h.localNodeID)
+	if len(candidates) == 0 {
 		writeJSONErrorWithReq(w, http.StatusServiceUnavailable, "no leader or replica currently available for shard", reqID)
 		return
 	}
@@ -530,19 +532,67 @@ func (h *KVHandler) handleDelete(w http.ResponseWriter, r *http.Request, key, re
 	ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
 	defer cancel()
 
-	resp, err := h.forwarder.Forward(ctx, targetNode, http.MethodDelete, r.URL.Path, nil, hops)
+	resp, err := h.forwardWithFailover(ctx, route, candidates, http.MethodDelete, r.URL.Path, nil, hops)
 	if err != nil {
-		h.forwarder.Resolver().Tracker().Invalidate(route.GroupID)
-		writeJSONErrorWithReq(w, http.StatusBadGateway, fmt.Sprintf("forward to %s failed: %v", targetNode, err), reqID)
+		writeJSONErrorWithReq(w, http.StatusBadGateway, fmt.Sprintf("forwarding failed: %v", err), reqID)
 		return
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusServiceUnavailable {
-		h.forwarder.Resolver().Tracker().Invalidate(route.GroupID)
+	h.pipeResponse(w, resp)
+}
+
+func (h *KVHandler) forwardWithFailover(
+	ctx context.Context,
+	route *router.RouteResult,
+	candidates []string,
+	method, path string,
+	body []byte,
+	hops int,
+) (*http.Response, error) {
+	var lastResp *http.Response
+	var lastErr error
+
+	for _, targetNode := range candidates {
+		if ctx.Err() != nil {
+			break
+		}
+
+		resp, err := h.forwarder.Forward(ctx, targetNode, method, path, body, hops)
+		if err != nil {
+			h.forwarder.Resolver().Tracker().InvalidateLeaderIf(route.GroupID, targetNode)
+			lastErr = err
+			continue
+		}
+
+		// If remote node responded with 503 (e.g. not leader or stopped), invalidate and try next replica
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			h.forwarder.Resolver().Tracker().InvalidateLeaderIf(route.GroupID, targetNode)
+			if lastResp != nil {
+				_ = lastResp.Body.Close()
+			}
+			lastResp = resp
+			continue
+		}
+
+		// If remote node succeeded (200 OK or 404 Not Found), update cached leader
+		if resp.StatusCode == http.StatusOK {
+			h.forwarder.Resolver().Tracker().SetLeader(route.GroupID, targetNode)
+		}
+
+		if lastResp != nil {
+			_ = lastResp.Body.Close()
+		}
+		return resp, nil
 	}
 
-	h.pipeResponse(w, resp)
+	if lastResp != nil {
+		return lastResp, nil
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("no available replica could satisfy request for shard %d", route.ShardID)
 }
 
 func (h *KVHandler) handleClusterStatus(w http.ResponseWriter, r *http.Request) {

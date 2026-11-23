@@ -95,7 +95,7 @@ func (t *NodeLivenessTracker) CheckTransitions(now time.Time) {
 
 	if cb != nil {
 		for _, nid := range transitionedOffline {
-			cb(nid, false)
+			go cb(nid, false)
 		}
 	}
 }

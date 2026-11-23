@@ -39,13 +39,14 @@ const (
 
 // RouteResult describes how a request for a specific key should be handled.
 type RouteResult struct {
-	ShardID          sharding.ShardID
-	GroupID          raft.GroupID
-	IsLocal          bool
-	Replica          ShardInstance
-	LeaderID         string // empty if unknown
-	CandidateReplica string // replica node ID to query/forward to when leader is unknown
-	Forward          bool
+	ShardID           sharding.ShardID
+	GroupID           raft.GroupID
+	IsLocal           bool
+	Replica           ShardInstance
+	LeaderID          string   // empty if unknown
+	CandidateReplica  string   // replica node ID to query/forward to when leader is unknown
+	CandidateReplicas []string // all known replicas configured for this shard
+	Forward           bool
 }
 
 // TargetNode returns the leader node ID if known, or candidate replica to contact.
@@ -54,6 +55,30 @@ func (r *RouteResult) TargetNode() string {
 		return r.LeaderID
 	}
 	return r.CandidateReplica
+}
+
+// Candidates returns the ordered sequence of candidate target node IDs to attempt forwarding to.
+// The known leader (if any) is placed first, followed by remaining shard replicas.
+// Any node matching excludeNodeID (usually the local node) is omitted.
+func (r *RouteResult) Candidates(excludeNodeID string) []string {
+	seen := make(map[string]bool)
+	var result []string
+
+	if r.LeaderID != "" && r.LeaderID != excludeNodeID {
+		result = append(result, r.LeaderID)
+		seen[r.LeaderID] = true
+	}
+	if r.CandidateReplica != "" && r.CandidateReplica != excludeNodeID && !seen[r.CandidateReplica] {
+		result = append(result, r.CandidateReplica)
+		seen[r.CandidateReplica] = true
+	}
+	for _, rep := range r.CandidateReplicas {
+		if rep != excludeNodeID && !seen[rep] {
+			result = append(result, rep)
+			seen[rep] = true
+		}
+	}
+	return result
 }
 
 // HasKnownLeader returns true if a confirmed leader is identified.
@@ -118,6 +143,11 @@ func (f *RequestForwarder) Route(key string, localShards map[sharding.ShardID]Sh
 		GroupID: groupID,
 	}
 
+	shardInfo, _ := f.router.GetShardInfo(key)
+	if shardInfo != nil {
+		res.CandidateReplicas = append([]string(nil), shardInfo.Replicas...)
+	}
+
 	replica, isLocal := localShards[shardID]
 	if isLocal && replica != nil {
 		res.Replica = replica
@@ -177,7 +207,7 @@ func (f *RequestForwarder) Route(key string, localShards map[sharding.ShardID]Sh
 	// Shard is not hosted locally and leader is unknown:
 	// Set CandidateReplica to first configured replica so caller can query it
 	// without falsely claiming it is the Raft leader.
-	shardInfo, err := f.router.GetShardInfo(key)
+	shardInfo, err = f.router.GetShardInfo(key)
 	if err == nil && len(shardInfo.Replicas) > 0 {
 		res.CandidateReplica = shardInfo.Replicas[0]
 		res.Forward = true

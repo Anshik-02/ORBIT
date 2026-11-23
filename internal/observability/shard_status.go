@@ -103,9 +103,9 @@ func BuildShardStatus(
 				st.ReplicationLag[peerID] = 0
 			}
 
-			// Peer is available if it has made progress or responded recently
+			// Peer is available if it has responded recently (within 3 seconds)
 			peerResponsive := !prog.LastContact.IsZero() && time.Since(prog.LastContact) < 3*time.Second
-			if peerResponsive || prog.NextIndex > 1 || prog.MatchIndex > 0 {
+			if peerResponsive {
 				availableCount++
 				st.AvailableReplicas = append(st.AvailableReplicas, peerID)
 			}

@@ -198,21 +198,26 @@ func (b *DistributedEventBus) relayToPeers(evt ClusterEvent) {
 		}
 		targetURL += "/cluster/events/relay"
 
-		req, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewReader(payload))
-		if err != nil {
-			continue
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Orbit-Origin-Node", b.localNode)
-
-		resp, err := b.httpClient.Do(req)
-		if err == nil {
-			_ = resp.Body.Close()
-		}
+		// Send relay to each peer in parallel so a dead or partitioned peer never stalls other peers
+		go b.sendRelayToPeer(targetURL, payload)
 	}
 }
 
-// HandleRelayHTTP handles an inbound relayed event from a peer node.
+func (b *DistributedEventBus) sendRelayToPeer(targetURL string, payload []byte) {
+	req, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewReader(payload))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Orbit-Origin-Node", b.localNode)
+
+	resp, err := b.httpClient.Do(req)
+	if err == nil {
+		_ = resp.Body.Close()
+	}
+}
+
+// HandleRelayHTTP handles an inbound relayed event from a peer node with strict validation and deduplication.
 func (b *DistributedEventBus) HandleRelayHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -225,10 +230,16 @@ func (b *DistributedEventBus) HandleRelayHTTP(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	// Validate required event attributes
+	if evt.EventID == "" || evt.Type == "" {
+		http.Error(w, "EventID and Type are required", http.StatusBadRequest)
+		return
+	}
+
 	b.mu.Lock()
 	if _, seen := b.seenEvents[evt.EventID]; seen {
 		b.mu.Unlock()
-		w.WriteHeader(http.StatusOK) // Deduplicated
+		w.WriteHeader(http.StatusOK) // Deduplicated successfully
 		return
 	}
 	b.seenEvents[evt.EventID] = time.Now()
@@ -239,9 +250,32 @@ func (b *DistributedEventBus) HandleRelayHTTP(w http.ResponseWriter, r *http.Req
 	w.WriteHeader(http.StatusOK)
 }
 
+// PruneSeen evicts event deduplication records older than the specified TTL.
+func (b *DistributedEventBus) PruneSeen(ttl time.Duration) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	cutoff := time.Now().Add(-ttl)
+	pruned := 0
+	for id, t := range b.seenEvents {
+		if t.Before(cutoff) {
+			delete(b.seenEvents, id)
+			pruned++
+		}
+	}
+	return pruned
+}
+
+// SeenCount returns the number of deduplicated event IDs currently held in the cache.
+func (b *DistributedEventBus) SeenCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.seenEvents)
+}
+
 func (b *DistributedEventBus) cleanOldSeenLocked() {
-	if len(b.seenEvents) > 5000 {
-		cutoff := time.Now().Add(-10 * time.Minute)
+	if len(b.seenEvents) > 1000 {
+		cutoff := time.Now().Add(-5 * time.Minute)
 		for id, t := range b.seenEvents {
 			if t.Before(cutoff) {
 				delete(b.seenEvents, id)

@@ -88,8 +88,6 @@ func (cm *ClusterMonitor) Collect(
 				for peerID, prog := range r.ReplicationStatus() {
 					if !prog.LastContact.IsZero() {
 						cm.liveness.RecordHeartbeat(peerID, prog.LastContact)
-					} else if prog.NextIndex > 1 || prog.MatchIndex > 0 {
-						cm.liveness.RecordHeartbeat(peerID, now)
 					}
 				}
 			} else if leaderID := r.LeaderID(); leaderID != "" {

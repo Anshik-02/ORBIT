@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -41,14 +42,30 @@ func TestMultiProcessHTTPCluster(t *testing.T) {
 		}
 	}
 
-	// 2. Prepare 3 node configurations with distinct ports
-	ports := []struct {
+	// 2. Prepare 3 node configurations with dynamically allocated free ports
+	ports := make([]struct {
 		apiPort  int
 		raftPort int
-	}{
-		{2925, 3925},
-		{2926, 3926},
-		{2927, 3927},
+	}, 3)
+	for i := 0; i < 3; i++ {
+		apiLn, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen api port %d: %v", i, err)
+		}
+		apiP := apiLn.Addr().(*net.TCPAddr).Port
+		_ = apiLn.Close()
+
+		raftLn, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen raft port %d: %v", i, err)
+		}
+		raftP := raftLn.Addr().(*net.TCPAddr).Port
+		_ = raftLn.Close()
+
+		ports[i] = struct {
+			apiPort  int
+			raftPort int
+		}{apiPort: apiP, raftPort: raftP}
 	}
 	nodeIDs := []string{"node-p1", "node-p2", "node-p3"}
 	configPaths := make([]string, 3)

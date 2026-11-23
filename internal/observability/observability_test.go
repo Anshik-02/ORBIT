@@ -10,6 +10,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -265,4 +267,131 @@ func TestWebSocket_HandshakeAndStreaming(t *testing.T) {
 	if received.Data["current_leader"] != "node-a" {
 		t.Errorf("unexpected event data: %+v", received.Data)
 	}
+}
+
+func TestDistributedEventBus_ValidationAndDeduplication(t *testing.T) {
+	t.Parallel()
+
+	hub := observability.NewEventHub()
+	defer hub.Close()
+
+	bus := observability.NewDistributedEventBus(hub, "node-a", nil)
+	ch := hub.Subscribe()
+	defer hub.Unsubscribe(ch)
+
+	// 1. Missing EventID returns 400 Bad Request
+	reqMissingID := httptest.NewRequest(http.MethodPost, "/cluster/events/relay", strings.NewReader(`{"type":"LEADER_CHANGED","node_id":"node-b"}`))
+	recMissingID := httptest.NewRecorder()
+	bus.HandleRelayHTTP(recMissingID, reqMissingID)
+	if recMissingID.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for missing event_id, got %d", recMissingID.Code)
+	}
+
+	// 2. Missing Type returns 400 Bad Request
+	reqMissingType := httptest.NewRequest(http.MethodPost, "/cluster/events/relay", strings.NewReader(`{"event_id":"evt-1","node_id":"node-b"}`))
+	recMissingType := httptest.NewRecorder()
+	bus.HandleRelayHTTP(recMissingType, reqMissingType)
+	if recMissingType.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for missing type, got %d", recMissingType.Code)
+	}
+
+	// 3. Valid event is accepted and published
+	validPayload := `{"event_id":"evt-dedup-test-1","type":"LEADER_CHANGED","node_id":"node-b"}`
+	reqValid := httptest.NewRequest(http.MethodPost, "/cluster/events/relay", strings.NewReader(validPayload))
+	recValid := httptest.NewRecorder()
+	bus.HandleRelayHTTP(recValid, reqValid)
+	if recValid.Code != http.StatusOK {
+		t.Errorf("expected 200 for valid event, got %d", recValid.Code)
+	}
+
+	select {
+	case evt := <-ch:
+		if evt.EventID != "evt-dedup-test-1" {
+			t.Errorf("expected evt-dedup-test-1, got %s", evt.EventID)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected event publication on hub")
+	}
+
+	// 4. Duplicate event is acknowledged with 200 OK but NOT published to hub
+	reqDup := httptest.NewRequest(http.MethodPost, "/cluster/events/relay", strings.NewReader(validPayload))
+	recDup := httptest.NewRecorder()
+	bus.HandleRelayHTTP(recDup, reqDup)
+	if recDup.Code != http.StatusOK {
+		t.Errorf("expected 200 for duplicate event, got %d", recDup.Code)
+	}
+
+	select {
+	case evt := <-ch:
+		t.Fatalf("unexpected duplicate event published to hub: %+v", evt)
+	case <-time.After(100 * time.Millisecond):
+		// Success: no duplicate received
+	}
+
+	if bus.SeenCount() != 1 {
+		t.Errorf("expected 1 seen event, got %d", bus.SeenCount())
+	}
+
+	// 5. Test cache pruning
+	pruned := bus.PruneSeen(0) // evict everything older than 0s
+	if pruned != 1 {
+		t.Errorf("expected 1 pruned event, got %d", pruned)
+	}
+	if bus.SeenCount() != 0 {
+		t.Errorf("expected 0 seen events after prune, got %d", bus.SeenCount())
+	}
+}
+
+func TestNodeLivenessTracker_Transitions(t *testing.T) {
+	t.Parallel()
+
+	tracker := observability.NewNodeLivenessTracker(50 * time.Millisecond)
+
+	var mu sync.Mutex
+	transitions := make([]struct {
+		nodeID string
+		online bool
+	}, 0)
+
+	tracker.SetCallback(func(nodeID string, online bool) {
+		mu.Lock()
+		transitions = append(transitions, struct {
+			nodeID string
+			online bool
+		}{nodeID, online})
+		mu.Unlock()
+	})
+
+	now := time.Now()
+	// Record initial heartbeat -> online
+	tracker.RecordHeartbeat("node-1", now)
+
+	// Allow goroutine callback to run
+	time.Sleep(50 * time.Millisecond)
+
+	mu.Lock()
+	if len(transitions) != 1 || !transitions[0].online || transitions[0].nodeID != "node-1" {
+		t.Fatalf("expected 1 online transition, got %+v", transitions)
+	}
+	mu.Unlock()
+
+	// Another heartbeat while already online should NOT fire callback again
+	tracker.RecordHeartbeat("node-1", now.Add(10*time.Millisecond))
+	time.Sleep(30 * time.Millisecond)
+
+	mu.Lock()
+	if len(transitions) != 1 {
+		t.Fatalf("expected still only 1 transition, got %d", len(transitions))
+	}
+	mu.Unlock()
+
+	// Check transitions after timeout -> offline transition
+	tracker.CheckTransitions(now.Add(100 * time.Millisecond))
+	time.Sleep(50 * time.Millisecond)
+
+	mu.Lock()
+	if len(transitions) != 2 || transitions[1].online || transitions[1].nodeID != "node-1" {
+		t.Fatalf("expected offline transition at index 1, got %+v", transitions)
+	}
+	mu.Unlock()
 }
