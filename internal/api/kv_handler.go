@@ -372,8 +372,12 @@ func (h *KVHandler) handlePut(w http.ResponseWriter, r *http.Request, key, reqID
 	ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
 	defer cancel()
 
-	resp, err := h.forwardWithFailover(ctx, route, candidates, http.MethodPut, r.URL.Path, body, hops)
+	resp, err := h.forwardWithFailover(ctx, route, candidates, http.MethodPut, r.URL.Path, body, hops, reqID)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "ambiguous") {
+			writeJSONErrorWithReq(w, http.StatusGatewayTimeout, "forwarded write timed out with ambiguous outcome; check key status before retrying", reqID)
+			return
+		}
 		writeJSONErrorWithReq(w, http.StatusBadGateway, fmt.Sprintf("forwarding failed: %v", err), reqID)
 		return
 	}
@@ -454,7 +458,7 @@ func (h *KVHandler) handleGet(w http.ResponseWriter, r *http.Request, key, reqID
 	ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
 	defer cancel()
 
-	resp, err := h.forwardWithFailover(ctx, route, candidates, http.MethodGet, r.URL.Path, nil, hops)
+	resp, err := h.forwardWithFailover(ctx, route, candidates, http.MethodGet, r.URL.Path, nil, hops, reqID)
 	if err != nil {
 		writeJSONErrorWithReq(w, http.StatusBadGateway, fmt.Sprintf("forwarding failed: %v", err), reqID)
 		return
@@ -532,8 +536,12 @@ func (h *KVHandler) handleDelete(w http.ResponseWriter, r *http.Request, key, re
 	ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
 	defer cancel()
 
-	resp, err := h.forwardWithFailover(ctx, route, candidates, http.MethodDelete, r.URL.Path, nil, hops)
+	resp, err := h.forwardWithFailover(ctx, route, candidates, http.MethodDelete, r.URL.Path, nil, hops, reqID)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "ambiguous") {
+			writeJSONErrorWithReq(w, http.StatusGatewayTimeout, "forwarded write timed out with ambiguous outcome; check key status before retrying", reqID)
+			return
+		}
 		writeJSONErrorWithReq(w, http.StatusBadGateway, fmt.Sprintf("forwarding failed: %v", err), reqID)
 		return
 	}
@@ -549,6 +557,7 @@ func (h *KVHandler) forwardWithFailover(
 	method, path string,
 	body []byte,
 	hops int,
+	reqID string,
 ) (*http.Response, error) {
 	var lastResp *http.Response
 	var lastErr error
@@ -558,10 +567,17 @@ func (h *KVHandler) forwardWithFailover(
 			break
 		}
 
-		resp, err := h.forwarder.Forward(ctx, targetNode, method, path, body, hops)
+		resp, err := h.forwarder.Forward(ctx, targetNode, method, path, body, hops, reqID)
 		if err != nil {
 			h.forwarder.Resolver().Tracker().InvalidateLeaderIf(route.GroupID, targetNode)
 			lastErr = err
+
+			// If the error was a context deadline / timeout after dispatching a mutating write,
+			// the write is ambiguous: the remote node may have received and committed it.
+			// Do not blindly retry mutating operations across multiple nodes!
+			if method != http.MethodGet && (errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded)) {
+				return nil, fmt.Errorf("forwarded %s to %s timed out with ambiguous outcome: %w", method, targetNode, err)
+			}
 			continue
 		}
 

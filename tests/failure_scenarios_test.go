@@ -3,6 +3,7 @@ package tests
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,6 +20,7 @@ import (
 
 	"orbit/internal/api"
 	"orbit/internal/node"
+	"orbit/internal/raft"
 	"orbit/internal/sharding"
 )
 
@@ -627,4 +629,237 @@ func TestPhase36_ComprehensiveFailureScenarios(t *testing.T) {
 	t.Log("Scenario 8 PASSED: Duplicate event was cleanly deduplicated with no duplicate frame emitted over WebSocket.")
 
 	t.Log("\n>>> ALL PHASE 3.6 FAILURE SCENARIOS COMPLETED SUCCESSFULLY! <<<")
+}
+
+// TestPhase36_DeterministicNodeRecoveryActualRaftState deterministically exercises
+// the full persistence and recovery path:
+//  1. Boot a 3-node shard cluster.
+//  2. Elect leader and commit multiple real Raft entries through Propose.
+//  3. Capture the exact persistent state (term, commitIndex, appliedIndex, disk data).
+//  4. Cleanly stop a replica node.
+//  5. Reopen the replica using the exact same data directory.
+//  6. Verify term, log entries, lastApplied, and database state are recovered independently
+//     without any mock or manual log injections.
+func TestPhase36_DeterministicNodeRecoveryActualRaftState(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	nodeIDs := []string{"det-node-a", "det-node-b", "det-node-c"}
+
+	// Topology: 1 shard across all 3 nodes
+	meta := sharding.NewClusterMetadata("det-recovery-cluster", 1, 1, 3, nodeIDs)
+	_ = meta.AddShard(&sharding.ShardInfo{ID: 0, Replicas: nodeIDs})
+
+	// Allocate ports
+	type portPair struct {
+		apiPort  int
+		raftPort int
+	}
+	ports := make(map[string]portPair)
+	for _, nid := range nodeIDs {
+		apiLn, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen api %s: %v", nid, err)
+		}
+		apiP := apiLn.Addr().(*net.TCPAddr).Port
+		_ = apiLn.Close()
+
+		raftLn, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen raft %s: %v", nid, err)
+		}
+		raftP := raftLn.Addr().(*net.TCPAddr).Port
+		_ = raftLn.Close()
+
+		ports[nid] = portPair{apiPort: apiP, raftPort: raftP}
+	}
+
+	peerRaftAddrs := make(map[string]string)
+	for _, nid := range nodeIDs {
+		peerRaftAddrs[nid] = fmt.Sprintf("127.0.0.1:%d", ports[nid].raftPort)
+	}
+
+	nodes := make(map[string]*node.Node)
+	for _, nid := range nodeIDs {
+		var peers []node.PeerConfig
+		for _, other := range nodeIDs {
+			if other != nid {
+				peers = append(peers, node.PeerConfig{
+					ID:          other,
+					Address:     fmt.Sprintf("127.0.0.1:%d", ports[other].apiPort),
+					RaftAddress: fmt.Sprintf("127.0.0.1:%d", ports[other].raftPort),
+				})
+			}
+		}
+
+		cfg := node.NodeConfig{
+			ID:                 nid,
+			Address:            fmt.Sprintf("127.0.0.1:%d", ports[nid].apiPort),
+			RaftAddress:        peerRaftAddrs[nid],
+			DataDir:            filepath.Join(tempDir, nid),
+			HeartbeatInterval:  25 * time.Millisecond,
+			ElectionTimeoutMin: 60 * time.Millisecond,
+			ElectionTimeoutMax: 120 * time.Millisecond,
+			Peers:              peers,
+		}
+
+		n, err := node.NewShardedNode(cfg, meta, peerRaftAddrs, nil)
+		if err != nil {
+			t.Fatalf("NewShardedNode %s: %v", nid, err)
+		}
+		nodes[nid] = n
+	}
+
+	// Start all nodes
+	for _, nid := range nodeIDs {
+		if err := nodes[nid].Start(); err != nil {
+			t.Fatalf("start %s: %v", nid, err)
+		}
+	}
+	defer func() {
+		for _, n := range nodes {
+			if n != nil {
+				_ = n.Stop()
+			}
+		}
+	}()
+
+	// Wait for leader election on Shard 0
+	deadline := time.Now().Add(5 * time.Second)
+	var leaderNode *node.Node
+	for time.Now().Before(deadline) {
+		for _, n := range nodes {
+			sh, ok := n.Shard(0)
+			if ok && sh.Raft().Role() == raft.Leader {
+				leaderNode = n
+				break
+			}
+		}
+		if leaderNode != nil {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+
+	if leaderNode == nil {
+		t.Fatal("failed to elect leader for shard 0")
+	}
+	t.Logf("Elected leader: %s", leaderNode.ID())
+
+	// Propose 5 real key-value entries
+	shard0Leader, _ := leaderNode.Shard(0)
+	for i := 1; i <= 5; i++ {
+		k := fmt.Sprintf("user:%d", i)
+		v := fmt.Sprintf("data-val-%d", i)
+		idx, _, err := shard0Leader.Raft().Propose("SET", k, v)
+		if err != nil {
+			t.Fatalf("propose %s: %v", k, err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := shard0Leader.Raft().WaitForApply(ctx, idx); err != nil {
+			cancel()
+			t.Fatalf("wait for apply %d: %v", idx, err)
+		}
+		cancel()
+	}
+
+	// Pick a follower to test persistence and recovery
+	var followerID string
+	for _, nid := range nodeIDs {
+		if nid != leaderNode.ID() {
+			followerID = nid
+			break
+		}
+	}
+	targetNode := nodes[followerID]
+	followerShard, _ := targetNode.Shard(0)
+
+	// Wait for follower to apply all 5 entries
+	time.Sleep(200 * time.Millisecond)
+
+	preStopTerm := followerShard.Raft().CurrentTerm()
+	preStopApplied := followerShard.Raft().LastApplied()
+	preStopCommit := followerShard.Raft().CommitIndex()
+	t.Logf("Follower %s pre-stop state: Term=%d, CommitIndex=%d, LastApplied=%d",
+		followerID, preStopTerm, preStopCommit, preStopApplied)
+
+	if preStopApplied < 5 {
+		t.Fatalf("follower lastApplied index too low before stop: %d", preStopApplied)
+	}
+
+	// Verify data before stop
+	valBefore, err := followerShard.DB().Get("user:3")
+	if err != nil || valBefore != "data-val-3" {
+		t.Fatalf("pre-stop value mismatch: val=%q, err=%v", valBefore, err)
+	}
+
+	// Cleanly stop the follower
+	if err := targetNode.Stop(); err != nil {
+		t.Fatalf("stop %s: %v", followerID, err)
+	}
+	nodes[followerID] = nil
+
+	// Recreate follower from disk with same configuration
+	var peers []node.PeerConfig
+	for _, other := range nodeIDs {
+		if other != followerID {
+			peers = append(peers, node.PeerConfig{
+				ID:          other,
+				Address:     fmt.Sprintf("127.0.0.1:%d", ports[other].apiPort),
+				RaftAddress: fmt.Sprintf("127.0.0.1:%d", ports[other].raftPort),
+			})
+		}
+	}
+
+	recoveredCfg := node.NodeConfig{
+		ID:                 followerID,
+		Address:            fmt.Sprintf("127.0.0.1:%d", ports[followerID].apiPort),
+		RaftAddress:        peerRaftAddrs[followerID],
+		DataDir:            filepath.Join(tempDir, followerID),
+		HeartbeatInterval:  25 * time.Millisecond,
+		ElectionTimeoutMin: 60 * time.Millisecond,
+		ElectionTimeoutMax: 120 * time.Millisecond,
+		Peers:              peers,
+	}
+
+	recoveredNode, err := node.NewShardedNode(recoveredCfg, meta, peerRaftAddrs, nil)
+	if err != nil {
+		t.Fatalf("recreate NewShardedNode %s: %v", followerID, err)
+	}
+	nodes[followerID] = recoveredNode
+
+	if err := recoveredNode.Start(); err != nil {
+		t.Fatalf("start recovered node %s: %v", followerID, err)
+	}
+
+	recShard, ok := recoveredNode.Shard(0)
+	if !ok {
+		t.Fatalf("recovered node missing shard 0")
+	}
+
+	// Verify actual recovered Raft state:
+	// 1. Term recovered from storage must match pre-stop term
+	if recShard.Raft().CurrentTerm() != preStopTerm {
+		t.Errorf("recovered term mismatch: expected %d, got %d", preStopTerm, recShard.Raft().CurrentTerm())
+	}
+
+	// 2. InitialLastApplied must match pre-stop applied to prevent duplicate re-application
+	if recShard.Engine().LastAppliedIndex() != preStopApplied {
+		t.Errorf("recovered engine last applied mismatch: expected %d, got %d", preStopApplied, recShard.Engine().LastAppliedIndex())
+	}
+
+	// 3. All 5 keys must be readable directly from the recovered database
+	for i := 1; i <= 5; i++ {
+		k := fmt.Sprintf("user:%d", i)
+		expected := fmt.Sprintf("data-val-%d", i)
+		got, err := recShard.DB().Get(k)
+		if err != nil {
+			t.Errorf("recovered DB get %s failed: %v", k, err)
+		}
+		if got != expected {
+			t.Errorf("recovered DB value mismatch for %s: expected %q, got %q", k, expected, got)
+		}
+	}
+
+	t.Logf("Successfully verified actual Raft state recovery for node %s!", followerID)
 }

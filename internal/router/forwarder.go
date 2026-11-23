@@ -35,6 +35,9 @@ const (
 
 	// HeaderForwardedFrom is the HTTP header identifying the origin node that forwarded the request.
 	HeaderForwardedFrom = "X-Orbit-Forwarded-From"
+
+	// HeaderRequestID is the HTTP header carrying end-to-end tracing and idempotency request IDs.
+	HeaderRequestID = "X-Request-ID"
 )
 
 // RouteResult describes how a request for a specific key should be handled.
@@ -156,13 +159,14 @@ func (f *RequestForwarder) Route(key string, localShards map[sharding.ShardID]Sh
 		if replica.Raft().Role() == raft.Leader {
 			res.IsLocal = true
 			res.LeaderID = f.localNodeID
+			f.resolver.Tracker().SetLeaderWithTerm(groupID, f.localNodeID, replica.Raft().CurrentTerm())
 			return res, nil
 		}
 
 		// If local replica knows the remote leader, route forward to it
 		if leaderID := replica.Raft().LeaderID(); leaderID != "" {
 			res.LeaderID = leaderID
-			f.resolver.Tracker().SetLeader(groupID, leaderID)
+			f.resolver.Tracker().SetLeaderWithTerm(groupID, leaderID, replica.Raft().CurrentTerm())
 			if leaderID == f.localNodeID {
 				res.IsLocal = true
 				return res, nil
@@ -218,7 +222,7 @@ func (f *RequestForwarder) Route(key string, localShards map[sharding.ShardID]Sh
 }
 
 // Forward sends an HTTP request to the designated target node with loop detection.
-func (f *RequestForwarder) Forward(ctx context.Context, targetNodeID, method, path string, body []byte, hops int) (*http.Response, error) {
+func (f *RequestForwarder) Forward(ctx context.Context, targetNodeID, method, path string, body []byte, hops int, reqID ...string) (*http.Response, error) {
 	if hops >= MaxForwardHops {
 		return nil, fmt.Errorf("%w: exceeded %d hops", ErrForwardingLoop, MaxForwardHops)
 	}
@@ -247,6 +251,9 @@ func (f *RequestForwarder) Forward(ctx context.Context, targetNodeID, method, pa
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(HeaderForwardedFrom, f.localNodeID)
 	req.Header.Set(HeaderForwardHops, strconv.Itoa(hops+1))
+	if len(reqID) > 0 && reqID[0] != "" {
+		req.Header.Set(HeaderRequestID, reqID[0])
+	}
 
 	resp, err := f.httpClient.Do(req)
 	if err != nil {

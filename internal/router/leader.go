@@ -23,25 +23,58 @@ var (
 	ErrLeaderUnknown = errors.New("router: leader unknown for shard")
 )
 
-// LeaderTracker tracks the known leader node ID for each shard group.
-// It is thread-safe for concurrent read and write operations.
+// LeaderRecord captures the known leader node ID and the Raft consensus term.
+type LeaderRecord struct {
+	LeaderID string
+	Term     uint64
+}
+
+// LeaderTracker tracks the known leader node ID and consensus term for each shard group.
+// It is term-aware and prevents outdated leadership updates from overwriting newer terms.
 type LeaderTracker struct {
 	mu      sync.RWMutex
-	leaders map[raft.GroupID]string
+	leaders map[raft.GroupID]LeaderRecord
 }
 
 // NewLeaderTracker creates an empty LeaderTracker.
 func NewLeaderTracker() *LeaderTracker {
 	return &LeaderTracker{
-		leaders: make(map[raft.GroupID]string),
+		leaders: make(map[raft.GroupID]LeaderRecord),
 	}
+}
+
+// SetLeaderWithTerm records that nodeID is the known leader for groupID at term.
+// Stale updates (where term < current cached term) are rejected, returning false.
+func (lt *LeaderTracker) SetLeaderWithTerm(groupID raft.GroupID, nodeID string, term uint64) bool {
+	lt.mu.Lock()
+	defer lt.mu.Unlock()
+
+	current, ok := lt.leaders[groupID]
+	if ok && term < current.Term {
+		return false // Stale term update rejected
+	}
+
+	lt.leaders[groupID] = LeaderRecord{
+		LeaderID: nodeID,
+		Term:     term,
+	}
+	return true
 }
 
 // SetLeader records that nodeID is the currently known leader for groupID.
 func (lt *LeaderTracker) SetLeader(groupID raft.GroupID, nodeID string) {
 	lt.mu.Lock()
 	defer lt.mu.Unlock()
-	lt.leaders[groupID] = nodeID
+
+	current := lt.leaders[groupID]
+	newTerm := current.Term
+	if newTerm == 0 {
+		newTerm = 1
+	}
+	lt.leaders[groupID] = LeaderRecord{
+		LeaderID: nodeID,
+		Term:     newTerm,
+	}
 }
 
 // GetLeader returns the currently known leader node ID for groupID.
@@ -49,8 +82,16 @@ func (lt *LeaderTracker) SetLeader(groupID raft.GroupID, nodeID string) {
 func (lt *LeaderTracker) GetLeader(groupID raft.GroupID) (string, bool) {
 	lt.mu.RLock()
 	defer lt.mu.RUnlock()
-	leader, ok := lt.leaders[groupID]
-	return leader, ok && leader != ""
+	rec, ok := lt.leaders[groupID]
+	return rec.LeaderID, ok && rec.LeaderID != ""
+}
+
+// GetLeaderWithTerm returns the currently known leader node ID and consensus term for groupID.
+func (lt *LeaderTracker) GetLeaderWithTerm(groupID raft.GroupID) (string, uint64, bool) {
+	lt.mu.RLock()
+	defer lt.mu.RUnlock()
+	rec, ok := lt.leaders[groupID]
+	return rec.LeaderID, rec.Term, ok && rec.LeaderID != ""
 }
 
 // Invalidate removes cached leader knowledge for groupID, e.g. after receiving
@@ -65,7 +106,16 @@ func (lt *LeaderTracker) Invalidate(groupID raft.GroupID) {
 func (lt *LeaderTracker) InvalidateLeaderIf(groupID raft.GroupID, expectedLeader string) {
 	lt.mu.Lock()
 	defer lt.mu.Unlock()
-	if current, ok := lt.leaders[groupID]; ok && current == expectedLeader {
+	if current, ok := lt.leaders[groupID]; ok && current.LeaderID == expectedLeader {
+		delete(lt.leaders, groupID)
+	}
+}
+
+// InvalidateLeaderWithTerm removes the cached leader if it matches expectedLeader and term >= cached term.
+func (lt *LeaderTracker) InvalidateLeaderWithTerm(groupID raft.GroupID, expectedLeader string, term uint64) {
+	lt.mu.Lock()
+	defer lt.mu.Unlock()
+	if current, ok := lt.leaders[groupID]; ok && current.LeaderID == expectedLeader && term >= current.Term {
 		delete(lt.leaders, groupID)
 	}
 }
@@ -98,17 +148,18 @@ func (lr *LeaderResolver) ResolveLocal(shard ShardInstance) (string, error) {
 	}
 
 	groupID := shard.GroupID()
+	term := shard.Raft().CurrentTerm()
 
 	// Check if the local Raft engine has elected itself leader
 	if shard.Raft().Role() == raft.Leader {
 		leaderID := shard.Raft().ID()
-		lr.tracker.SetLeader(groupID, leaderID)
+		lr.tracker.SetLeaderWithTerm(groupID, leaderID, term)
 		return leaderID, nil
 	}
 
 	// Check if follower/candidate recognizes a remote leader
 	if leaderID := shard.Raft().LeaderID(); leaderID != "" {
-		lr.tracker.SetLeader(groupID, leaderID)
+		lr.tracker.SetLeaderWithTerm(groupID, leaderID, term)
 		return leaderID, nil
 	}
 

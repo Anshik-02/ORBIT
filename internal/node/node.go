@@ -486,13 +486,13 @@ func (n *Node) wireShardLeaderCallbacksLocked() {
 	}
 	for sid, replica := range n.shards {
 		shardID := sid
-		replica.Raft().SetLeaderCallback(func(gid raft.GroupID, leaderID string) {
-			n.onLeaderChanged(shardID, gid, leaderID)
+		replica.Raft().SetLeaderCallback(func(gid raft.GroupID, leaderID string, term uint64) {
+			n.onLeaderChanged(shardID, gid, leaderID, term)
 		})
 	}
 }
 
-func (n *Node) onLeaderChanged(sid sharding.ShardID, gid raft.GroupID, leaderID string) {
+func (n *Node) onLeaderChanged(sid sharding.ShardID, gid raft.GroupID, leaderID string, term uint64) {
 	n.mu.Lock()
 	handler := n.kvHandler
 	n.mu.Unlock()
@@ -502,7 +502,7 @@ func (n *Node) onLeaderChanged(sid sharding.ShardID, gid raft.GroupID, leaderID 
 	}
 
 	if leaderID != "" {
-		handler.Forwarder().Resolver().Tracker().SetLeader(gid, leaderID)
+		handler.Forwarder().Resolver().Tracker().SetLeaderWithTerm(gid, leaderID, term)
 	} else {
 		handler.Forwarder().Resolver().Tracker().Invalidate(gid)
 	}
@@ -521,6 +521,7 @@ func (n *Node) onLeaderChanged(sid sharding.ShardID, gid raft.GroupID, leaderID 
 		map[string]any{
 			"group_id":  string(gid),
 			"leader_id": leaderID,
+			"term":      term,
 		},
 	))
 }

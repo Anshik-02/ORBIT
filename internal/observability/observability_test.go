@@ -395,3 +395,68 @@ func TestNodeLivenessTracker_Transitions(t *testing.T) {
 	}
 	mu.Unlock()
 }
+
+func TestWebSocket_ValidationRFC6455(t *testing.T) {
+	t.Parallel()
+
+	eventHub := observability.NewEventHub()
+	defer eventHub.Close()
+
+	wsHub := observability.NewWebSocketHub(eventHub)
+	defer wsHub.Close()
+
+	mux := http.NewServeMux()
+	wsHub.RegisterRoutes(mux, "/ws/events")
+
+	// 1. Method Not Allowed (POST)
+	rec1 := httptest.NewRecorder()
+	req1 := httptest.NewRequest(http.MethodPost, "/ws/events", nil)
+	mux.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405 for POST, got %d", rec1.Code)
+	}
+
+	// 2. Missing Connection: Upgrade
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodGet, "/ws/events", nil)
+	req2.Header.Set("Upgrade", "websocket")
+	mux.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for missing Connection header, got %d", rec2.Code)
+	}
+
+	// 3. Missing Upgrade: websocket
+	rec3 := httptest.NewRecorder()
+	req3 := httptest.NewRequest(http.MethodGet, "/ws/events", nil)
+	req3.Header.Set("Connection", "Upgrade")
+	mux.ServeHTTP(rec3, req3)
+	if rec3.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for missing Upgrade header, got %d", rec3.Code)
+	}
+
+	// 4. Invalid Sec-WebSocket-Version (!= 13)
+	rec4 := httptest.NewRecorder()
+	req4 := httptest.NewRequest(http.MethodGet, "/ws/events", nil)
+	req4.Header.Set("Connection", "Upgrade")
+	req4.Header.Set("Upgrade", "websocket")
+	req4.Header.Set("Sec-WebSocket-Version", "12")
+	mux.ServeHTTP(rec4, req4)
+	if rec4.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for version 12, got %d", rec4.Code)
+	}
+	if rec4.Header().Get("Sec-WebSocket-Version") != "13" {
+		t.Errorf("expected Sec-WebSocket-Version: 13 header in response, got %s", rec4.Header().Get("Sec-WebSocket-Version"))
+	}
+
+	// 5. Invalid Sec-WebSocket-Key (not 16 bytes)
+	rec5 := httptest.NewRecorder()
+	req5 := httptest.NewRequest(http.MethodGet, "/ws/events", nil)
+	req5.Header.Set("Connection", "Upgrade")
+	req5.Header.Set("Upgrade", "websocket")
+	req5.Header.Set("Sec-WebSocket-Version", "13")
+	req5.Header.Set("Sec-WebSocket-Key", "not-16-bytes")
+	mux.ServeHTTP(rec5, req5)
+	if rec5.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for invalid key, got %d", rec5.Code)
+	}
+}

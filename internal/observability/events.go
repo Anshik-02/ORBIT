@@ -410,18 +410,41 @@ func (wsh *WebSocketHub) broadcastEvent(evt ClusterEvent) {
 // HandleWebSocket upgrades an HTTP request to an RFC 6455 WebSocket connection.
 func (wsh *WebSocketHub) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-		http.Error(w, "Expected websocket upgrade", http.StatusBadRequest)
+	// 1. Validate Connection header contains "upgrade"
+	connHdr := strings.ToLower(r.Header.Get("Connection"))
+	if !strings.Contains(connHdr, "upgrade") {
+		http.Error(w, "Expected Connection: Upgrade", http.StatusBadRequest)
 		return
 	}
 
-	key := r.Header.Get("Sec-WebSocket-Key")
+	// 2. Validate Upgrade header equals "websocket"
+	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		http.Error(w, "Expected Upgrade: websocket", http.StatusBadRequest)
+		return
+	}
+
+	// 3. Validate Sec-WebSocket-Version equals "13"
+	version := r.Header.Get("Sec-WebSocket-Version")
+	if version != "13" {
+		w.Header().Set("Sec-WebSocket-Version", "13")
+		http.Error(w, "Unsupported Sec-WebSocket-Version; expected 13", http.StatusBadRequest)
+		return
+	}
+
+	// 4. Validate Sec-WebSocket-Key is valid base64 and 16 bytes
+	key := strings.TrimSpace(r.Header.Get("Sec-WebSocket-Key"))
 	if key == "" {
 		http.Error(w, "Missing Sec-WebSocket-Key", http.StatusBadRequest)
+		return
+	}
+	rawKey, err := base64.StdEncoding.DecodeString(key)
+	if err != nil || len(rawKey) != 16 {
+		http.Error(w, "Invalid Sec-WebSocket-Key: must be 16 base64-encoded bytes", http.StatusBadRequest)
 		return
 	}
 
@@ -552,6 +575,9 @@ func readFrame(rw *bufio.ReadWriter) (byte, []byte, error) {
 		return 0, nil, err
 	}
 	masked := (b1 & 0x80) != 0
+	if !masked {
+		return 0, nil, errors.New("unmasked client frame: RFC 6455 section 5.1 protocol error")
+	}
 	payloadLen := int(b1 & 0x7F)
 
 	if payloadLen == 126 {

@@ -92,6 +92,47 @@ func TestLeaderTracker_SetGetInvalidate(t *testing.T) {
 	}
 }
 
+func TestLeaderTracker_TermAwareness(t *testing.T) {
+	t.Parallel()
+
+	lt := router.NewLeaderTracker()
+	gid := raft.GroupID("shard-0")
+
+	// Set leader at Term 2
+	ok := lt.SetLeaderWithTerm(gid, "node-b", 2)
+	if !ok {
+		t.Fatal("expected SetLeaderWithTerm(term 2) to succeed")
+	}
+
+	ldr, term, found := lt.GetLeaderWithTerm(gid)
+	if !found || ldr != "node-b" || term != 2 {
+		t.Fatalf("expected node-b at term 2, got %s (term %d, found %v)", ldr, term, found)
+	}
+
+	// Attempt stale update from Term 1 (must be rejected!)
+	staleOk := lt.SetLeaderWithTerm(gid, "node-a", 1)
+	if staleOk {
+		t.Fatal("expected stale SetLeaderWithTerm(term 1) to be rejected")
+	}
+
+	// Verify cached leader was NOT overwritten by stale update
+	ldr, term, found = lt.GetLeaderWithTerm(gid)
+	if !found || ldr != "node-b" || term != 2 {
+		t.Fatalf("expected node-b at term 2 preserved, got %s (term %d)", ldr, term)
+	}
+
+	// Update with higher Term 3 (must succeed)
+	higherOk := lt.SetLeaderWithTerm(gid, "node-c", 3)
+	if !higherOk {
+		t.Fatal("expected higher term update to succeed")
+	}
+
+	ldr, term, found = lt.GetLeaderWithTerm(gid)
+	if !found || ldr != "node-c" || term != 3 {
+		t.Fatalf("expected node-c at term 3, got %s (term %d)", ldr, term)
+	}
+}
+
 func TestRequestForwarder_Route(t *testing.T) {
 	t.Parallel()
 

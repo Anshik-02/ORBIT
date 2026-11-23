@@ -19,7 +19,7 @@ type Config struct {
 	ElectionTimeoutMin time.Duration
 	ElectionTimeoutMax time.Duration
 	CommitCallback     func(LogEntry) error // Invoked sequentially when an entry is committed
-	LeaderCallback     func(GroupID, string) // Invoked asynchronously whenever leader changes or is discovered
+	LeaderCallback     func(GroupID, string, uint64) // Invoked asynchronously whenever leader changes or is discovered with its term
 
 	// InitialLastApplied seeds lastApplied on startup from a recovered storage engine.
 	// Set this to engine.LastAppliedIndex() so the applyLoop skips already-applied entries
@@ -70,7 +70,7 @@ type Raft struct {
 
 	// Coordination & lifecycle
 	commitCallback func(LogEntry) error
-	leaderCallback func(GroupID, string)
+	leaderCallback func(GroupID, string, uint64)
 	stopCh         chan struct{}
 	stoppedCh      chan struct{}
 	applyCond      *sync.Cond
@@ -220,7 +220,7 @@ func (r *Raft) LeaderID() string {
 }
 
 // SetLeaderCallback dynamically registers a callback invoked when leadership changes.
-func (r *Raft) SetLeaderCallback(cb func(GroupID, string)) {
+func (r *Raft) SetLeaderCallback(cb func(GroupID, string, uint64)) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.leaderCallback = cb
@@ -515,7 +515,8 @@ func (r *Raft) notifyLeaderChangeLocked(newLeader string) {
 	}
 	cb := r.leaderCallback
 	gid := r.groupID
-	go cb(gid, newLeader)
+	term := r.currentTerm
+	go cb(gid, newLeader, term)
 }
 
 // stepDownLocked transitions the node to Follower for a new, higher term.
