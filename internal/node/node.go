@@ -7,12 +7,14 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
 	"orbit/internal/api"
 	"orbit/internal/database"
 	"orbit/internal/raft"
+	"orbit/internal/router"
 	"orbit/internal/sharding"
 	"orbit/internal/storage"
 )
@@ -244,14 +246,33 @@ func (n *Node) Start() error {
 		return fmt.Errorf("start transport: %w", err)
 	}
 
-	// 2. Start all hosted shard Raft replicas
-	for sid, replica := range n.shards {
+	// 2. Start all hosted shard Raft replicas in deterministic order
+	shardIDs := make([]sharding.ShardID, 0, len(n.shards))
+	for sid := range n.shards {
+		shardIDs = append(shardIDs, sid)
+	}
+	sort.Slice(shardIDs, func(i, j int) bool {
+		return shardIDs[i] < shardIDs[j]
+	})
+
+	for _, sid := range shardIDs {
+		replica := n.shards[sid]
 		if err := replica.Start(); err != nil {
+			// Roll back and stop all shard replicas to release resources
+			for _, s := range n.shards {
+				_ = s.Stop()
+			}
+			// Close the transport that was opened in step 1.
+			_ = n.transport.Close()
+			// Mark node as closed so callers know it is unusable.
+			n.closed = true
 			return fmt.Errorf("start shard %s: %w", sid, err)
 		}
 	}
 	if n.raft != nil && len(n.shards) == 0 {
 		if err := n.raft.Start(); err != nil {
+			_ = n.transport.Close()
+			n.closed = true
 			return fmt.Errorf("start raft: %w", err)
 		}
 	}
@@ -326,6 +347,17 @@ func (n *Node) Shards() map[sharding.ShardID]*ShardReplica {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	res := make(map[sharding.ShardID]*ShardReplica, len(n.shards))
+	for k, v := range n.shards {
+		res[k] = v
+	}
+	return res
+}
+
+// ShardInstances returns a map of hosted shard replicas satisfying router.ShardInstance.
+func (n *Node) ShardInstances() map[sharding.ShardID]router.ShardInstance {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	res := make(map[sharding.ShardID]router.ShardInstance, len(n.shards))
 	for k, v := range n.shards {
 		res[k] = v
 	}

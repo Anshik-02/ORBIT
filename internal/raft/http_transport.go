@@ -61,6 +61,9 @@ func (t *HTTPTransport) RegisterHandler(groupID GroupID, handler RPCHandler) err
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	if t.closed {
+		return ErrTransportClosed
+	}
 	if t.handlers == nil {
 		t.handlers = make(map[GroupID]RPCHandler)
 	}
@@ -142,6 +145,7 @@ func (t *HTTPTransport) Close() error {
 		defer cancel()
 		_ = t.server.Shutdown(ctx)
 	}
+	t.client.CloseIdleConnections()
 	return nil
 }
 

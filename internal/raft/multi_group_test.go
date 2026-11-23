@@ -42,20 +42,22 @@ func TestMultiGroup_IndependentElections(t *testing.T) {
 		peerAddrs[id] = id
 	}
 
-	// Drop votes for Node A initially so Group 0 elects Node B or C, and Group 1 elects Node D or E.
-	// This deterministically exercises having different leaders across groups.
-	net.DropVotes("node-a", true)
-
 	nodes := make(map[string]*node.Node)
 	for _, id := range allNodes {
+		minTimeout := 250 * time.Millisecond
+		maxTimeout := 350 * time.Millisecond
+		if id == "node-b" || id == "node-d" {
+			minTimeout = 40 * time.Millisecond
+			maxTimeout = 80 * time.Millisecond
+		}
 		cfg := node.NodeConfig{
 			ID:                 id,
 			Address:            "127.0.0.1:0",
 			RaftAddress:        "127.0.0.1:0",
 			DataDir:            filepath.Join(baseDir, id),
-			HeartbeatInterval:  30 * time.Millisecond,
-			ElectionTimeoutMin: 100 * time.Millisecond,
-			ElectionTimeoutMax: 200 * time.Millisecond,
+			HeartbeatInterval:  20 * time.Millisecond,
+			ElectionTimeoutMin: minTimeout,
+			ElectionTimeoutMax: maxTimeout,
 		}
 		// Node A has one shared transport instance used for both Group 0 and Group 1
 		tr := net.CreateTransport(id)
@@ -110,9 +112,6 @@ func TestMultiGroup_IndependentElections(t *testing.T) {
 		t.Fatalf("expected different leaders for Group 0 and Group 1, got same leader %s", leader0)
 	}
 	t.Logf("Group 0 leader: %s, Group 1 leader: %s", leader0, leader1)
-
-	// Re-enable votes for Node A now that leaders are elected
-	net.DropVotes("node-a", false)
 
 	replica0, _ := nodes[leader0].Shard(0)
 	replica1, _ := nodes[leader1].Shard(1)
@@ -577,6 +576,73 @@ func TestMultiGroup_TermIsolation(t *testing.T) {
 	}
 	if shard1.Raft().CurrentTerm() != 3 {
 		t.Errorf("TERM ISOLATION VIOLATION: Group 1 term changed to %d, expected 3", shard1.Raft().CurrentTerm())
+	}
+}
+
+// TestMultiGroup_PartialStartupCleanup verifies Task 5:
+// If a node hosts 3 shards and shard 2 fails to start, the node cleanly stops
+// shards 0 and 1, closes the shared transport, and marks the node as closed.
+func TestMultiGroup_PartialStartupCleanup(t *testing.T) {
+	t.Parallel()
+
+	net := raft.NewMockNetwork()
+	baseDir := t.TempDir()
+
+	allNodes := []string{"node-a"}
+	meta := sharding.NewClusterMetadata("orbit-multi-test", 1, 3, 1, allNodes)
+	_ = meta.AddShard(&sharding.ShardInfo{ID: 0, Replicas: []string{"node-a"}})
+	_ = meta.AddShard(&sharding.ShardInfo{ID: 1, Replicas: []string{"node-a"}})
+	_ = meta.AddShard(&sharding.ShardInfo{ID: 2, Replicas: []string{"node-a"}})
+
+	peerAddrs := map[string]string{
+		"node-a": "node-a",
+	}
+
+	cfgA := node.NodeConfig{
+		ID:                 "node-a",
+		Address:            "127.0.0.1:0",
+		RaftAddress:        "127.0.0.1:0",
+		DataDir:            filepath.Join(baseDir, "node-a"),
+		HeartbeatInterval:  30 * time.Millisecond,
+		ElectionTimeoutMin: 100 * time.Millisecond,
+		ElectionTimeoutMax: 200 * time.Millisecond,
+	}
+
+	trA := net.CreateTransport("node-a")
+	nodeA, err := node.NewShardedNode(cfgA, meta, peerAddrs, trA)
+	if err != nil {
+		t.Fatalf("NewShardedNode: %v", err)
+	}
+
+	shard0, ok0 := nodeA.Shard(0)
+	shard1, ok1 := nodeA.Shard(1)
+	shard2, ok2 := nodeA.Shard(2)
+	if !ok0 || !ok1 || !ok2 {
+		t.Fatalf("expected node-a to host shards 0, 1, and 2")
+	}
+
+	// Deliberately stop shard 2 before starting nodeA so that shard2.Start() fails with ErrStopped
+	if err := shard2.Stop(); err != nil {
+		t.Fatalf("shard2.Stop(): %v", err)
+	}
+
+	// Starting nodeA must fail because shard 2 cannot start
+	errStart := nodeA.Start()
+	if errStart == nil {
+		t.Fatal("expected nodeA.Start() to fail, got nil")
+	}
+
+	// Verify that shards 0 and 1 were rolled back and stopped
+	if err := shard0.Start(); !errors.Is(err, raft.ErrStopped) {
+		t.Errorf("expected shard 0 to be stopped, got %v", err)
+	}
+	if err := shard1.Start(); !errors.Is(err, raft.ErrStopped) {
+		t.Errorf("expected shard 1 to be stopped, got %v", err)
+	}
+
+	// Verify node is marked closed
+	if err := nodeA.Start(); err == nil {
+		t.Error("expected subsequent nodeA.Start() to return closed error, got nil")
 	}
 }
 

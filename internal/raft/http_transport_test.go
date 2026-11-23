@@ -295,3 +295,172 @@ func TestHTTPTransport_ConcurrentOperations(t *testing.T) {
 
 	wg.Wait()
 }
+
+// TestHTTPTransport_ConcurrentStress is a more intensive stress test with higher goroutine counts.
+// It concurrently sends 50 vote requests to static-0, 50 AppendEntries requests to static-1,
+// and concurrently registers/unregisters 20 dynamic handlers — all under -race.
+func TestHTTPTransport_ConcurrentStress(t *testing.T) {
+	t.Parallel()
+
+	transport := NewHTTPTransport("127.0.0.1:0")
+
+	h0 := &mockIsolationHandler{}
+	h1 := &mockIsolationHandler{}
+	_ = transport.RegisterHandler(GroupID("static-0"), h0)
+	_ = transport.RegisterHandler(GroupID("static-1"), h1)
+
+	if err := transport.Start(); err != nil {
+		t.Fatalf("transport.Start() failed: %v", err)
+	}
+	defer transport.Close()
+
+	client := NewHTTPTransport("127.0.0.1:0")
+	var wg sync.WaitGroup
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// 50 goroutines each sending 1 vote request to static-0
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			_, _ = client.SendRequestVote(ctx, transport.Addr(), GroupID("static-0"), &RequestVoteRequest{
+				Term:        uint64(n + 1),
+				CandidateID: fmt.Sprintf("stress-cand-%d", n),
+			})
+		}(i)
+	}
+
+	// 50 goroutines each sending 1 AppendEntries request to static-1
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			_, _ = client.SendAppendEntries(ctx, transport.Addr(), GroupID("static-1"), &AppendEntriesRequest{
+				Term:     uint64(n + 1),
+				LeaderID: fmt.Sprintf("stress-leader-%d", n),
+			})
+		}(i)
+	}
+
+	// 20 goroutines each registering a unique dynamic handler then unregistering it
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			dynGroup := GroupID(fmt.Sprintf("stress-dyn-%d", n))
+			_ = transport.RegisterHandler(dynGroup, &mockIsolationHandler{})
+			_, _ = client.SendRequestVote(ctx, transport.Addr(), dynGroup, &RequestVoteRequest{Term: 1})
+			transport.UnregisterHandler(dynGroup)
+			_, _ = client.SendRequestVote(ctx, transport.Addr(), dynGroup, &RequestVoteRequest{Term: 2})
+		}(i)
+	}
+
+	wg.Wait()
+}
+
+// TestHTTPTransport_StartIdempotent verifies that calling Start() twice returns no error.
+func TestHTTPTransport_StartIdempotent(t *testing.T) {
+	t.Parallel()
+
+	tr := NewHTTPTransport("127.0.0.1:0")
+	if err := tr.Start(); err != nil {
+		t.Fatalf("first Start() failed: %v", err)
+	}
+	defer tr.Close()
+
+	if err := tr.Start(); err != nil {
+		t.Fatalf("second Start() should be idempotent, got error: %v", err)
+	}
+}
+
+// TestHTTPTransport_CloseIdempotent verifies that calling Close() twice returns no error.
+func TestHTTPTransport_CloseIdempotent(t *testing.T) {
+	t.Parallel()
+
+	tr := NewHTTPTransport("127.0.0.1:0")
+	if err := tr.Start(); err != nil {
+		t.Fatalf("Start() failed: %v", err)
+	}
+
+	if err := tr.Close(); err != nil {
+		t.Fatalf("first Close() failed: %v", err)
+	}
+	if err := tr.Close(); err != nil {
+		t.Fatalf("second Close() should be idempotent, got error: %v", err)
+	}
+}
+
+// TestHTTPTransport_StartAfterClose verifies that calling Start() after Close() returns an error.
+func TestHTTPTransport_StartAfterClose(t *testing.T) {
+	t.Parallel()
+
+	tr := NewHTTPTransport("127.0.0.1:0")
+	if err := tr.Start(); err != nil {
+		t.Fatalf("Start() failed: %v", err)
+	}
+	if err := tr.Close(); err != nil {
+		t.Fatalf("Close() failed: %v", err)
+	}
+
+	err := tr.Start()
+	if err == nil {
+		t.Fatal("expected error from Start() after Close(), got nil")
+	}
+}
+
+// TestHTTPTransport_RegisterAfterClose verifies that registering a handler after Close()
+// returns ErrTransportClosed.
+func TestHTTPTransport_RegisterAfterClose(t *testing.T) {
+	t.Parallel()
+
+	tr := NewHTTPTransport("127.0.0.1:0")
+	if err := tr.Start(); err != nil {
+		t.Fatalf("Start() failed: %v", err)
+	}
+	if err := tr.Close(); err != nil {
+		t.Fatalf("Close() failed: %v", err)
+	}
+
+	err := tr.RegisterHandler(GroupID("post-close-group"), &mockIsolationHandler{})
+	if err == nil {
+		t.Fatal("expected ErrTransportClosed when registering after Close(), got nil")
+	}
+	if !errors.Is(err, ErrTransportClosed) {
+		t.Fatalf("expected ErrTransportClosed, got: %v", err)
+	}
+}
+
+// TestHTTPTransport_CloseIdleConnections verifies that Close() calls CloseIdleConnections()
+// on the HTTP client (no panic, no error; subsequent operations on a fresh transport still work).
+func TestHTTPTransport_CloseIdleConnections(t *testing.T) {
+	t.Parallel()
+
+	// Start a server transport and register a handler.
+	server := NewHTTPTransport("127.0.0.1:0")
+	h := &mockIsolationHandler{}
+	_ = server.RegisterHandler(GroupID("idle-group"), h)
+	if err := server.Start(); err != nil {
+		t.Fatalf("server Start() failed: %v", err)
+	}
+	defer server.Close()
+
+	// Use a client transport to make a successful request (creates idle connections).
+	client := NewHTTPTransport("127.0.0.1:0")
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	_, err := client.SendRequestVote(ctx, server.Addr(), GroupID("idle-group"), &RequestVoteRequest{
+		Term:        1,
+		CandidateID: "idle-test-cand",
+	})
+	if err != nil {
+		t.Fatalf("SendRequestVote failed: %v", err)
+	}
+
+	// Close the client transport — this must call CloseIdleConnections() without panicking.
+	if err := client.Close(); err != nil {
+		t.Fatalf("client.Close() failed: %v", err)
+	}
+}
