@@ -35,9 +35,15 @@ type ringToken struct {
 //
 // # Duplicate token positions
 //
-// SHA-256 collisions at the uint64 prefix are astronomically unlikely but handled
-// deterministically: when two tokens land on the same position, the one with the
-// lower ShardID wins.  This keeps lookup results stable across restarts.
+// All tokens are retained, even when two tokens for different shards hash to the
+// same position.  The token slice is sorted first by hash, then by ShardID as a
+// deterministic tie-breaker.  Binary search finds the first token whose hash is
+// >= the key hash; at any collision position the lower ShardID is visited first.
+//
+// This design is critical for correctness: if the token at a colliding position
+// were silently dropped, removing the other shard could orphan keys that depended
+// on the dropped token.  By keeping all tokens, RemoveShard removes only that
+// shard's own tokens and never affects any other shard's coverage.
 //
 // # Concurrency
 //
@@ -170,7 +176,8 @@ func (r *HashRing) Shards() []ShardID {
 }
 
 // TokenCount returns the total number of virtual-node tokens on the ring.
-// Useful for diagnostics and uniformity analysis.
+// When two shards produce tokens at the same hash position, both tokens are
+// present in the slice.  Useful for diagnostics and uniformity analysis.
 func (r *HashRing) TokenCount() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -200,7 +207,12 @@ func hashKey(key string) uint64 {
 }
 
 // mergeTokens merges two sorted slices of ringTokens into a single sorted slice.
-// On hash collision the token with the smaller ShardID wins (deterministic tie-break).
+//
+// Sort order: ascending hash, then ascending ShardID as a deterministic tie-breaker.
+//
+// All tokens are retained — even when two tokens have identical hashes.  Deduplication
+// is intentionally avoided so that removing one shard's token never silently drops a
+// token that belongs to a different shard at the same position.
 func mergeTokens(existing, incoming []ringToken) []ringToken {
 	merged := make([]ringToken, 0, len(existing)+len(incoming))
 	merged = append(merged, existing...)
@@ -210,17 +222,9 @@ func mergeTokens(existing, incoming []ringToken) []ringToken {
 		if merged[i].hash != merged[j].hash {
 			return merged[i].hash < merged[j].hash
 		}
-		// deterministic tie-break: lower ShardID wins
+		// deterministic tie-break: lower ShardID sorts first
 		return merged[i].shardID < merged[j].shardID
 	})
 
-	// Deduplicate exact hash collisions — keep only the lower ShardID token.
-	deduped := merged[:0]
-	for idx, t := range merged {
-		if idx == 0 || merged[idx-1].hash != t.hash {
-			deduped = append(deduped, t)
-		}
-	}
-
-	return deduped
+	return merged
 }

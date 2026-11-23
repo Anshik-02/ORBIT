@@ -1,0 +1,31 @@
+{
+  "id": "node-e",
+  "address": "127.0.0.1:2529",
+  "raft_address": "127.0.0.1:3529",
+  "data_dir": "data/node-e",
+  "heartbeat_interval": "50ms",
+  "election_timeout_min": "150ms",
+  "election_timeout_max": "300ms",
+  "peers": [
+    {
+      "id": "node-a",
+      "address": "127.0.0.1:2525",
+      "raft_address": "127.0.0.1:3525"
+    },
+    {
+      "id": "node-b",
+      "address": "127.0.0.1:2526",
+      "raft_address": "127.0.0.1:3526"
+    },
+    {
+      "id": "node-c",
+      "address": "127.0.0.1:2527",
+      "raft_address": "127.0.0.1:3527"
+    },
+    {
+      "id": "node-d",
+      "address": "127.0.0.1:2528",
+      "raft_address": "127.0.0.1:3528"
+    }
+  ]
+}

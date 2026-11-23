@@ -1,0 +1,39 @@
+{
+  "cluster_id": "orbit-cluster-01",
+  "epoch": 1,
+  "shard_count": 3,
+  "replication_factor": 3,
+  "physical_nodes": [
+    "node-a",
+    "node-b",
+    "node-c",
+    "node-d",
+    "node-e"
+  ],
+  "shards": [
+    {
+      "id": 0,
+      "replicas": [
+        "node-a",
+        "node-b",
+        "node-c"
+      ]
+    },
+    {
+      "id": 1,
+      "replicas": [
+        "node-d",
+        "node-e",
+        "node-a"
+      ]
+    },
+    {
+      "id": 2,
+      "replicas": [
+        "node-b",
+        "node-c",
+        "node-d"
+      ]
+    }
+  ]
+}

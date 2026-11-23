@@ -375,22 +375,22 @@ func (m *mockBlockingEngine) Set(k, v string) error {
 	close(m.opEnded)
 	return nil
 }
-func (m *mockBlockingEngine) Get(k string) (string, bool)                         { return "", false }
-func (m *mockBlockingEngine) Delete(k string) error                               { return nil }
-func (m *mockBlockingEngine) ApplyCommitted(cmd storage.CommittedCommand) error   { return nil }
-func (m *mockBlockingEngine) Close() error                                        { return nil }
-func (m *mockBlockingEngine) Health() error                                       { return nil }
+func (m *mockBlockingEngine) Get(k string) (string, bool)                       { return "", false }
+func (m *mockBlockingEngine) Delete(k string) error                             { return nil }
+func (m *mockBlockingEngine) ApplyCommitted(cmd storage.CommittedCommand) error { return nil }
+func (m *mockBlockingEngine) Close() error                                      { return nil }
+func (m *mockBlockingEngine) Health() error                                     { return nil }
 
 type mockFailingEngine struct {
 	closeErr error
 }
 
-func (m *mockFailingEngine) Set(k, v string) error                         { return nil }
-func (m *mockFailingEngine) Get(k string) (string, bool)                   { return "", false }
-func (m *mockFailingEngine) Delete(k string) error                         { return nil }
+func (m *mockFailingEngine) Set(k, v string) error                             { return nil }
+func (m *mockFailingEngine) Get(k string) (string, bool)                       { return "", false }
+func (m *mockFailingEngine) Delete(k string) error                             { return nil }
 func (m *mockFailingEngine) ApplyCommitted(cmd storage.CommittedCommand) error { return nil }
-func (m *mockFailingEngine) Close() error                                  { return m.closeErr }
-func (m *mockFailingEngine) Health() error                                 { return nil }
+func (m *mockFailingEngine) Close() error                                      { return m.closeErr }
+func (m *mockFailingEngine) Health() error                                     { return nil }
 
 // TestRaftAppliedIndexRecoveredAfterRestart verifies that Raft consensus progress
 // is persisted in the WAL and fully restored upon restart, enabling idempotency.
