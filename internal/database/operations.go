@@ -79,3 +79,25 @@ func (db *Database) Health() error {
 	}
 	return db.engine.Health()
 }
+
+// ExportSnapshotBytes serializes the underlying state machine's key-value data with its applied Raft index.
+func (db *Database) ExportSnapshotBytes() (uint64, []byte, error) {
+	db.closeMu.RLock()
+	defer db.closeMu.RUnlock()
+
+	if db.closed {
+		return 0, nil, ErrClosed
+	}
+	return db.engine.ExportSnapshotBytes()
+}
+
+// RestoreSnapshotBytes restores the state machine to snapshot state.
+func (db *Database) RestoreSnapshotBytes(meta storage.SnapshotMetadata, data []byte) error {
+	db.closeMu.RLock()
+	defer db.closeMu.RUnlock()
+
+	if db.closed {
+		return ErrClosed
+	}
+	return db.engine.RestoreSnapshotBytes(meta, data)
+}

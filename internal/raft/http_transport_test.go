@@ -36,6 +36,14 @@ func (m *mockIsolationHandler) HandleAppendEntries(ctx context.Context, req *App
 	}, nil
 }
 
+func (m *mockIsolationHandler) HandleInstallSnapshot(ctx context.Context, req *InstallSnapshotRequest) (*InstallSnapshotResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return &InstallSnapshotResponse{
+		Term: req.Term,
+	}, nil
+}
+
 func (m *mockIsolationHandler) VoteCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()

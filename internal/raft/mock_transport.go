@@ -188,3 +188,43 @@ func (t *MockTransport) SendAppendEntries(ctx context.Context, target string, gr
 
 	return handler.HandleAppendEntries(ctx, req)
 }
+
+func (t *MockTransport) SendInstallSnapshot(ctx context.Context, target string, groupID GroupID, req *InstallSnapshotRequest) (*InstallSnapshotResponse, error) {
+	t.mu.RLock()
+	if t.closed {
+		t.mu.RUnlock()
+		return nil, ErrTransportClosed
+	}
+	t.mu.RUnlock()
+
+	if groupID == "" {
+		groupID = DefaultGroupID
+	}
+
+	t.network.mu.RLock()
+	targetNode, exists := t.network.nodes[target]
+	if !exists {
+		t.network.mu.RUnlock()
+		return nil, fmt.Errorf("%w: %s", ErrNodeNotFound, target)
+	}
+
+	if t.network.isolated[t.nodeID] || t.network.isolated[targetNode.nodeID] {
+		t.network.mu.RUnlock()
+		return nil, ErrNetworkPartition
+	}
+	t.network.mu.RUnlock()
+
+	targetNode.mu.RLock()
+	handler := targetNode.handlers[groupID]
+	targetClosed := targetNode.closed
+	targetNode.mu.RUnlock()
+
+	if targetClosed {
+		return nil, ErrNetworkPartition
+	}
+	if handler == nil {
+		return nil, fmt.Errorf("%w: group %s on target %s", ErrGroupNotFound, groupID, target)
+	}
+
+	return handler.HandleInstallSnapshot(ctx, req)
+}

@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -25,6 +26,19 @@ type Config struct {
 	// Set this to engine.LastAppliedIndex() so the applyLoop skips already-applied entries
 	// after a node restart, preventing duplicate state-machine application.
 	InitialLastApplied uint64
+
+	// SnapshotCallback captures state machine state for log compaction.
+	SnapshotCallback func() ([]byte, error)
+
+	// SnapshotRestoreCallback restores state machine state when an InstallSnapshot RPC is received.
+	SnapshotRestoreCallback func(SnapshotMetadata, []byte) error
+}
+
+type snapshotAssembly struct {
+	lastIncludedIndex uint64
+	lastIncludedTerm  uint64
+	data              []byte
+	lastOffset        int64
 }
 
 // Raft implements a consensus engine following the Raft consensus algorithm.
@@ -69,10 +83,13 @@ type Raft struct {
 	lastHeartbeat      time.Time
 
 	// Coordination & lifecycle
-	commitCallback func(LogEntry) error
-	leaderCallback func(GroupID, string, uint64)
-	stopCh         chan struct{}
-	stoppedCh      chan struct{}
+	commitCallback          func(LogEntry) error
+	leaderCallback          func(GroupID, string, uint64)
+	snapshotCallback        func() ([]byte, error)
+	snapshotRestoreCallback func(SnapshotMetadata, []byte) error
+	snapshotAssembly        *snapshotAssembly
+	stopCh                  chan struct{}
+	stoppedCh               chan struct{}
 	applyCond      *sync.Cond
 	rng            *rand.Rand
 	started        bool
@@ -121,9 +138,11 @@ func New(cfg Config) (*Raft, error) {
 		heartbeatInterval:  cfg.HeartbeatInterval,
 		electionTimeoutMin: cfg.ElectionTimeoutMin,
 		electionTimeoutMax: cfg.ElectionTimeoutMax,
-		commitCallback:     cfg.CommitCallback,
-		leaderCallback:     cfg.LeaderCallback,
-		nextIndex:          make(map[string]uint64),
+		commitCallback:          cfg.CommitCallback,
+		leaderCallback:          cfg.LeaderCallback,
+		snapshotCallback:        cfg.SnapshotCallback,
+		snapshotRestoreCallback: cfg.SnapshotRestoreCallback,
+		nextIndex:               make(map[string]uint64),
 		matchIndex:         make(map[string]uint64),
 		peerLastContact:    make(map[string]time.Time),
 		stopCh:             make(chan struct{}),
@@ -730,14 +749,21 @@ func (r *Raft) broadcastAppendEntriesLocked(isHeartbeat bool) {
 	term := r.currentTerm
 	leaderID := r.id
 	leaderCommit := r.commitIndex
+	firstIndex := r.storage.FirstIndex()
 
 	for peerID, peerAddr := range r.peers {
 		nextIdx := r.nextIndex[peerID]
 		if nextIdx == 0 {
 			nextIdx = 1
 		}
-		prevLogIndex := nextIdx - 1
 
+		if nextIdx <= firstIndex {
+			// Follower is behind the compacted log boundary; stream snapshot
+			go r.sendInstallSnapshotToPeer(peerID, peerAddr, term)
+			continue
+		}
+
+		prevLogIndex := nextIdx - 1
 		prevEntry, ok := r.storage.GetEntry(prevLogIndex)
 		var prevLogTerm uint64
 		if ok {
@@ -809,6 +835,13 @@ func (r *Raft) sendAppendEntriesToPeer(peerID, peerAddr string, req *AppendEntri
 			r.nextIndex[peerID]--
 		}
 
+		firstIndex := r.storage.FirstIndex()
+		if r.nextIndex[peerID] <= firstIndex {
+			// Next index fell behind the compacted log boundary; stream snapshot
+			go r.sendInstallSnapshotToPeer(peerID, peerAddr, r.currentTerm)
+			return
+		}
+
 		// If entries are still pending for this peer, trigger immediate retry
 		lastIndex, _ := r.storage.LastLogInfo()
 		if r.nextIndex[peerID] <= lastIndex {
@@ -826,6 +859,82 @@ func (r *Raft) sendAppendEntriesToPeer(peerID, peerAddr string, req *AppendEntri
 			}
 			go r.sendAppendEntriesToPeer(peerID, peerAddr, retryReq, r.currentTerm)
 		}
+	}
+}
+
+// sendInstallSnapshotToPeer streams snapshot data chunks to a lagging follower (Section 7).
+func (r *Raft) sendInstallSnapshotToPeer(peerID, peerAddr string, term uint64) {
+	snap, err := r.storage.GetSnapshot()
+	if err != nil || snap == nil {
+		return
+	}
+
+	const chunkSize = 512 * 1024 // 512KB chunks
+	data := snap.Data
+	dataLen := int64(len(data))
+	var offset int64 = 0
+
+	for {
+		end := offset + chunkSize
+		done := false
+		if end >= dataLen {
+			end = dataLen
+			done = true
+		}
+
+		chunk := data[offset:end]
+		req := &InstallSnapshotRequest{
+			Term:              term,
+			LeaderID:          r.id,
+			LastIncludedIndex: snap.Metadata.LastIncludedIndex,
+			LastIncludedTerm:  snap.Metadata.LastIncludedTerm,
+			Offset:            offset,
+			Data:              chunk,
+			Done:              done,
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), r.heartbeatInterval*5)
+		resp, err := r.transport.SendInstallSnapshot(ctx, peerAddr, r.groupID, req)
+		cancel()
+
+		if err != nil {
+			return
+		}
+
+		r.mu.Lock()
+		r.peerLastContact[peerID] = time.Now()
+
+		if resp.Term > r.currentTerm {
+			if err := r.stepDownLocked(resp.Term); err != nil {
+				r.storageErr = err
+			}
+			r.mu.Unlock()
+			return
+		}
+
+		if r.role != Leader || r.currentTerm != term || r.storageErr != nil {
+			r.mu.Unlock()
+			return
+		}
+
+		if done {
+			if snap.Metadata.LastIncludedIndex > r.matchIndex[peerID] {
+				r.matchIndex[peerID] = snap.Metadata.LastIncludedIndex
+			}
+			r.nextIndex[peerID] = r.matchIndex[peerID] + 1
+			r.checkAndUpdateCommitIndexLocked()
+
+			// If follower still needs uncompacted log entries, trigger replication
+			lastLogIndex, _ := r.storage.LastLogInfo()
+			if r.nextIndex[peerID] <= lastLogIndex {
+				r.broadcastAppendEntriesLocked(false)
+			}
+			r.mu.Unlock()
+			return
+		}
+
+		r.mu.Unlock()
+		offset = end
 	}
 }
 
@@ -877,6 +986,12 @@ func (r *Raft) applyLoop() {
 		nextIndex := r.lastApplied + 1
 		entry, ok := r.storage.GetEntry(nextIndex)
 		if !ok {
+			firstIdx := r.storage.FirstIndex()
+			if nextIndex <= firstIdx {
+				r.lastApplied = firstIdx
+				r.mu.Unlock()
+				continue
+			}
 			r.applyErr = fmt.Errorf("raft: committed entry at index %d not found in storage", nextIndex)
 			r.applyCond.Broadcast()
 			r.mu.Unlock()
@@ -1018,6 +1133,16 @@ func (r *Raft) HandleAppendEntries(ctx context.Context, req *AppendEntriesReques
 
 	// 3. Log consistency check: Reply false if log doesn't contain an entry at
 	// prevLogIndex matching prevLogTerm (Section 5.3)
+	firstLogIndex := r.storage.FirstIndex()
+	if req.PrevLogIndex < firstLogIndex {
+		return &AppendEntriesResponse{
+			Term:          r.currentTerm,
+			Success:       false,
+			ConflictIndex: firstLogIndex + 1,
+			ConflictTerm:  0,
+		}, nil
+	}
+
 	lastLogIndex, _ := r.storage.LastLogInfo()
 	if req.PrevLogIndex > lastLogIndex {
 		// Follower log is shorter than leader's prevLogIndex
@@ -1034,8 +1159,8 @@ func (r *Raft) HandleAppendEntries(ctx context.Context, req *AppendEntriesReques
 		if !ok || prevEntry.Term != req.PrevLogTerm {
 			// Term mismatch at prevLogIndex: find first index for conflicting term
 			conflictTerm := prevEntry.Term
-			var conflictIdx uint64 = 1
-			for i := req.PrevLogIndex; i >= 1; i-- {
+			conflictIdx := firstLogIndex + 1
+			for i := req.PrevLogIndex; i > firstLogIndex; i-- {
 				if e, found := r.storage.GetEntry(i); found && e.Term == conflictTerm {
 					conflictIdx = i
 				} else {
@@ -1097,4 +1222,242 @@ func (r *Raft) HandleAppendEntries(ctx context.Context, req *AppendEntriesReques
 		Term:    r.currentTerm,
 		Success: true,
 	}, nil
+}
+
+// HandleInstallSnapshot processes inbound InstallSnapshot RPCs from leaders (Section 7).
+func (r *Raft) HandleInstallSnapshot(ctx context.Context, req *InstallSnapshotRequest) (*InstallSnapshotResponse, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if req.LeaderID != "" {
+		r.peerLastContact[req.LeaderID] = time.Now()
+	}
+
+	if r.storageErr != nil {
+		return nil, fmt.Errorf("%w: %w", ErrStorageHalted, r.storageErr)
+	}
+
+	// 1. Reply immediately if req.Term < currentTerm
+	if req.Term < r.currentTerm {
+		return &InstallSnapshotResponse{
+			Term: r.currentTerm,
+		}, nil
+	}
+
+	// 2. If req.Term > currentTerm, step down to Follower
+	if req.Term > r.currentTerm {
+		if err := r.stepDownLocked(req.Term); err != nil {
+			r.storageErr = err
+			return &InstallSnapshotResponse{
+				Term: r.currentTerm,
+			}, fmt.Errorf("step down to term %d: %w", req.Term, err)
+		}
+	} else if r.role == Candidate {
+		r.role = Follower
+	}
+	prevLeader := r.leaderID
+	r.leaderID = req.LeaderID
+	if req.LeaderID != "" && req.LeaderID != prevLeader {
+		r.notifyLeaderChangeLocked(req.LeaderID)
+	}
+
+	// Valid heartbeat recognized: reset election timer
+	r.lastHeartbeat = time.Now()
+
+	// If snapshot is already behind our applied state, reply success without re-installing
+	if req.LastIncludedIndex <= r.lastApplied {
+		return &InstallSnapshotResponse{
+			Term: r.currentTerm,
+		}, nil
+	}
+
+	// Chunk assembly
+	if req.Offset == 0 {
+		r.snapshotAssembly = &snapshotAssembly{
+			lastIncludedIndex: req.LastIncludedIndex,
+			lastIncludedTerm:  req.LastIncludedTerm,
+			data:              make([]byte, 0, len(req.Data)),
+		}
+	}
+
+	if r.snapshotAssembly == nil || r.snapshotAssembly.lastIncludedIndex != req.LastIncludedIndex {
+		return &InstallSnapshotResponse{
+			Term: r.currentTerm,
+		}, nil
+	}
+
+	r.snapshotAssembly.data = append(r.snapshotAssembly.data, req.Data...)
+	r.snapshotAssembly.lastOffset += int64(len(req.Data))
+
+	if !req.Done {
+		return &InstallSnapshotResponse{
+			Term: r.currentTerm,
+		}, nil
+	}
+
+	// Full snapshot data assembled
+	fullData := r.snapshotAssembly.data
+	r.snapshotAssembly = nil
+
+	meta := SnapshotMetadata{
+		Version:           SnapshotCurrentVersion,
+		GroupID:           r.groupID,
+		LastIncludedIndex: req.LastIncludedIndex,
+		LastIncludedTerm:  req.LastIncludedTerm,
+		CreatedAt:         time.Now(),
+		Size:              int64(len(fullData)),
+		Checksum:          ComputeSnapshotChecksum(fullData),
+	}
+
+	// 1. Durably persist snapshot
+	if err := r.storage.SaveSnapshot(meta, fullData); err != nil {
+		r.storageErr = fmt.Errorf("install snapshot save: %w", err)
+		return nil, r.storageErr
+	}
+
+	// 2. Discard/compact Raft log
+	if err := r.storage.CompactLog(req.LastIncludedIndex, req.LastIncludedTerm); err != nil {
+		r.storageErr = fmt.Errorf("install snapshot compact log: %w", err)
+		return nil, r.storageErr
+	}
+
+	// 3. Reset state machine
+	if r.snapshotRestoreCallback != nil {
+		if err := r.snapshotRestoreCallback(meta, fullData); err != nil {
+			r.applyErr = fmt.Errorf("install snapshot restore state machine: %w", err)
+			return nil, r.applyErr
+		}
+	}
+
+	// 4. Advance commitIndex and lastApplied
+	if req.LastIncludedIndex > r.commitIndex {
+		r.commitIndex = req.LastIncludedIndex
+	}
+	if req.LastIncludedIndex > r.lastApplied {
+		r.lastApplied = req.LastIncludedIndex
+	}
+	r.applyCond.Broadcast()
+
+	return &InstallSnapshotResponse{
+		Term: r.currentTerm,
+	}, nil
+}
+
+// CreateSnapshot creates and persists a snapshot with provided data up to appliedIndex,
+// compacting obsolete Raft log entries.
+func (r *Raft) CreateSnapshot(appliedIndex uint64, data []byte) (*SnapshotMetadata, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.closed {
+		return nil, ErrStopped
+	}
+	if r.storageErr != nil {
+		return nil, fmt.Errorf("%w: %w", ErrStorageHalted, r.storageErr)
+	}
+
+	firstIndex := r.storage.FirstIndex()
+	if appliedIndex <= firstIndex {
+		return nil, fmt.Errorf("%w: snapshot index %d <= first log index %d", ErrSnapshotBehind, appliedIndex, firstIndex)
+	}
+
+	entry, ok := r.storage.GetEntry(appliedIndex)
+	if !ok {
+		return nil, fmt.Errorf("raft: entry at applied index %d not found", appliedIndex)
+	}
+
+	meta := SnapshotMetadata{
+		Version:           SnapshotCurrentVersion,
+		GroupID:           r.groupID,
+		LastIncludedIndex: appliedIndex,
+		LastIncludedTerm:  entry.Term,
+		CreatedAt:         time.Now(),
+		Size:              int64(len(data)),
+		Checksum:          ComputeSnapshotChecksum(data),
+	}
+
+	if err := r.storage.SaveSnapshot(meta, data); err != nil {
+		r.storageErr = err
+		return nil, fmt.Errorf("save snapshot: %w", err)
+	}
+
+	if err := r.storage.CompactLog(appliedIndex, entry.Term); err != nil {
+		r.storageErr = err
+		return nil, fmt.Errorf("compact log: %w", err)
+	}
+
+	return &meta, nil
+}
+
+// TakeSnapshot captures a snapshot of the current state machine up to lastApplied
+// using the registered SnapshotCallback and compacts the Raft log.
+func (r *Raft) TakeSnapshot() (*SnapshotMetadata, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.closed {
+		return nil, ErrStopped
+	}
+	if r.storageErr != nil {
+		return nil, fmt.Errorf("%w: %w", ErrStorageHalted, r.storageErr)
+	}
+	if r.snapshotCallback == nil {
+		return nil, errors.New("raft: snapshot callback not configured")
+	}
+
+	lastApplied := r.lastApplied
+	firstIndex := r.storage.FirstIndex()
+	if lastApplied <= firstIndex {
+		if snap, _ := r.storage.GetSnapshot(); snap != nil {
+			return &snap.Metadata, nil
+		}
+		return nil, errors.New("raft: nothing to snapshot; no entries applied")
+	}
+
+	entry, ok := r.storage.GetEntry(lastApplied)
+	if !ok {
+		return nil, fmt.Errorf("raft: entry at last applied index %d not found", lastApplied)
+	}
+	lastAppliedTerm := entry.Term
+
+	data, err := r.snapshotCallback()
+	if err != nil {
+		return nil, fmt.Errorf("raft: snapshot callback: %w", err)
+	}
+
+	meta := SnapshotMetadata{
+		Version:           SnapshotCurrentVersion,
+		GroupID:           r.groupID,
+		LastIncludedIndex: lastApplied,
+		LastIncludedTerm:  lastAppliedTerm,
+		CreatedAt:         time.Now(),
+		Size:              int64(len(data)),
+		Checksum:          ComputeSnapshotChecksum(data),
+	}
+
+	if err := r.storage.SaveSnapshot(meta, data); err != nil {
+		r.storageErr = err
+		return nil, fmt.Errorf("save snapshot: %w", err)
+	}
+
+	if err := r.storage.CompactLog(lastApplied, lastAppliedTerm); err != nil {
+		r.storageErr = err
+		return nil, fmt.Errorf("compact log: %w", err)
+	}
+
+	return &meta, nil
+}
+
+// FirstIndex returns the lowest index present in Raft storage (the snapshot sentinel index).
+func (r *Raft) FirstIndex() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.storage.FirstIndex()
+}
+
+// Snapshot returns the current durable snapshot, or (nil, nil) if none exists.
+func (r *Raft) Snapshot() (*Snapshot, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.storage.GetSnapshot()
 }

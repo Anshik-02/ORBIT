@@ -113,6 +113,16 @@ func NewNode(cfg NodeConfig, customTransport raft.Transport) (*Node, error) {
 		ElectionTimeoutMax: cfg.ElectionTimeoutMax,
 		CommitCallback:     n.onCommittedEntry,
 		InitialLastApplied: eng.LastAppliedIndex(), // seed from recovered WAL to prevent re-application
+		SnapshotCallback: func() ([]byte, error) {
+			_, data, err := eng.ExportSnapshotBytes()
+			return data, err
+		},
+		SnapshotRestoreCallback: func(meta raft.SnapshotMetadata, data []byte) error {
+			return eng.RestoreSnapshotBytes(storage.SnapshotMetadata{
+				Index: meta.LastIncludedIndex,
+				Term:  meta.LastIncludedTerm,
+			}, data)
+		},
 	})
 	if err != nil {
 		_ = rStorage.Close()

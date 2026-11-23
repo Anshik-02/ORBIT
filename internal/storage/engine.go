@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -233,6 +234,44 @@ func (e *Engine) InstallSnapshot(meta SnapshotMetadata, state map[string]string)
 	e.memtable = newMem
 	e.lastAppliedIndex = meta.Index
 	return nil
+}
+
+// ExportSnapshot returns the current applied Raft index and a point-in-time copy of memtable state.
+func (e *Engine) ExportSnapshot() (uint64, map[string]string, error) {
+	if e.closed.Load() {
+		return 0, nil, ErrClosed
+	}
+
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+
+	if e.closed.Load() {
+		return 0, nil, ErrClosed
+	}
+
+	return e.lastAppliedIndex, e.memtable.All(), nil
+}
+
+// ExportSnapshotBytes exports the current state machine data as serialized JSON bytes with its applied Raft index.
+func (e *Engine) ExportSnapshotBytes() (uint64, []byte, error) {
+	idx, state, err := e.ExportSnapshot()
+	if err != nil {
+		return 0, nil, err
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		return 0, nil, fmt.Errorf("storage: marshal snapshot state: %w", err)
+	}
+	return idx, data, nil
+}
+
+// RestoreSnapshotBytes unmarshals and atomically installs serialized snapshot data.
+func (e *Engine) RestoreSnapshotBytes(meta SnapshotMetadata, data []byte) error {
+	var state map[string]string
+	if err := json.Unmarshal(data, &state); err != nil {
+		return fmt.Errorf("storage: unmarshal snapshot state: %w", err)
+	}
+	return e.InstallSnapshot(meta, state)
 }
 
 // Set stores key -> value in the database.

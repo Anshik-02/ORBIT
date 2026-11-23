@@ -380,6 +380,10 @@ func (m *mockBlockingEngine) Delete(k string) error                             
 func (m *mockBlockingEngine) ApplyCommitted(cmd storage.CommittedCommand) error { return nil }
 func (m *mockBlockingEngine) Close() error                                      { return nil }
 func (m *mockBlockingEngine) Health() error                                     { return nil }
+func (m *mockBlockingEngine) ExportSnapshotBytes() (uint64, []byte, error)      { return 0, nil, nil }
+func (m *mockBlockingEngine) RestoreSnapshotBytes(meta storage.SnapshotMetadata, data []byte) error {
+	return nil
+}
 
 type mockFailingEngine struct {
 	closeErr error
@@ -391,6 +395,10 @@ func (m *mockFailingEngine) Delete(k string) error                             {
 func (m *mockFailingEngine) ApplyCommitted(cmd storage.CommittedCommand) error { return nil }
 func (m *mockFailingEngine) Close() error                                      { return m.closeErr }
 func (m *mockFailingEngine) Health() error                                     { return nil }
+func (m *mockFailingEngine) ExportSnapshotBytes() (uint64, []byte, error)      { return 0, nil, nil }
+func (m *mockFailingEngine) RestoreSnapshotBytes(meta storage.SnapshotMetadata, data []byte) error {
+	return nil
+}
 
 // TestRaftAppliedIndexRecoveredAfterRestart verifies that Raft consensus progress
 // is persisted in the WAL and fully restored upon restart, enabling idempotency.

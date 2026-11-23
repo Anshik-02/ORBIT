@@ -47,3 +47,15 @@ func (m *Memtable) Delete(key string) {
 	defer m.mu.Unlock()
 	delete(m.data, key)
 }
+
+// All returns a point-in-time copy of all key-value entries currently in the memtable.
+// Acquires a shared read lock so it is safe to call concurrently with Gets.
+func (m *Memtable) All() map[string]string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	copied := make(map[string]string, len(m.data))
+	for k, v := range m.data {
+		copied[k] = v
+	}
+	return copied
+}

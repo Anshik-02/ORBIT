@@ -22,6 +22,9 @@ var (
 	ErrNilHandler      = errors.New("raft: rpc handler cannot be nil")
 	ErrInvalidGroupID  = errors.New("raft: invalid group id")
 	ErrTransportClosed = errors.New("raft: transport is already closed")
+	ErrSnapshotBehind  = errors.New("raft: snapshot index is behind current applied state")
+	ErrCorruptSnapshot = errors.New("raft: snapshot is corrupted or invalid")
+	ErrNoSnapshot      = errors.New("raft: no snapshot available")
 )
 
 // GroupID uniquely identifies an independent consensus group (e.g. "shard-0").
@@ -110,4 +113,26 @@ type GroupRequestVoteRequest struct {
 type GroupAppendEntriesRequest struct {
 	GroupID GroupID              `json:"group_id"`
 	Request AppendEntriesRequest `json:"request"`
+}
+
+// InstallSnapshotRequest is invoked by the leader to send chunks of a snapshot to a lagging follower (Section 7).
+type InstallSnapshotRequest struct {
+	Term              uint64  `json:"term"`
+	LeaderID          string  `json:"leader_id"`
+	LastIncludedIndex uint64  `json:"last_included_index"`
+	LastIncludedTerm  uint64  `json:"last_included_term"`
+	Offset            int64   `json:"offset"`
+	Data              []byte  `json:"data"`
+	Done              bool    `json:"done"`
+}
+
+// InstallSnapshotResponse is returned by followers in response to InstallSnapshotRequest.
+type InstallSnapshotResponse struct {
+	Term uint64 `json:"term"`
+}
+
+// GroupInstallSnapshotRequest is the RPC envelope tagging an InstallSnapshot request with its target consensus group.
+type GroupInstallSnapshotRequest struct {
+	GroupID GroupID                `json:"group_id"`
+	Request InstallSnapshotRequest `json:"request"`
 }

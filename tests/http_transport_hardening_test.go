@@ -26,6 +26,10 @@ func (m *mockRaftHandler) HandleAppendEntries(ctx context.Context, req *raft.App
 	return &raft.AppendEntriesResponse{Term: req.Term, Success: true}, nil
 }
 
+func (m *mockRaftHandler) HandleInstallSnapshot(ctx context.Context, req *raft.InstallSnapshotRequest) (*raft.InstallSnapshotResponse, error) {
+	return &raft.InstallSnapshotResponse{Term: req.Term}, nil
+}
+
 func TestHTTPTransport_MethodNotAllowed(t *testing.T) {
 	t.Parallel()
 
@@ -39,7 +43,7 @@ func TestHTTPTransport_MethodNotAllowed(t *testing.T) {
 	baseURL := "http://" + transport.Addr()
 
 	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete, http.MethodPatch} {
-		for _, endpoint := range []string{"/raft/vote", "/raft/append"} {
+		for _, endpoint := range []string{"/raft/vote", "/raft/append", "/raft/install-snapshot"} {
 			req, err := http.NewRequest(method, baseURL+endpoint, nil)
 			if err != nil {
 				t.Fatalf("new request failed: %v", err)
@@ -224,6 +228,15 @@ func (s *slowRaftHandler) HandleAppendEntries(ctx context.Context, req *raft.App
 	select {
 	case <-time.After(s.delay):
 		return &raft.AppendEntriesResponse{Term: req.Term, Success: true}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (s *slowRaftHandler) HandleInstallSnapshot(ctx context.Context, req *raft.InstallSnapshotRequest) (*raft.InstallSnapshotResponse, error) {
+	select {
+	case <-time.After(s.delay):
+		return &raft.InstallSnapshotResponse{Term: req.Term}, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}

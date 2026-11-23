@@ -80,17 +80,31 @@ func NewShardReplica(
 		})
 	}
 
+	snapshotCallback := func() ([]byte, error) {
+		_, data, err := eng.ExportSnapshotBytes()
+		return data, err
+	}
+
+	snapshotRestoreCallback := func(meta raft.SnapshotMetadata, data []byte) error {
+		return eng.RestoreSnapshotBytes(storage.SnapshotMetadata{
+			Index: meta.LastIncludedIndex,
+			Term:  meta.LastIncludedTerm,
+		}, data)
+	}
+
 	rEngine, err := raft.New(raft.Config{
-		ID:                 nodeID,
-		GroupID:            sr.groupID,
-		Peers:              peers,
-		Storage:            rStorage,
-		Transport:          transport,
-		HeartbeatInterval:  heartbeatInterval,
-		ElectionTimeoutMin: electionTimeoutMin,
-		ElectionTimeoutMax: electionTimeoutMax,
-		CommitCallback:     commitCallback,
-		InitialLastApplied: eng.LastAppliedIndex(),
+		ID:                      nodeID,
+		GroupID:                 sr.groupID,
+		Peers:                   peers,
+		Storage:                 rStorage,
+		Transport:               transport,
+		HeartbeatInterval:       heartbeatInterval,
+		ElectionTimeoutMin:      electionTimeoutMin,
+		ElectionTimeoutMax:      electionTimeoutMax,
+		CommitCallback:          commitCallback,
+		InitialLastApplied:      eng.LastAppliedIndex(),
+		SnapshotCallback:        snapshotCallback,
+		SnapshotRestoreCallback: snapshotRestoreCallback,
 	})
 	if err != nil {
 		_ = rStorage.Close()

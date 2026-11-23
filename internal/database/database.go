@@ -16,6 +16,8 @@ type StorageEngine interface {
 	ApplyCommitted(cmd storage.CommittedCommand) error
 	Close() error
 	Health() error
+	ExportSnapshotBytes() (uint64, []byte, error)
+	RestoreSnapshotBytes(meta storage.SnapshotMetadata, data []byte) error
 }
 
 // Database is the public-facing database object.

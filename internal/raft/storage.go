@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 var (
@@ -30,6 +31,10 @@ type Storage interface {
 	GetEntry(index uint64) (LogEntry, bool)
 	GetEntries(fromIndex uint64) []LogEntry
 	LastLogInfo() (lastIndex uint64, lastTerm uint64)
+	FirstIndex() uint64
+	SaveSnapshot(meta SnapshotMetadata, data []byte) error
+	GetSnapshot() (*Snapshot, error)
+	CompactLog(lastIncludedIndex uint64, lastIncludedTerm uint64) error
 	Close() error
 }
 
@@ -58,17 +63,20 @@ type metadataState struct {
 //   - Index 0 is a sentinel representing the base state (term 0).
 //   - All operations are thread-safe protected by mu.
 type FileStorage struct {
-	mu          sync.Mutex
-	dir         string
-	metaPath    string
-	logPath     string
-	logFile     *os.File
-	currentTerm uint64
-	votedFor    string
-	entries     []LogEntry // 1-based indexing; entries[0] is sentinel {Index:0, Term:0}
-	closed      bool
-	poisoned    bool
-	poisonErr   error
+	mu           sync.Mutex
+	dir          string
+	metaPath     string
+	logPath      string
+	snapMetaPath string
+	snapDataPath string
+	logFile      *os.File
+	currentTerm  uint64
+	votedFor     string
+	entries      []LogEntry // entries[0] is sentinel at FirstIndex()
+	snapshot     *Snapshot
+	closed       bool
+	poisoned     bool
+	poisonErr    error
 }
 
 // computeEntryChecksum calculates a length-prefixed CRC32-IEEE checksum over an entry's fields.
@@ -104,16 +112,18 @@ func OpenFileStorage(dataDir string) (*FileStorage, error) {
 	}
 
 	fs := &FileStorage{
-		dir:      raftDir,
-		metaPath: filepath.Join(raftDir, "metadata.json"),
-		logPath:  filepath.Join(raftDir, "raft.log"),
-		entries:  []LogEntry{{Index: 0, Term: 0}}, // Sentinel entry at index 0
+		dir:          raftDir,
+		metaPath:     filepath.Join(raftDir, "metadata.json"),
+		logPath:      filepath.Join(raftDir, "raft.log"),
+		snapMetaPath: filepath.Join(raftDir, "snapshot.meta"),
+		snapDataPath: filepath.Join(raftDir, "snapshot.data"),
+		entries:      []LogEntry{{Index: 0, Term: 0}}, // Default sentinel entry at index 0
 	}
 
 	// 0. Crash recovery during atomic replacement:
 	// If a crash occurred after removing the original file but before renaming the .tmp replacement,
 	// promote the fully synced .tmp replacement. If the original file is intact, clean up any stale .tmp.
-	for _, target := range []string{fs.logPath, fs.metaPath} {
+	for _, target := range []string{fs.logPath, fs.metaPath, fs.snapMetaPath, fs.snapDataPath} {
 		tmpTarget := target + ".tmp"
 		if _, err := os.Stat(tmpTarget); err == nil {
 			if _, err := os.Stat(target); errors.Is(err, os.ErrNotExist) {
@@ -129,12 +139,17 @@ func OpenFileStorage(dataDir string) (*FileStorage, error) {
 		return nil, fmt.Errorf("raft storage: recover metadata: %w", err)
 	}
 
-	// 2. Recover and validate log entries from raft.log
+	// 2. Recover snapshot if present
+	if err := fs.recoverSnapshot(); err != nil {
+		return nil, fmt.Errorf("raft storage: recover snapshot: %w", err)
+	}
+
+	// 3. Recover and validate log entries from raft.log
 	if err := fs.recoverLog(); err != nil {
 		return nil, fmt.Errorf("raft storage: recover log: %w", err)
 	}
 
-	// 3. Open raft.log in append-only mode for writing
+	// 4. Open raft.log in append-only mode for writing
 	f, err := os.OpenFile(fs.logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("raft storage: open log file: %w", err)
@@ -142,6 +157,43 @@ func OpenFileStorage(dataDir string) (*FileStorage, error) {
 	fs.logFile = f
 
 	return fs, nil
+}
+
+// recoverSnapshot loads snapshot.meta and snapshot.data if present and validates integrity.
+func (fs *FileStorage) recoverSnapshot() error {
+	metaBytes, err := os.ReadFile(fs.snapMetaPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	var meta SnapshotMetadata
+	if err := json.Unmarshal(metaBytes, &meta); err != nil {
+		return fmt.Errorf("%w: parse snapshot metadata: %v", ErrCorruptSnapshot, err)
+	}
+
+	dataBytes, err := os.ReadFile(fs.snapDataPath)
+	if err != nil {
+		return fmt.Errorf("%w: read snapshot data: %v", ErrCorruptSnapshot, err)
+	}
+
+	snap := &Snapshot{
+		Metadata: meta,
+		Data:     dataBytes,
+	}
+	if err := snap.Validate(); err != nil {
+		return err
+	}
+
+	fs.snapshot = snap
+	// Sentinel entry reflects the snapshot baseline
+	fs.entries = []LogEntry{{
+		Index: meta.LastIncludedIndex,
+		Term:  meta.LastIncludedTerm,
+	}}
+	return nil
 }
 
 // recoverMetadata loads metadata.json if present.
@@ -168,7 +220,7 @@ func (fs *FileStorage) recoverMetadata() error {
 // recoverLog replays and validates all records from raft.log with strict validation:
 //  1. Rejects blank lines anywhere in the log as corruption.
 //  2. Disallows unknown fields and secondary trailing JSON tokens.
-//  3. Verifies contiguous 1-based indexing (expectedIndex) and monotonically non-decreasing terms.
+//  3. Verifies contiguous indexing starting after snapshot sentinel and monotonically non-decreasing terms.
 //  4. Verifies length-prefixed CRC32-IEEE checksums.
 //  5. Automatically truncates partial trailing writes from crashes mid-write back to last valid boundary.
 func (fs *FileStorage) recoverLog() error {
@@ -181,8 +233,9 @@ func (fs *FileStorage) recoverLog() error {
 	reader := bufio.NewReader(f)
 	var lastValidOffset int64 = 0
 	var currentOffset int64 = 0
-	expectedIndex := uint64(1)
-	var prevTerm uint64 = 0
+	expectedIndex := fs.entries[0].Index + 1
+	prevTerm := fs.entries[0].Term
+	obsoleteEntriesSkipped := false
 
 	for {
 		line, readErr := reader.ReadBytes('\n')
@@ -198,7 +251,6 @@ func (fs *FileStorage) recoverLog() error {
 					return fmt.Errorf("%w: corrupt record at offset %d: unexpected blank line", ErrCorruptState, currentOffset)
 				}
 
-				// Strict JSON decoding: disallow unknown fields
 				dec := json.NewDecoder(bytes.NewReader(trimmed))
 				dec.DisallowUnknownFields()
 
@@ -207,7 +259,6 @@ func (fs *FileStorage) recoverLog() error {
 					return fmt.Errorf("%w: corrupt record at offset %d: %v", ErrCorruptState, currentOffset, err)
 				}
 
-				// Check trailing tokens on record line
 				var trailing json.RawMessage
 				if err := dec.Decode(&trailing); err != io.EOF {
 					return fmt.Errorf("%w: unexpected trailing content on record line at offset %d", ErrCorruptState, currentOffset)
@@ -218,6 +269,14 @@ func (fs *FileStorage) recoverLog() error {
 				if rec.Checksum != expectedChecksum {
 					return fmt.Errorf("%w: record index %d (stored %d, computed %d)",
 						ErrChecksumMismatch, rec.Index, rec.Checksum, expectedChecksum)
+				}
+
+				// If record was already included in a snapshot, skip it
+				if rec.Index <= fs.entries[0].Index {
+					obsoleteEntriesSkipped = true
+					currentOffset += lineLen
+					lastValidOffset = currentOffset
+					continue
 				}
 
 				// Verify contiguous index
@@ -269,6 +328,30 @@ func (fs *FileStorage) recoverLog() error {
 		}
 		if err := f.Sync(); err != nil {
 			return fmt.Errorf("raft storage: sync truncated log: %w", err)
+		}
+	}
+
+	// If obsolete pre-snapshot records were in the log, rewrite log now
+	if obsoleteEntriesSkipped {
+		var buf bytes.Buffer
+		for i := 1; i < len(fs.entries); i++ {
+			e := fs.entries[i]
+			cs := computeEntryChecksum(e.Index, e.Term, e.Operation, e.Key, e.Value)
+			rec := persistentRecord{
+				Index:     e.Index,
+				Term:      e.Term,
+				Operation: e.Operation,
+				Key:       e.Key,
+				Value:     e.Value,
+				Checksum:  cs,
+			}
+			data, _ := json.Marshal(rec)
+			buf.Write(data)
+			buf.WriteByte('\n')
+		}
+		_ = f.Close()
+		if err := atomicWriteFile(fs.logPath, buf.Bytes(), 0600); err != nil {
+			return fmt.Errorf("rewrite compacted log: %w", err)
 		}
 	}
 
@@ -408,15 +491,18 @@ func (fs *FileStorage) Truncate(fromIndex uint64) error {
 	if fs.poisoned {
 		return fmt.Errorf("%w: %v", ErrStoragePoisoned, fs.poisonErr)
 	}
-	if fromIndex == 0 {
+	firstIndex := fs.entries[0].Index
+	if fromIndex <= firstIndex {
 		return ErrInvalidTruncateIdx
 	}
-	if fromIndex >= uint64(len(fs.entries)) {
+	lastIndex := fs.entries[len(fs.entries)-1].Index
+	if fromIndex > lastIndex {
 		return nil // Nothing to truncate
 	}
 
 	// 1. Identify remaining prefix entries without mutating fs.entries yet
-	remainingEntries := fs.entries[:fromIndex]
+	cutoffOffset := fromIndex - firstIndex
+	remainingEntries := fs.entries[:cutoffOffset]
 
 	// 2. Re-serialize valid remaining entries to memory buffer
 	var buf bytes.Buffer
@@ -474,10 +560,15 @@ func (fs *FileStorage) GetEntry(index uint64) (LogEntry, bool) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	if index >= uint64(len(fs.entries)) {
+	firstIndex := fs.entries[0].Index
+	if index < firstIndex {
 		return LogEntry{}, false
 	}
-	return fs.entries[index], true
+	offset := index - firstIndex
+	if offset >= uint64(len(fs.entries)) {
+		return LogEntry{}, false
+	}
+	return fs.entries[offset], true
 }
 
 // GetEntries returns all entries starting from fromIndex up to the end of the log.
@@ -485,12 +576,184 @@ func (fs *FileStorage) GetEntries(fromIndex uint64) []LogEntry {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	if fromIndex >= uint64(len(fs.entries)) {
+	firstIndex := fs.entries[0].Index
+	lastIndex := fs.entries[len(fs.entries)-1].Index
+	if fromIndex <= firstIndex {
+		fromIndex = firstIndex + 1
+	}
+	if fromIndex > lastIndex {
 		return nil
 	}
-	result := make([]LogEntry, len(fs.entries)-int(fromIndex))
-	copy(result, fs.entries[fromIndex:])
+	startOffset := fromIndex - firstIndex
+	result := make([]LogEntry, len(fs.entries)-int(startOffset))
+	copy(result, fs.entries[startOffset:])
 	return result
+}
+
+// FirstIndex returns the lowest index present in storage (the snapshot sentinel index).
+func (fs *FileStorage) FirstIndex() uint64 {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	return fs.entries[0].Index
+}
+
+// SaveSnapshot atomically persists snapshot data and metadata to disk.
+func (fs *FileStorage) SaveSnapshot(meta SnapshotMetadata, data []byte) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	if fs.closed {
+		return ErrStorageClosed
+	}
+	if fs.poisoned {
+		return fmt.Errorf("%w: %v", ErrStoragePoisoned, fs.poisonErr)
+	}
+
+	// Prevent regressing snapshot index
+	if fs.snapshot != nil && meta.LastIncludedIndex < fs.snapshot.Metadata.LastIncludedIndex {
+		return ErrSnapshotBehind
+	}
+
+	meta.Version = SnapshotCurrentVersion
+	meta.Checksum = ComputeSnapshotChecksum(data)
+	meta.Size = int64(len(data))
+	if meta.CreatedAt.IsZero() {
+		meta.CreatedAt = time.Now()
+	}
+
+	// 1. Write snapshot data atomically
+	if err := atomicWriteFile(fs.snapDataPath, data, 0600); err != nil {
+		fs.poisoned = true
+		fs.poisonErr = err
+		return fmt.Errorf("write snapshot data: %w", err)
+	}
+
+	// 2. Write snapshot metadata atomically
+	metaBytes, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal snapshot metadata: %w", err)
+	}
+	if err := atomicWriteFile(fs.snapMetaPath, metaBytes, 0600); err != nil {
+		fs.poisoned = true
+		fs.poisonErr = err
+		return fmt.Errorf("write snapshot metadata: %w", err)
+	}
+
+	// 3. Cache in-memory
+	dataCopy := make([]byte, len(data))
+	copy(dataCopy, data)
+	fs.snapshot = &Snapshot{
+		Metadata: meta,
+		Data:     dataCopy,
+	}
+
+	return nil
+}
+
+// GetSnapshot retrieves a copy of the current durable snapshot, or (nil, nil) if none exists.
+func (fs *FileStorage) GetSnapshot() (*Snapshot, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	if fs.closed {
+		return nil, ErrStorageClosed
+	}
+	if fs.snapshot == nil {
+		return nil, nil
+	}
+
+	dataCopy := make([]byte, len(fs.snapshot.Data))
+	copy(dataCopy, fs.snapshot.Data)
+	return &Snapshot{
+		Metadata: fs.snapshot.Metadata,
+		Data:     dataCopy,
+	}, nil
+}
+
+// CompactLog discards log entries through lastIncludedIndex, preserving a sentinel
+// at lastIncludedIndex with lastIncludedTerm (Raft Paper Section 7).
+func (fs *FileStorage) CompactLog(lastIncludedIndex uint64, lastIncludedTerm uint64) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	if fs.closed {
+		return ErrStorageClosed
+	}
+	if fs.poisoned {
+		return fmt.Errorf("%w: %v", ErrStoragePoisoned, fs.poisonErr)
+	}
+
+	firstIndex := fs.entries[0].Index
+	lastIndex := fs.entries[len(fs.entries)-1].Index
+
+	// Already compacted up to or beyond this index
+	if lastIncludedIndex <= firstIndex {
+		return nil
+	}
+
+	var remainingEntries []LogEntry
+
+	// If log contains lastIncludedIndex with matching term, retain entries after it
+	if lastIncludedIndex <= lastIndex {
+		offset := lastIncludedIndex - firstIndex
+		if fs.entries[offset].Term == lastIncludedTerm {
+			remainingEntries = fs.entries[offset+1:]
+		}
+	}
+
+	// Serialize remaining uncompacted entries to memory buffer
+	var buf bytes.Buffer
+	for _, e := range remainingEntries {
+		cs := computeEntryChecksum(e.Index, e.Term, e.Operation, e.Key, e.Value)
+		rec := persistentRecord{
+			Index:     e.Index,
+			Term:      e.Term,
+			Operation: e.Operation,
+			Key:       e.Key,
+			Value:     e.Value,
+			Checksum:  cs,
+		}
+		data, err := json.Marshal(rec)
+		if err != nil {
+			return err
+		}
+		buf.Write(data)
+		buf.WriteByte('\n')
+	}
+
+	// Close open file handle before atomic replacement
+	if fs.logFile != nil {
+		_ = fs.logFile.Close()
+		fs.logFile = nil
+	}
+
+	// Atomically write replacement log file
+	if err := atomicWriteFile(fs.logPath, buf.Bytes(), 0600); err != nil {
+		fs.poisoned = true
+		fs.poisonErr = err
+		return fmt.Errorf("rewrite compacted log: %w", err)
+	}
+
+	// Reopen in append mode
+	f, err := os.OpenFile(fs.logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		fs.poisoned = true
+		fs.poisonErr = err
+		return fmt.Errorf("reopen compacted log: %w", err)
+	}
+	fs.logFile = f
+
+	// In-memory entries begins with sentinel at lastIncludedIndex
+	newEntries := make([]LogEntry, 0, len(remainingEntries)+1)
+	newEntries = append(newEntries, LogEntry{
+		Index: lastIncludedIndex,
+		Term:  lastIncludedTerm,
+	})
+	newEntries = append(newEntries, remainingEntries...)
+	fs.entries = newEntries
+
+	return nil
 }
 
 // LastLogInfo returns the index and term of the last entry in the log.
