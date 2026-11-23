@@ -70,6 +70,7 @@ type Raft struct {
 	stoppedCh      chan struct{}
 	applyCond      *sync.Cond
 	rng            *rand.Rand
+	started        bool
 	closed         bool
 }
 
@@ -128,20 +129,30 @@ func New(cfg Config) (*Raft, error) {
 }
 
 // Start begins the Raft background event loop and transport listener.
+// Calling Start multiple times is safe and idempotent.
 func (r *Raft) Start() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	if r.closed {
+		return ErrStopped
+	}
+	if r.started {
+		return nil
+	}
 
 	if err := r.transport.Start(); err != nil {
 		return fmt.Errorf("start raft transport: %w", err)
 	}
 
+	r.started = true
 	go r.runLoop()
 	go r.applyLoop()
 	return nil
 }
 
 // Stop terminates the consensus engine and releases resources.
+// Calling Stop multiple times is safe and idempotent.
 func (r *Raft) Stop() error {
 	r.mu.Lock()
 	if r.closed {
@@ -149,11 +160,16 @@ func (r *Raft) Stop() error {
 		return nil
 	}
 	r.closed = true
-	close(r.stopCh)
+	wasStarted := r.started
+	if wasStarted {
+		close(r.stopCh)
+	}
 	r.applyCond.Broadcast()
 	r.mu.Unlock()
 
-	<-r.stoppedCh
+	if wasStarted {
+		<-r.stoppedCh
+	}
 
 	_ = r.transport.Close()
 	return r.storage.Close()
@@ -311,7 +327,7 @@ func (r *Raft) ReadIndex(ctx context.Context) (uint64, error) {
 	if r.storageErr != nil {
 		err := r.storageErr
 		r.mu.Unlock()
-		return 0, fmt.Errorf("consensus halted due to fatal storage error: %w", err)
+		return 0, fmt.Errorf("%w: %w", ErrStorageHalted, err)
 	}
 	if r.role != Leader {
 		r.mu.Unlock()
@@ -592,7 +608,7 @@ func (r *Raft) Propose(op, key, value string) (uint64, uint64, error) {
 		return 0, 0, ErrStopped
 	}
 	if r.storageErr != nil {
-		return 0, 0, fmt.Errorf("consensus halted due to fatal storage error: %w", r.storageErr)
+		return 0, 0, fmt.Errorf("%w: %w", ErrStorageHalted, r.storageErr)
 	}
 	if r.role != Leader {
 		return 0, 0, ErrNotLeader
@@ -814,7 +830,7 @@ func (r *Raft) HandleRequestVote(ctx context.Context, req *RequestVoteRequest) (
 	defer r.mu.Unlock()
 
 	if r.storageErr != nil {
-		return nil, fmt.Errorf("consensus halted due to fatal storage error: %w", r.storageErr)
+		return nil, fmt.Errorf("%w: %w", ErrStorageHalted, r.storageErr)
 	}
 
 	// 1. If req.Term < currentTerm, reject vote
@@ -877,7 +893,7 @@ func (r *Raft) HandleAppendEntries(ctx context.Context, req *AppendEntriesReques
 	defer r.mu.Unlock()
 
 	if r.storageErr != nil {
-		return nil, fmt.Errorf("consensus halted due to fatal storage error: %w", r.storageErr)
+		return nil, fmt.Errorf("%w: %w", ErrStorageHalted, r.storageErr)
 	}
 
 	// 1. Reply false if req.Term < currentTerm (Section 5.1)

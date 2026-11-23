@@ -16,6 +16,7 @@ var (
 	ErrCorruptState   = errors.New("raft: persistent state is corrupted")
 	ErrQuorumLost     = errors.New("raft: lost majority quorum; cannot confirm leadership")
 	ErrLeaderNotReady = errors.New("raft: leader has not yet committed an entry in current term")
+	ErrStorageHalted  = errors.New("raft: consensus halted due to fatal storage error")
 )
 
 // Role represents the current consensus role of a node in the Raft cluster.

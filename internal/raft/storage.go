@@ -110,6 +110,20 @@ func OpenFileStorage(dataDir string) (*FileStorage, error) {
 		entries:  []LogEntry{{Index: 0, Term: 0}}, // Sentinel entry at index 0
 	}
 
+	// 0. Crash recovery during atomic replacement:
+	// If a crash occurred after removing the original file but before renaming the .tmp replacement,
+	// promote the fully synced .tmp replacement. If the original file is intact, clean up any stale .tmp.
+	for _, target := range []string{fs.logPath, fs.metaPath} {
+		tmpTarget := target + ".tmp"
+		if _, err := os.Stat(tmpTarget); err == nil {
+			if _, err := os.Stat(target); errors.Is(err, os.ErrNotExist) {
+				_ = os.Rename(tmpTarget, target)
+			} else {
+				_ = os.Remove(tmpTarget)
+			}
+		}
+	}
+
 	// 1. Recover metadata (currentTerm, votedFor)
 	if err := fs.recoverMetadata(); err != nil {
 		return nil, fmt.Errorf("raft storage: recover metadata: %w", err)
@@ -520,26 +534,26 @@ func (fs *FileStorage) Close() error {
 	return nil
 }
 
-// atomicWriteFile safely writes data to path using a temp file, fsync, and rename.
+// atomicWriteFile safely writes data to path using a deterministic .tmp file, fsync, and atomic rename.
 func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, "tmp.*")
+	tmpPath := path + ".tmp"
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, perm)
 	if err != nil {
 		return err
 	}
-	tmpPath := tmp.Name()
-	defer func() {
-		_ = tmp.Close()
-		_ = os.Remove(tmpPath)
-	}()
 
-	if _, err := tmp.Write(data); err != nil {
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpPath)
 		return err
 	}
-	if err := tmp.Sync(); err != nil {
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpPath)
 		return err
 	}
-	if err := tmp.Close(); err != nil {
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpPath)
 		return err
 	}
 

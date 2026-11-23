@@ -6,11 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"sync"
 	"time"
 )
+
+const maxRPCRequestBodyBytes = 4 * 1024 * 1024 // 4MB maximum Raft RPC payload size
 
 // HTTPTransport implements inter-node Raft communication over HTTP/JSON.
 type HTTPTransport struct {
@@ -55,8 +58,8 @@ func (t *HTTPTransport) Start() error {
 	defer t.mu.Unlock()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /raft/vote", t.serveRequestVote)
-	mux.HandleFunc("POST /raft/append", t.serveAppendEntries)
+	mux.HandleFunc("/raft/vote", t.serveRequestVote)
+	mux.HandleFunc("/raft/append", t.serveAppendEntries)
 
 	ln, err := net.Listen("tcp", t.addr)
 	if err != nil {
@@ -66,9 +69,11 @@ func (t *HTTPTransport) Start() error {
 	t.addr = ln.Addr().String()
 
 	t.server = &http.Server{
-		Handler:      mux,
-		ReadTimeout:  2 * time.Second,
-		WriteTimeout: 2 * time.Second,
+		Handler:           mux,
+		ReadHeaderTimeout: 2 * time.Second,
+		ReadTimeout:       5 * time.Second,
+		WriteTimeout:      5 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	go func() {
@@ -105,6 +110,11 @@ func (t *HTTPTransport) Close() error {
 }
 
 func (t *HTTPTransport) serveRequestVote(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	t.mu.RLock()
 	h := t.handler
 	t.mu.RUnlock()
@@ -114,9 +124,24 @@ func (t *HTTPTransport) serveRequestVote(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxRPCRequestBodyBytes)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+
 	var req RequestVoteRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+	if err := dec.Decode(&req); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "request payload exceeds size limit", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		http.Error(w, "unexpected trailing content after json", http.StatusBadRequest)
 		return
 	}
 
@@ -131,6 +156,11 @@ func (t *HTTPTransport) serveRequestVote(w http.ResponseWriter, r *http.Request)
 }
 
 func (t *HTTPTransport) serveAppendEntries(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	t.mu.RLock()
 	h := t.handler
 	t.mu.RUnlock()
@@ -140,9 +170,24 @@ func (t *HTTPTransport) serveAppendEntries(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxRPCRequestBodyBytes)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+
 	var req AppendEntriesRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+	if err := dec.Decode(&req); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "request payload exceeds size limit", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		http.Error(w, "unexpected trailing content after json", http.StatusBadRequest)
 		return
 	}
 

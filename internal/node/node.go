@@ -27,6 +27,7 @@ type Node struct {
 	transport  raft.Transport
 	raft       *raft.Raft
 	httpServer *http.Server
+	started    bool
 	closed     bool
 }
 
@@ -119,14 +120,23 @@ func (n *Node) onCommittedEntry(entry raft.LogEntry) error {
 }
 
 // Start boots the Raft consensus engine and the client HTTP server.
+// It is safe and idempotent across repeated calls.
 func (n *Node) Start() error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+
+	if n.closed {
+		return errors.New("node is already closed")
+	}
+	if n.started {
+		return nil
+	}
 
 	// Start Raft consensus engine
 	if err := n.raft.Start(); err != nil {
 		return fmt.Errorf("start raft: %w", err)
 	}
+	n.started = true
 
 	// Start client HTTP API server if address provided
 	if n.config.Address != "" {
@@ -157,6 +167,7 @@ func (n *Node) Start() error {
 }
 
 // Stop cleanly terminates HTTP server, Raft engine, and closes database storage.
+// It is safe and idempotent across repeated calls.
 func (n *Node) Stop() error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -165,6 +176,7 @@ func (n *Node) Stop() error {
 		return nil
 	}
 	n.closed = true
+	n.started = false
 
 	// 1. Drain HTTP server
 	if n.httpServer != nil {
