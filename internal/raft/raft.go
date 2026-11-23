@@ -182,7 +182,6 @@ func (r *Raft) Stop() error {
 	}
 
 	r.transport.UnregisterHandler(r.groupID)
-	_ = r.transport.Close()
 	return r.storage.Close()
 }
 
