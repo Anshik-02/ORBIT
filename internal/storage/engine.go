@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -190,6 +191,7 @@ func (e *Engine) recover() error {
 		}
 		e.sstables = append(e.sstables, reader)
 	}
+	e.sortSSTablesLocked()
 
 	// 3. Recover engine.snapshot if present
 	if data, err := os.ReadFile(e.snapPath); err == nil && len(data) > 0 {
@@ -215,6 +217,9 @@ func (e *Engine) recover() error {
 	}
 
 	lastFlushedWAL, _ := e.manifest.LastFlushedOffsets()
+	if lastFlushedWAL > e.wal.Sequence() {
+		e.wal.SetSequence(lastFlushedWAL)
+	}
 
 	// 4. Stream WAL records, skipping entries already incorporated into SSTables or snapshot
 	return e.wal.Replay(func(r wal.Record) error {
@@ -383,10 +388,6 @@ func (e *Engine) drainImmutableMemtables() error {
 	defer e.flushMu.Unlock()
 
 	for {
-		if e.closed.Load() {
-			return ErrClosed
-		}
-
 		e.writeMu.Lock()
 		if len(e.immutable) == 0 {
 			e.writeMu.Unlock()
@@ -446,6 +447,7 @@ func (e *Engine) drainImmutableMemtables() error {
 
 			e.writeMu.Lock()
 			e.sstables = append(e.sstables, reader)
+			e.sortSSTablesLocked()
 			if len(e.immutable) > 0 && e.immutable[0] == oldest {
 				e.immutable = e.immutable[1:]
 			}
@@ -975,13 +977,7 @@ func (e *Engine) Close() error {
 	close(e.stopWorkerCh)
 	<-e.workerDoneCh
 
-	// Drain any remaining active memtable to disk
-	e.writeMu.Lock()
-	if e.memtable.Len() > 0 {
-		e.immutable = append(e.immutable, e.memtable)
-		e.memtable = NewMemtable()
-	}
-	e.writeMu.Unlock()
+	// Drain any remaining queued immutable memtables
 	_ = e.drainImmutableMemtables()
 
 	// Close all SSTable readers
@@ -1006,4 +1002,19 @@ func (e *Engine) Close() error {
 		return e.closeErr
 	}
 	return e.closeErr
+}
+
+// sortSSTablesLocked orders sstables from oldest to newest:
+// Higher levels (L2, L1 - older) come first, down to Level 0 (newest).
+// Within the same level, lower IDs (older) come first, down to highest ID (newest).
+// This guarantees that reverse iteration (len-1 down to 0) encounters newest data first.
+func (e *Engine) sortSSTablesLocked() {
+	sort.Slice(e.sstables, func(i, j int) bool {
+		mi := e.sstables[i].Metadata()
+		mj := e.sstables[j].Metadata()
+		if mi.Level != mj.Level {
+			return mi.Level > mj.Level
+		}
+		return mi.ID < mj.ID
+	})
 }

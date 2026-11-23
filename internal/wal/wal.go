@@ -96,11 +96,18 @@ func (l *Log) Sequence() uint64 {
 	return l.sequence
 }
 
-// SetSequenceForTesting allows test suites to set the sequence counter directly.
-func (l *Log) SetSequenceForTesting(seq uint64) {
+// SetSequence sets the sequence counter baseline (e.g. from restored manifest watermark).
+func (l *Log) SetSequence(seq uint64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.sequence = seq
+	if seq > l.sequence {
+		l.sequence = seq
+	}
+}
+
+// SetSequenceForTesting allows test suites to set the sequence counter directly.
+func (l *Log) SetSequenceForTesting(seq uint64) {
+	l.SetSequence(seq)
 }
 
 // Append writes a Record to the WAL in a thread-safe manner.
@@ -274,8 +281,10 @@ func (l *Log) Replay(handler HandlerFunc) error {
 	// Reset the buffered writer so its internal buffer starts clean at the file pointer.
 	l.writer.Reset(l.file)
 
-	// Set the committed sequence counter to the highest replayed sequence.
-	l.sequence = lastReplayedSeq
+	// Set the committed sequence counter to the highest replayed sequence if advanced.
+	if lastReplayedSeq > l.sequence {
+		l.sequence = lastReplayedSeq
+	}
 
 	return nil
 }

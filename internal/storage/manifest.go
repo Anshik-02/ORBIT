@@ -241,9 +241,9 @@ func (m *Manifest) AllTables() []SSTableRecord {
 
 	sort.Slice(all, func(i, j int) bool {
 		if all[i].Level != all[j].Level {
-			return all[i].Level < all[j].Level
+			return all[i].Level > all[j].Level // Higher level (older) comes before lower level (newer)
 		}
-		return all[i].ID < all[j].ID
+		return all[i].ID < all[j].ID // Lower ID (older) comes before higher ID (newer)
 	})
 
 	return all

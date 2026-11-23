@@ -1,156 +1,169 @@
-# ORBIT — Distributed Multi-Raft Key-Value Database
+# ORBIT — Distributed Multi-Raft Key-Value Database & Storage Engine
 
-ORBIT is a high-performance, crash-resilient, distributed Key-Value database written in Go. It combines an ACID-compliant single-node storage engine (Write-Ahead Logging with streaming recovery and process locking), independent multi-group **Raft consensus**, consistent hash ring sharding, and real-time WebSocket cluster observability.
+ORBIT is a high-performance, crash-resilient, distributed, sharded Key-Value database written in **pure Go** using standard library primitives exclusively.
+
+It integrates an LSM-Tree storage engine (with Write-Ahead Logging, Memtable rotation, SSTables, Bloom filters, leveled compaction, and MANIFEST durability), independent **Multi-Raft consensus** groups, consistent hash ring sharding, dynamic topology membership and rebalancing, real-time RFC 6455 WebSocket cluster observability, a built-in **Benchmark CLI runner**, and a **Chaos Lab fault injection framework**.
 
 ---
 
 ## Architecture Overview
 
-ORBIT partitions the keyspace across multiple shards using consistent hashing. Each shard runs its own independent Raft consensus group replicated across a designated subset of physical nodes. A physical node can host replicas for multiple shards concurrently with strict transport, storage, and consensus isolation.
+```mermaid
+graph TD
+    Client[Distributed Client / REST API] --> Ingress[Physical Ingress Node]
+    
+    subgraph RoutingLayer [Routing & Sharding]
+        Ingress --> Ring[Consistent Hash Ring: 256 vnodes]
+        Ring --> Router[Shard Router & Request Forwarder]
+        Router --> Resolver[Term-Aware Leader Resolver]
+    end
 
+    subgraph MultiRaftEngine [Multi-Raft Consensus Subsystem]
+        Resolver -->|Shard 0 Mutations| Raft0[Raft Group 0: Nodes A, B, C]
+        Resolver -->|Shard 1 Mutations| Raft1[Raft Group 1: Nodes D, E, A]
+        Resolver -->|Shard 2 Mutations| Raft2[Raft Group 2: Nodes B, C, D]
+    end
+
+    subgraph LSMStorageEngine [LSM-Tree Storage Engine per Shard]
+        Raft0 -->|ApplyCommitted| LSM0[LSM Engine: Shard 0]
+        LSM0 --> WAL0[WAL + Checkpointing]
+        LSM0 --> Mem0[Active Memtable]
+        Mem0 --> Imm0[Immutable Queue]
+        Imm0 --> L0[Level 0 SSTables]
+        L0 -->|Leveled Compaction| L1[Level 1 SSTables]
+        LSM0 -.-> Manifest[Persistent MANIFEST]
+    end
+
+    subgraph SecurityAndObservability [Security & Observability]
+        Ingress -.-> Security[TLS / mTLS, RBAC, Rate Limiting]
+        LSM0 -.-> Metrics[Rolling Metrics: RPS, Latency p50/p95/p99]
+        Raft0 -.-> EventHub[EventHub & WebSocket Stream]
+        EventHub --> EventBus[Distributed Event Bus]
+    end
 ```
-                         CLIENT (HTTP)
-                               |
-                               v
-                     +-------------------+
-                     |   SHARD ROUTER    |
-                     +-------------------+
-                               |
-             Consistent Hashing (Virtual Nodes)
-                               |
-          +--------------------+--------------------+
-          |                    |                    |
-          v                    v                    v
-      +-------+            +-------+            +-------+
-      |Shard 0|            |Shard 1|            |Shard 2|
-      +-------+            +-------+            +-------+
-          |                    |                    |
-     Raft Group 0         Raft Group 1         Raft Group 2
- (Node A, B, C)       (Node D, E, A)       (Node B, C, D)
-```
-
-### Physical Node Internals
-
-```
-+------------------------------------------------------------------------+
-|                          PHYSICAL NODE A                               |
-|                                                                        |
-|  +------------------------------------------------------------------+  |
-|  | Client KV API (/kv/:key, /cluster/*, /ws/events)                 |  |
-|  | - Transparent Shard Routing & Leader Forwarding                  |  |
-|  | - Linearizable Reads via Raft ReadIndex Protocol                 |  |
-|  | - Live Event Streaming via RFC 6455 WebSockets                   |  |
-|  +------------------------------------------------------------------+  |
-|                                                                        |
-|  +------------------------------------------------------------------+  |
-|  | Multiplexed Group-Aware HTTP Transport (/raft/vote, /raft/append)|  |
-|  +------------------------------------------------------------------+  |
-|             |                                            |             |
-|             v                                            v             |
-|  +---------------------+                      +---------------------+  |
-|  |   SHARD 0 REPLICA   |                      |   SHARD 1 REPLICA   |  |
-|  |   Raft Group 0      |                      |   Raft Group 1      |  |
-|  |   Term, Log, State  |                      |   Term, Log, State  |  |
-|  |   Isolated WAL/DB   |                      |   Isolated WAL/DB   |  |
-|  +---------------------+                      +---------------------+  |
-+------------------------------------------------------------------------+
-```
-
-### Key Architectural Invariants
-
-1. **Multi-Raft Consensus Independence**:
-   Each shard maintains its own term, log entries, commit index, election timer, and leader identity. A failure or term increase in Shard 0 never affects Shard 1.
-2. **Storage Isolation**:
-   Every shard replica maintains a strictly isolated data directory (`data/<node>/shards/shard-<id>/`), including its own `raft.log`, `metadata.json`, and database `wal.log`.
-3. **Transport Multiplexing**:
-   A single shared HTTP listener routes consensus RPCs to the appropriate local Raft group using the `group_id` header and payload field.
-4. **Linearizable Reads via ReadIndex**:
-   Reads query the shard leader, execute the Raft ReadIndex protocol to verify leadership against a strict majority quorum, wait for `lastApplied >= readIndex`, and return linearizable data. Partitioned leaders reject reads if quorum cannot be confirmed.
-5. **Deterministic Replica Placement**:
-   Replicas are assigned to physical nodes using the formula $R_i = (S \cdot K + i) \pmod N$, ensuring balanced shard distribution across cluster nodes.
 
 ---
 
-## Shard-Aware Client KV API
+## Core Subsystems
 
-All physical nodes provide the client HTTP API. When a request arrives at any node in the cluster, the router maps the key to its owning shard and forwards mutations or linearizable queries to the shard's active leader.
+### 1. LSM-Tree Storage Engine
+- **Write-Ahead Log (WAL)**: Formatted with CRC32 checksums, atomic appends, sequential monotonic stamps, and disk space reclamation via `TruncateBefore(seq)`.
+- **Memtables & Flushing**: Dynamic byte size tracking, automatic rotation into immutable queues, dedicated background flush worker, and writer backpressure (`maxImmutableCount`).
+- **SSTable Storage**: Length-prefixed block formats, binary-searchable sparse index, and false-positive configurable Bloom filters (1% FPR) for zero-disk-read misses.
+- **Leveled Compaction**: Multi-way merge compactor transitioning Level 0 tables into non-overlapping Level 1 sorted tables with automatic tombstone purging.
+- **MANIFEST**: Durable atomic metadata tracking all active SSTables, levels, checksums, and flushed watermarks with crash-recovery cleanup of orphaned files.
 
-| Method | Endpoint | Request Body | Description |
-|---|---|---|---|
-| `PUT` | `/kv/{key}` | `{"value":"Alice"}` | Put key-value pair. Automatically forwards to the shard leader. |
-| `GET` | `/kv/{key}` | _None_ | Linearizable read via Raft ReadIndex. Forwards to leader if received on follower. |
-| `DELETE` | `/kv/{key}` | _None_ | Delete key. Forwards to leader and replicates tombstone. |
-| `GET` | `/cluster/status` | _None_ | Static cluster metadata: cluster ID, epoch, shard count, node list. |
-| `GET` | `/cluster/health` | _None_ | Live real-time cluster health: online nodes, healthy shards, leaderless shards, replication health. |
-| `GET` | `/cluster/shards` | _None_ | Detailed shard topology, replica assignments, and current leaders. |
-| `GET` | `/cluster/nodes` | _None_ | List of physical cluster nodes. |
-| `GET` | `/ws/events` | _None_ | RFC 6455 WebSocket stream for live cluster events. |
+### 2. Multi-Raft Consensus
+- **Autonomous Consensus Groups**: Independent terms, logs, commit indices, and randomized election timers (150ms-300ms) per shard.
+- **Batch Replication & Lag**: Configurable batching limits (`MaxBatchEntries`) and follower lag measurement (`ReplicationLag`).
+- **State-Machine Snapshots**: Atomic state capture, sentinel log truncation, chunked streaming `InstallSnapshot` RPC, and apply-loop synchronization.
 
----
+### 3. Sharding, Dynamic Membership & Migration
+- **Consistent Hash Ring**: Deterministic mapping of UTF-8 keys to shards with minimal key movement on topology changes.
+- **Dynamic Membership**: Monotonically increasing `Epoch` tracking with atomic persistence to `cluster_metadata.json` and conflict prevention.
+- **Migration Coordinator**: Multi-phase replica migration (`TRANSFERRING_SNAPSHOT` $\to$ `CATCHING_UP` $\to$ `COMMITTING_PLACEMENT` $\to$ `COMPLETED`).
+- **Automatic Rebalancing**: Minimizes replica moves to maintain $\max(\text{load}) - \min(\text{load}) \le 1$.
 
-## Live Cluster Events (WebSocket)
+### 4. Distributed API & Client Routing
+- **REST Endpoints**: Versioned under `/` and `/api/v1/` for `GET`, `PUT`, `DELETE`.
+- **Batch Operations**: `POST /api/v1/kv/batch` for multi-key transactional write and read operations.
+- **Range Scans & Pagination**: `GET /api/v1/kv/scan` and `GET /api/v1/kv/prefix` supporting sorted cross-tier scans with `has_more` and `next_cursor`.
+- **Idempotency Keys**: `X-Idempotency-Key` caching for network retry replay deduplication.
+- **Transparent Forwarding**: Automatically forwards requests from follower replicas to active shard leaders.
 
-Connect to `ws://<node>/ws/events` to receive real-time JSON events:
+### 5. Observability, Metrics & Events
+- **Rolling Metrics Collector**: Tracks real-time RPS, reads/sec, writes/sec, latency percentiles (`p50`, `p95`, `p99`, `avg` in ms), error rates, and memory allocations via `GET /metrics` and `GET /api/v1/metrics`.
+- **Monotonic Event Sequencing**: Sequence numbers and `EventsSince(seq)` buffer allowing reconnecting WebSocket clients to catch up on missed events.
+- **Structured JSON Logging**: Correlated log records with correlation IDs, timestamps, and subsystem identifiers.
 
-```json
-{
-  "event_id": "a1b2c3d4e5f60718",
-  "type": "LEADER_CHANGED",
-  "timestamp": "2026-11-23T15:00:00Z",
-  "node_id": "node-a",
-  "shard_id": 1,
-  "data": {
-    "previous_leader": "node-b",
-    "current_leader": "node-a"
-  }
-}
-```
+### 6. Security & Hardening
+- **TLS & mTLS**: Production-ready server and client TLS configurations enforcing TLS 1.2/1.3 and mutual client certificate authentication.
+- **Role-Based Access Control (RBAC)**: Enforces `admin`, `writer`, and `reader` privilege tiers.
+- **Rate Limiting**: Token-bucket rate limiter per client IP address.
+- **Request Size Limits & Origin Validation**: Enforces maximum payload body size and CORS/Origin verification.
 
-### Event Types
-- `NODE_JOINED`: A physical node came online and registered with the cluster.
-- `NODE_DISCONNECTED`: A node heartbeat timed out or node stopped.
-- `LEADER_CHANGED`: A shard consensus group elected a new leader.
-- `TERM_CHANGED`: A Raft group transitioned to a new term.
-- `ENTRY_COMMITTED`: A mutation reached quorum commitment and applied to the state machine.
-- `SHARD_UPDATED`: Shard replica configuration or topology changed.
-
----
-
-## Cluster Observability
-
-The `internal/observability` subsystem exposes three levels of real-time operational status built directly from active Raft and node states (without mock or placeholder health values):
-
-1. **Node Status**:
-   - `node_id`, `online` / `offline`, `hosted_shard_ids`, `raft_group_count`, `last_observed_activity`.
-2. **Shard Status**:
-   - `shard_id`, `replica_node_ids`, `current_leader`, `current_term`, `commit_index`, `last_applied_index`, per-replica `replication_progress` (`match_index` and `next_index`).
-3. **Cluster Health**:
-   - `total_nodes`, `available_nodes`, `total_shards`, `healthy_shards`, `leaderless_shards`, and `replication_health` (`"healthy"`, `"degraded"`, `"unavailable"`).
-
----
-
-## Running the Automated Test Suite
-
-Run the complete multi-group test suite with the Go race detector enabled across all packages:
-
+### 7. Benchmarks (`orbit-bench`)
+Configurable performance benchmarking CLI for storage engines, databases, and multi-node clusters:
 ```bash
-go test -v -race -timeout 180s ./...
+go run ./cmd/orbit-bench -target storage -concurrency 8 -duration 10s -read-ratio 0.8
+go run ./cmd/orbit-bench -target storage -scenario during_compaction -concurrency 4
+go run ./cmd/orbit-bench -target cluster -url http://localhost:2525 -compare baseline.json
 ```
 
-To run specific test packages:
+### 8. Chaos Lab (`orbit-chaos`)
+Distributed fault injection framework testing real-world failures:
+- Node failure, kill leader, kill followers, partition leader from majority.
+- Network delay, packet loss, RPC timeout, and dynamic partition healing via `ChaosTransport`.
+- Storage crashes during WAL append, memtable flush, compaction, SSTable corruption, and snapshot recovery.
 ```bash
-# Core consensus & multi-group tests
-go test -v -race ./internal/raft/...
-
-# Sharding & consistent hashing tests
-go test -v -race ./internal/sharding/...
-
-# Shard routing & forwarder tests
-go test -v -race ./internal/router/...
-
-# Cluster observability & WebSocket tests
-go test -v -race ./internal/observability/...
-
-# End-to-end integration and API tests
-go test -v -race ./tests/...
+go run ./cmd/orbit-chaos -action run -fault wal-crash -target data/node-a/wal.log
 ```
+
+---
+
+## Quickstart
+
+### Running with Docker Compose (5 Nodes, 3 Shards)
+```bash
+docker compose up -d
+```
+Verify cluster health:
+```bash
+curl http://localhost:2525/live
+curl http://localhost:2525/ready
+curl http://localhost:2525/cluster/status
+curl http://localhost:2525/metrics
+```
+
+### Running Locally from Source
+```bash
+# Start physical node A
+go run ./cmd/orbit -config configs/node-a.json -cluster configs/cluster.json
+
+# Perform a distributed write
+curl -X PUT http://localhost:2525/api/v1/kv/user:100 \
+     -H "Content-Type: application/json" \
+     -d '{"value":"Alice"}'
+
+# Read back from any physical node (e.g. node B on port 2526)
+curl http://localhost:2526/api/v1/kv/user:100
+```
+
+---
+
+## Testing & Quality Verification
+
+Run the full test suite with the Go race detector:
+```bash
+go test -v -race ./...
+```
+
+Run static analysis:
+```bash
+go vet ./...
+```
+
+Run fuzz testing:
+```bash
+go test -v ./tests/ -run Fuzz
+```
+
+Build all project executables:
+```bash
+go build ./cmd/orbit
+go build ./cmd/orbit-bench
+go build ./cmd/orbit-chaos
+go build ./cmd/orbit-admin
+```
+
+---
+
+## Documentation Index
+
+- [Architecture Guide](docs/ARCHITECTURE.md)
+- [LSM Storage Engine](docs/STORAGE_ENGINE.md)
+- [Multi-Raft Consensus](docs/CONSENSUS_RAFT.md)
+- [Sharding & Rebalancing](docs/SHARDING_AND_REBALANCING.md)
+- [HTTP API Reference](docs/API_REFERENCE.md)
+- [Deployment & Operations](docs/DEPLOYMENT_AND_OPERATIONS.md)
+- [Benchmarks & Chaos Lab](docs/BENCHMARKS_AND_CHAOS.md)

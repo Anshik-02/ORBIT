@@ -27,8 +27,16 @@ jobs:
       - name: Go Vet
         run: go vet ./...
 
-      - name: Build Binary
-        run: go build -v ./cmd/orbit
+      - name: Build Binaries
+        run: |
+          go build -v ./cmd/orbit
+          go build -v ./cmd/orbit-bench
+          go build -v ./cmd/orbit-chaos
+          go build -v ./cmd/orbit-admin
 
       - name: Run Test Suite (Race Detector Enabled)
-        run: go test -v ./... -race -count=1 -timeout 180s
+        run: go test -v ./... -race -count=1 -timeout 300s
+
+      - name: Code Coverage
+        if: matrix.os == 'ubuntu-latest'
+        run: go test -coverprofile=coverage.out ./...

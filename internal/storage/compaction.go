@@ -125,6 +125,11 @@ func (c *Compactor) CompactLevel0ToLevel1() (*CompactionResult, error) {
 			mergedMap[entry.Key] = entry
 		}
 	}
+	// Close input readers immediately so files are unlocked on disk
+	for _, r := range inputReaders {
+		_ = r.Close()
+	}
+	inputReaders = nil
 
 	// Check if higher levels (L2+) exist. If not, tombstones can be dropped!
 	hasHigherLevels := false
@@ -233,6 +238,7 @@ func (c *Compactor) CompactLevel0ToLevel1() (*CompactionResult, error) {
 
 		// Replace engine SSTables list
 		c.engine.sstables = append(remainingReaders, newReaders...)
+		c.engine.sortSSTablesLocked()
 		c.engine.writeMu.Unlock()
 
 		// Close old readers outside writeMu
@@ -313,6 +319,11 @@ func (c *Compactor) MajorCompaction() (*CompactionResult, error) {
 			mergedMap[entry.Key] = entry
 		}
 	}
+	// Close input readers immediately so files are unlocked on disk
+	for _, r := range inputReaders {
+		_ = r.Close()
+	}
+	inputReaders = nil
 
 	// In MajorCompaction, ALL levels are compacted, so all tombstones can be safely discarded
 	sortedKeys := make([]string, 0, len(mergedMap))
@@ -409,6 +420,7 @@ func (c *Compactor) MajorCompaction() (*CompactionResult, error) {
 		}
 
 		c.engine.sstables = append(remainingReaders, newReaders...)
+		c.engine.sortSSTablesLocked()
 		c.engine.writeMu.Unlock()
 
 		for _, r := range toCloseReaders {
