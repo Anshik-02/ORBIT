@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -51,23 +52,37 @@ type CommittedCommand struct {
 	Value     string
 }
 
+const (
+	// DefaultMemtableLimit is the default memory threshold (4MB) before rotating to an immutable memtable.
+	DefaultMemtableLimit int64 = 4 * 1024 * 1024
+)
+
 // Engine is the core storage component of ORBIT.
 //
 // Invariants & Concurrency:
 //   - Exclusive OS-level file locking prevents multiple processes on the same data.
 //   - Mutations (ApplyCommitted, Set, Delete) serialize through `writeMu`.
-//   - Read operations (Get) are non-blocking and concurrent via Memtable RLock.
-//   - Single-pass streaming WAL replay on boot reconstructs Memtable AND restores lastAppliedIndex.
-//   - Enforces contiguous sequential application for consensus commands (no gaps allowed).
+//   - Memtable rotation triggers when active memtable reaches `memtableSizeLimit`.
+//   - Background flushing converts immutable memtables into SSTables without blocking new writes.
+//   - Read operations (Get) check active memtable, immutable memtables, and SSTables (newest to oldest).
+//   - Tombstones prevent deleted keys from resurfacing in older SSTables.
+//   - Single-pass streaming WAL replay on boot reconstructs state AND restores lastAppliedIndex.
 //   - Durable snapshots in engine.snapshot survive node restarts without WAL dependency.
 type Engine struct {
-	memtable         *Memtable
-	wal              *wal.Log
-	snapPath         string
-	writeMu          sync.Mutex  // serializes WAL append + Memtable update transaction
-	closed           atomic.Bool // tracks shutdown state
-	closeErr         error       // sticky error from Close()
-	lastAppliedIndex uint64      // highest applied Raft index for idempotency
+	memtable          *Memtable
+	immutable         []*Memtable
+	sstables          []*SSTableReader
+	wal               *wal.Log
+	dataDir           string
+	sstDir            string
+	snapPath          string
+	writeMu           sync.Mutex  // serializes WAL append + Memtable update transaction
+	flushMu           sync.Mutex  // serializes background and foreground flushing of immutable memtables
+	closed            atomic.Bool // tracks shutdown state
+	closeErr          error       // sticky error from Close()
+	lastAppliedIndex  uint64      // highest applied Raft index for idempotency
+	memtableSizeLimit int64       // byte limit before memtable rotation
+	nextSSTableID     uint64      // monotonic sequence counter for SSTable filenames
 }
 
 // NewEngine opens the WAL at walPath, recovers durable snapshot state if present,
@@ -79,13 +94,26 @@ func NewEngine(walPath string) (*Engine, error) {
 		return nil, fmt.Errorf("storage: open wal: %w", err)
 	}
 
-	engine := &Engine{
-		memtable: NewMemtable(),
-		wal:      w,
-		snapPath: filepath.Join(filepath.Dir(walPath), "engine.snapshot"),
+	dataDir := filepath.Dir(walPath)
+	sstDir := filepath.Join(dataDir, "sstables")
+	if err := os.MkdirAll(sstDir, 0700); err != nil {
+		_ = w.Close()
+		return nil, fmt.Errorf("storage: create sstables dir: %w", err)
 	}
 
-	// Reconstruct state machine from durable snapshot and subsequent WAL entries
+	engine := &Engine{
+		memtable:          NewMemtable(),
+		immutable:         make([]*Memtable, 0),
+		sstables:          make([]*SSTableReader, 0),
+		wal:               w,
+		dataDir:           dataDir,
+		sstDir:            sstDir,
+		snapPath:          filepath.Join(dataDir, "engine.snapshot"),
+		memtableSizeLimit: DefaultMemtableLimit,
+		nextSSTableID:     1,
+	}
+
+	// Reconstruct state machine from durable snapshot, SSTables, and subsequent WAL entries
 	if err := engine.recover(); err != nil {
 		w.Close()
 		return nil, fmt.Errorf("storage: recovery failed: %w", err)
@@ -94,10 +122,10 @@ func NewEngine(walPath string) (*Engine, error) {
 	return engine, nil
 }
 
-// recover restores Memtable and lastAppliedIndex from engine.snapshot (if present),
+// recover restores Memtable, SSTables, and lastAppliedIndex from disk,
 // then streams subsequent WAL records.
 func (e *Engine) recover() error {
-	// 0. Crash recovery for engine.snapshot.tmp
+	// 0. Crash recovery for engine.snapshot.tmp and cleanup incomplete .sst.tmp files
 	tmpSnap := e.snapPath + ".tmp"
 	if _, err := os.Stat(tmpSnap); err == nil {
 		if _, err := os.Stat(e.snapPath); errors.Is(err, os.ErrNotExist) {
@@ -107,7 +135,43 @@ func (e *Engine) recover() error {
 		}
 	}
 
-	// 1. Recover engine.snapshot if present
+	// Clean up stale temporary sstable files from crashes
+	if entries, err := os.ReadDir(e.sstDir); err == nil {
+		for _, entry := range entries {
+			if filepath.Ext(entry.Name()) == ".tmp" {
+				_ = os.Remove(filepath.Join(e.sstDir, entry.Name()))
+			}
+		}
+	}
+
+	// 1. Recover existing SSTables in numeric sequence order
+	if entries, err := os.ReadDir(e.sstDir); err == nil {
+		var sstFiles []string
+		for _, entry := range entries {
+			if !entry.IsDir() && filepath.Ext(entry.Name()) == ".sst" {
+				sstFiles = append(sstFiles, entry.Name())
+			}
+		}
+		sort.Strings(sstFiles)
+
+		for _, fname := range sstFiles {
+			fullPath := filepath.Join(e.sstDir, fname)
+			reader, err := OpenSSTableReader(fullPath)
+			if err != nil {
+				return fmt.Errorf("storage: open sstable %s: %w", fname, err)
+			}
+			e.sstables = append(e.sstables, reader)
+
+			var fileID uint64
+			if _, sErr := fmt.Sscanf(fname, "%06d.sst", &fileID); sErr == nil {
+				if fileID >= e.nextSSTableID {
+					e.nextSSTableID = fileID + 1
+				}
+			}
+		}
+	}
+
+	// 2. Recover engine.snapshot if present
 	if data, err := os.ReadFile(e.snapPath); err == nil && len(data) > 0 {
 		var container EngineSnapshotContainer
 		if err := json.Unmarshal(data, &container); err != nil {
@@ -130,7 +194,7 @@ func (e *Engine) recover() error {
 		e.lastAppliedIndex = container.Index
 	}
 
-	// 2. Stream WAL records, skipping entries already incorporated into the snapshot
+	// 3. Stream WAL records, skipping entries already incorporated into the snapshot
 	return e.wal.Replay(func(r wal.Record) error {
 		if r.RaftIndex > 0 && r.RaftIndex <= e.lastAppliedIndex {
 			return nil
@@ -228,7 +292,127 @@ func (e *Engine) ApplyCommitted(cmd CommittedCommand) error {
 		e.lastAppliedIndex = cmd.RaftIndex
 	}
 
+	// Rotate active memtable to immutable if memory threshold exceeded
+	if e.memtable.SizeBytes() >= e.memtableSizeLimit {
+		e.rotateMemtableLocked()
+	}
+
 	return nil
+}
+
+// RotateMemtable moves the current active memtable into the immutable queue
+// and creates a fresh active memtable, triggering background flushing.
+func (e *Engine) RotateMemtable() {
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	e.rotateMemtableLocked()
+}
+
+func (e *Engine) rotateMemtableLocked() {
+	if e.memtable.Len() == 0 {
+		return
+	}
+	e.immutable = append(e.immutable, e.memtable)
+	e.memtable = NewMemtable()
+	go func() {
+		_ = e.Flush()
+	}()
+}
+
+// Flush synchronously drains all immutable memtables to SSTables on disk.
+func (e *Engine) Flush() error {
+	e.flushMu.Lock()
+	defer e.flushMu.Unlock()
+
+	for {
+		if e.closed.Load() {
+			return ErrClosed
+		}
+
+		e.writeMu.Lock()
+		if len(e.immutable) == 0 {
+			e.writeMu.Unlock()
+			return nil
+		}
+		oldest := e.immutable[0]
+		sstID := e.nextSSTableID
+		e.nextSSTableID++
+		sstPath := filepath.Join(e.sstDir, fmt.Sprintf("%06d.sst", sstID))
+		e.writeMu.Unlock()
+
+		entries := oldest.EntriesSorted()
+		if len(entries) > 0 {
+			writer, err := NewSSTableWriter(sstPath, 0, defaultSparseInterval, DefaultBloomFPRate)
+			if err != nil {
+				return fmt.Errorf("storage flush: create sstable writer: %w", err)
+			}
+			for _, entry := range entries {
+				if err := writer.Append(entry); err != nil {
+					return fmt.Errorf("storage flush: append entry: %w", err)
+				}
+			}
+			if _, err := writer.Finish(); err != nil {
+				return fmt.Errorf("storage flush: finish sstable: %w", err)
+			}
+
+			reader, err := OpenSSTableReader(sstPath)
+			if err != nil {
+				return fmt.Errorf("storage flush: open sstable reader: %w", err)
+			}
+
+			e.writeMu.Lock()
+			e.sstables = append(e.sstables, reader)
+			if len(e.immutable) > 0 && e.immutable[0] == oldest {
+				e.immutable = e.immutable[1:]
+			}
+			e.writeMu.Unlock()
+		} else {
+			e.writeMu.Lock()
+			if len(e.immutable) > 0 && e.immutable[0] == oldest {
+				e.immutable = e.immutable[1:]
+			}
+			e.writeMu.Unlock()
+		}
+	}
+}
+
+// SetMemtableSizeLimit configures the byte threshold that triggers memtable rotation.
+func (e *Engine) SetMemtableSizeLimit(limit int64) {
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	if limit > 0 {
+		e.memtableSizeLimit = limit
+	}
+}
+
+// MemtableSizeBytes returns the active memtable's in-memory byte size.
+func (e *Engine) MemtableSizeBytes() int64 {
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	return e.memtable.SizeBytes()
+}
+
+// ImmutableCount returns the number of immutable memtables pending flush.
+func (e *Engine) ImmutableCount() int {
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	return len(e.immutable)
+}
+
+// SSTablesCount returns the number of active SSTables loaded in the engine.
+func (e *Engine) SSTablesCount() int {
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	return len(e.sstables)
+}
+
+// SSTables returns a snapshot copy of current SSTable readers.
+func (e *Engine) SSTables() []*SSTableReader {
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	cp := make([]*SSTableReader, len(e.sstables))
+	copy(cp, e.sstables)
+	return cp
 }
 
 // LastAppliedIndex returns the highest committed consensus index applied to this engine.
@@ -311,7 +495,20 @@ func (e *Engine) InstallSnapshot(meta SnapshotMetadata, state map[string]string)
 		return fmt.Errorf("storage: reset wal after snapshot install: %w", err)
 	}
 
-	// 3. Atomically update in-memory state
+	// 3. Purge existing SSTables since snapshot replaces authoritative state
+	for _, reader := range e.sstables {
+		_ = reader.Close()
+	}
+	e.sstables = make([]*SSTableReader, 0)
+	e.immutable = make([]*Memtable, 0)
+
+	if sstEntries, err := os.ReadDir(e.sstDir); err == nil {
+		for _, sstEntry := range sstEntries {
+			_ = os.Remove(filepath.Join(e.sstDir, sstEntry.Name()))
+		}
+	}
+
+	// 4. Atomically update in-memory state
 	newMem := NewMemtable()
 	for k, v := range state {
 		newMem.Set(k, v)
@@ -320,6 +517,50 @@ func (e *Engine) InstallSnapshot(meta SnapshotMetadata, state map[string]string)
 	e.memtable = newMem
 	e.lastAppliedIndex = meta.Index
 	return nil
+}
+
+// allLiveStateLocked constructs a point-in-time map of all live key-values
+// by overlaying SSTables (oldest to newest), immutable memtables (oldest to newest),
+// and the active memtable, accurately respecting tombstones.
+func (e *Engine) allLiveStateLocked() (map[string]string, error) {
+	state := make(map[string]string)
+
+	// 1. Overlay SSTables (oldest to newest)
+	for _, reader := range e.sstables {
+		entries, err := reader.AllEntries()
+		if err != nil {
+			return nil, fmt.Errorf("storage: read sstable entries for snapshot: %w", err)
+		}
+		for _, entry := range entries {
+			if entry.IsTombstone {
+				delete(state, entry.Key)
+			} else {
+				state[entry.Key] = entry.Value
+			}
+		}
+	}
+
+	// 2. Overlay immutable memtables (oldest to newest)
+	for _, imm := range e.immutable {
+		for _, entry := range imm.EntriesSorted() {
+			if entry.IsTombstone {
+				delete(state, entry.Key)
+			} else {
+				state[entry.Key] = entry.Value
+			}
+		}
+	}
+
+	// 3. Overlay active memtable
+	for _, entry := range e.memtable.EntriesSorted() {
+		if entry.IsTombstone {
+			delete(state, entry.Key)
+		} else {
+			state[entry.Key] = entry.Value
+		}
+	}
+
+	return state, nil
 }
 
 // SaveSnapshot durably persists the current in-memory database state and applied index to disk.
@@ -335,7 +576,11 @@ func (e *Engine) SaveSnapshot(meta SnapshotMetadata) error {
 		return ErrClosed
 	}
 
-	state := e.memtable.All()
+	state, err := e.allLiveStateLocked()
+	if err != nil {
+		return err
+	}
+
 	stateBytes, err := json.Marshal(state)
 	if err != nil {
 		return fmt.Errorf("storage: marshal state for snapshot: %w", err)
@@ -355,7 +600,7 @@ func (e *Engine) SaveSnapshot(meta SnapshotMetadata) error {
 	return atomicWriteFileWithDirSync(e.snapPath, containerBytes, 0600)
 }
 
-// ExportSnapshot returns the current applied Raft index and a point-in-time copy of memtable state.
+// ExportSnapshot returns the current applied Raft index and a point-in-time copy of all live key-values.
 func (e *Engine) ExportSnapshot() (uint64, map[string]string, error) {
 	if e.closed.Load() {
 		return 0, nil, ErrClosed
@@ -368,7 +613,12 @@ func (e *Engine) ExportSnapshot() (uint64, map[string]string, error) {
 		return 0, nil, ErrClosed
 	}
 
-	return e.lastAppliedIndex, e.memtable.All(), nil
+	state, err := e.allLiveStateLocked()
+	if err != nil {
+		return 0, nil, err
+	}
+
+	return e.lastAppliedIndex, state, nil
 }
 
 // ExportSnapshotBytes exports the current state machine data as serialized JSON bytes with its applied Raft index.
@@ -459,13 +709,58 @@ func (e *Engine) Set(key, value string) error {
 	})
 }
 
-// Get retrieves the value for key.
-// Returns ("", false) if closed or key is not found.
+// Get retrieves the value for key across the LSM hierarchy:
+//  1. Active Memtable (with tombstone check)
+//  2. Immutable Memtables from newest to oldest (with tombstone check)
+//  3. SSTables from newest to oldest (with Bloom filter and tombstone check)
+//
+// Returns ("", false) if closed, absent, or marked with a tombstone.
 func (e *Engine) Get(key string) (string, bool) {
 	if e.closed.Load() {
 		return "", false
 	}
-	return e.memtable.Get(key)
+
+	e.writeMu.Lock()
+	// 1. Check active Memtable
+	if entry, found := e.memtable.GetEntry(key); found {
+		e.writeMu.Unlock()
+		if entry.IsTombstone {
+			return "", false
+		}
+		return entry.Value, true
+	}
+
+	// 2. Check immutable Memtables in reverse (newest to oldest)
+	for i := len(e.immutable) - 1; i >= 0; i-- {
+		if entry, found := e.immutable[i].GetEntry(key); found {
+			e.writeMu.Unlock()
+			if entry.IsTombstone {
+				return "", false
+			}
+			return entry.Value, true
+		}
+	}
+
+	// Snapshot list of SSTable readers so we can search without holding writeMu
+	readers := make([]*SSTableReader, len(e.sstables))
+	copy(readers, e.sstables)
+	e.writeMu.Unlock()
+
+	// 3. Check SSTables from newest to oldest
+	for i := len(readers) - 1; i >= 0; i-- {
+		val, found, isTomb, err := readers[i].Get(key)
+		if err != nil {
+			continue
+		}
+		if found {
+			if isTomb {
+				return "", false
+			}
+			return val, true
+		}
+	}
+
+	return "", false
 }
 
 // Delete removes key from the database.
@@ -485,7 +780,7 @@ func (e *Engine) Health() error {
 	return e.wal.Health()
 }
 
-// Close safely flushes the WAL, closes file handles, and releases the exclusive process lock.
+// Close safely flushes the WAL, closes all SSTables, and releases resources.
 // Retains sticky error: if close fails, subsequent invocations return the same error.
 func (e *Engine) Close() error {
 	e.writeMu.Lock()
@@ -496,9 +791,18 @@ func (e *Engine) Close() error {
 	}
 	e.closed.Store(true)
 
+	// Close all SSTable readers
+	for _, reader := range e.sstables {
+		if err := reader.Close(); err != nil && e.closeErr == nil {
+			e.closeErr = err
+		}
+	}
+	e.sstables = nil
+	e.immutable = nil
+
 	if err := e.wal.Close(); err != nil {
 		e.closeErr = fmt.Errorf("storage: close wal: %w", err)
 		return e.closeErr
 	}
-	return nil
+	return e.closeErr
 }
