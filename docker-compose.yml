@@ -1,0 +1,148 @@
+version: '3.8'
+
+networks:
+  orbit-cluster-net:
+    driver: bridge
+
+volumes:
+  orbit_data_a:
+  orbit_data_b:
+  orbit_data_c:
+  orbit_data_d:
+  orbit_data_e:
+
+services:
+  node-a:
+    build: .
+    container_name: orbit-node-a
+    command: ["-config", "configs/node-a.json", "-cluster", "configs/cluster.json"]
+    environment:
+      - ORBIT_NODE_ID=node-a
+      - ORBIT_ADDRESS=0.0.0.0:2525
+      - ORBIT_RAFT_ADDRESS=0.0.0.0:3525
+    ports:
+      - "2525:2525"
+      - "3525:3525"
+    volumes:
+      - orbit_data_a:/home/orbit/data
+    networks:
+      - orbit-cluster-net
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:2525/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  node-b:
+    build: .
+    container_name: orbit-node-b
+    command: ["-config", "configs/node-b.json", "-cluster", "configs/cluster.json"]
+    environment:
+      - ORBIT_NODE_ID=node-b
+      - ORBIT_ADDRESS=0.0.0.0:2526
+      - ORBIT_RAFT_ADDRESS=0.0.0.0:3526
+    ports:
+      - "2526:2526"
+      - "3526:3526"
+    volumes:
+      - orbit_data_b:/home/orbit/data
+    networks:
+      - orbit-cluster-net
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:2526/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  node-c:
+    build: .
+    container_name: orbit-node-c
+    command: ["-config", "configs/node-c.json", "-cluster", "configs/cluster.json"]
+    environment:
+      - ORBIT_NODE_ID=node-c
+      - ORBIT_ADDRESS=0.0.0.0:2527
+      - ORBIT_RAFT_ADDRESS=0.0.0.0:3527
+    ports:
+      - "2527:2527"
+      - "3527:3527"
+    volumes:
+      - orbit_data_c:/home/orbit/data
+    networks:
+      - orbit-cluster-net
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:2527/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  node-d:
+    build: .
+    container_name: orbit-node-d
+    command: ["-config", "configs/node-d.json", "-cluster", "configs/cluster.json"]
+    environment:
+      - ORBIT_NODE_ID=node-d
+      - ORBIT_ADDRESS=0.0.0.0:2528
+      - ORBIT_RAFT_ADDRESS=0.0.0.0:3528
+    ports:
+      - "2528:2528"
+      - "3528:3528"
+    volumes:
+      - orbit_data_d:/home/orbit/data
+    networks:
+      - orbit-cluster-net
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:2528/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  node-e:
+    build: .
+    container_name: orbit-node-e
+    command: ["-config", "configs/node-e.json", "-cluster", "configs/cluster.json"]
+    environment:
+      - ORBIT_NODE_ID=node-e
+      - ORBIT_ADDRESS=0.0.0.0:2529
+      - ORBIT_RAFT_ADDRESS=0.0.0.0:3529
+    ports:
+      - "2529:2529"
+      - "3529:3529"
+    volumes:
+      - orbit_data_e:/home/orbit/data
+    networks:
+      - orbit-cluster-net
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:2529/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 3

@@ -33,6 +33,13 @@ func main() {
 	flag.StringVar(&clusterConfigFile, "cluster", "configs/cluster.json", "path to cluster metadata JSON (e.g. configs/cluster.json)")
 	flag.Parse()
 
+	if configFile == "" {
+		configFile = os.Getenv("ORBIT_CONFIG_PATH")
+	}
+	if clusterConfigFile == "configs/cluster.json" && os.Getenv("ORBIT_CLUSTER_CONFIG") != "" {
+		clusterConfigFile = os.Getenv("ORBIT_CLUSTER_CONFIG")
+	}
+
 	if configFile != "" {
 		runClusterNode(configFile, clusterConfigFile)
 		return

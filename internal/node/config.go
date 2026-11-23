@@ -104,6 +104,25 @@ func LoadConfig(path string) (NodeConfig, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return NodeConfig{}, fmt.Errorf("node: parse config JSON %q: %w", path, err)
 	}
+
+	// Environment variable overrides
+	if envID := os.Getenv("ORBIT_NODE_ID"); envID != "" {
+		cfg.ID = envID
+	}
+	if envAddr := os.Getenv("ORBIT_ADDRESS"); envAddr != "" {
+		cfg.Address = envAddr
+	} else if envHTTP := os.Getenv("ORBIT_HTTP_ADDR"); envHTTP != "" {
+		cfg.Address = envHTTP
+	}
+	if envRaft := os.Getenv("ORBIT_RAFT_ADDRESS"); envRaft != "" {
+		cfg.RaftAddress = envRaft
+	} else if envRaftAddr := os.Getenv("ORBIT_RAFT_ADDR"); envRaftAddr != "" {
+		cfg.RaftAddress = envRaftAddr
+	}
+	if envDir := os.Getenv("ORBIT_DATA_DIR"); envDir != "" {
+		cfg.DataDir = envDir
+	}
+
 	if err := cfg.Validate(); err != nil {
 		return NodeConfig{}, fmt.Errorf("node: validate config %q: %w", path, err)
 	}

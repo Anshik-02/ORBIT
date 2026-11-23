@@ -297,6 +297,8 @@ func RegisterKVRoutes(mux *http.ServeMux, h *KVHandler) {
 	mux.HandleFunc("/cluster/shards", h.handleClusterShards)
 	mux.HandleFunc("/cluster/nodes", h.handleClusterNodes)
 	mux.HandleFunc("/metrics", h.metrics.ServeHTTP)
+	mux.HandleFunc("/live", h.handleLiveness)
+	mux.HandleFunc("/ready", h.handleReadiness)
 
 	// Versioned v1 API routes (/api/v1/...)
 	mux.HandleFunc("/api/v1/kv/", h.handleKV)
@@ -314,6 +316,8 @@ func RegisterKVRoutes(mux *http.ServeMux, h *KVHandler) {
 	mux.HandleFunc("/api/v1/cluster/shards", h.handleClusterShards)
 	mux.HandleFunc("/api/v1/cluster/nodes", h.handleClusterNodes)
 	mux.HandleFunc("/api/v1/metrics", h.metrics.ServeHTTP)
+	mux.HandleFunc("/api/v1/live", h.handleLiveness)
+	mux.HandleFunc("/api/v1/ready", h.handleReadiness)
 
 	if h.wsHub != nil {
 		h.wsHub.RegisterRoutes(mux, "/ws/events")
@@ -1226,5 +1230,44 @@ func (h *KVHandler) handlePrefixScan(w http.ResponseWriter, r *http.Request, req
 		HasMore:    hasMore,
 		NextCursor: nextCursor,
 		RequestID:  reqID,
+	})
+}
+
+// handleLiveness responds to process liveness probes.
+func (h *KVHandler) handleLiveness(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":    "ALIVE",
+		"node_id":   h.localNodeID,
+		"timestamp": time.Now().UTC(),
+	})
+}
+
+// handleReadiness responds to cluster and storage readiness probes.
+func (h *KVHandler) handleReadiness(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if h.provider != nil {
+		instances := h.provider.ShardInstances()
+		for sid, inst := range instances {
+			if inst.DB() != nil {
+				if err := inst.DB().Health(); err != nil {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"status":   "NOT_READY",
+						"node_id":  h.localNodeID,
+						"shard_id": sid,
+						"error":    err.Error(),
+					})
+					return
+				}
+			}
+		}
+	}
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":    "READY",
+		"node_id":   h.localNodeID,
+		"timestamp": time.Now().UTC(),
 	})
 }
