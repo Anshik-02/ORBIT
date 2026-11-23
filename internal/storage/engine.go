@@ -961,6 +961,33 @@ func atomicWriteFileWithDirSync(path string, data []byte, perm os.FileMode) erro
 	return nil
 }
 
+// CreateBackup creates a point-in-time, isolated backup of the active engine.
+// It synchronizes all in-flight flushes and holds write and flush locks so no compaction
+// or SSTable deletion can occur concurrently, guaranteeing a 100% consistent snapshot.
+func (e *Engine) CreateBackup(backupBaseDir string) (string, error) {
+	if e.closed.Load() {
+		return "", ErrClosed
+	}
+
+	// Drain any in-flight immutable memtables to SSTables first
+	if err := e.drainImmutableMemtables(); err != nil {
+		return "", fmt.Errorf("storage backup: drain memtables: %w", err)
+	}
+
+	e.flushMu.Lock()
+	defer e.flushMu.Unlock()
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+
+	// Persist the manifest cleanly
+	if err := e.manifest.saveLocked(); err != nil {
+		return "", fmt.Errorf("storage backup: save manifest: %w", err)
+	}
+
+	// Now delegate to CreateBackup which will copy the exact manifest, active SSTables, and WAL safely
+	return CreateBackup(e.dataDir, backupBaseDir)
+}
+
 // Close safely drains flushes, stops the background worker, closes all SSTables,
 // persists the manifest, and releases WAL locks.
 func (e *Engine) Close() error {

@@ -373,11 +373,12 @@ func (c *WebSocketClient) Close() {
 
 // WebSocketHub manages live WebSocket connections streaming cluster events to dashboard clients.
 type WebSocketHub struct {
-	hub       *EventHub
-	mu        sync.Mutex
-	clients   map[*WebSocketClient]struct{}
-	closeCh   chan struct{}
-	closeOnce sync.Once
+	hub           *EventHub
+	mu            sync.Mutex
+	clients       map[*WebSocketClient]struct{}
+	closeCh       chan struct{}
+	closeOnce     sync.Once
+	authValidator func(*http.Request) error
 }
 
 // NewWebSocketHub constructs a WebSocketHub connected to the given EventHub.
@@ -390,6 +391,13 @@ func NewWebSocketHub(eventHub *EventHub) *WebSocketHub {
 
 	go wsh.eventLoop()
 	return wsh
+}
+
+// SetAuthValidator sets an authentication validation callback required before upgrading WebSocket connections.
+func (wsh *WebSocketHub) SetAuthValidator(fn func(*http.Request) error) {
+	wsh.mu.Lock()
+	defer wsh.mu.Unlock()
+	wsh.authValidator = fn
 }
 
 // RegisterRoutes attaches the WebSocket endpoint handler to the provided HTTP mux.
@@ -442,6 +450,17 @@ func (wsh *WebSocketHub) HandleWebSocket(w http.ResponseWriter, r *http.Request)
 		w.Header().Set("Allow", "GET")
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
+	}
+
+	// 0. Authenticate connection if an auth validator is configured
+	wsh.mu.Lock()
+	validator := wsh.authValidator
+	wsh.mu.Unlock()
+	if validator != nil {
+		if err := validator(r); err != nil {
+			http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
+			return
+		}
 	}
 
 	// 1. Validate Connection header contains "upgrade"

@@ -3,6 +3,8 @@ package raft
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,13 +20,15 @@ const maxRPCRequestBodyBytes = 4 * 1024 * 1024 // 4MB maximum Raft RPC payload s
 
 // HTTPTransport implements inter-node Raft communication over HTTP/JSON with multi-group support.
 type HTTPTransport struct {
-	mu       sync.RWMutex
-	addr     string
-	handlers map[GroupID]RPCHandler
-	server   *http.Server
-	client   *http.Client
-	listener net.Listener
-	closed   bool
+	mu            sync.RWMutex
+	addr          string
+	handlers      map[GroupID]RPCHandler
+	server        *http.Server
+	client        *http.Client
+	listener      net.Listener
+	closed        bool
+	tlsConfig     *tls.Config
+	clusterSecret string
 }
 
 // NewHTTPTransport creates an HTTP-based transport listening on addr.
@@ -47,6 +51,23 @@ func NewHTTPTransport(addr string) *HTTPTransport {
 			Timeout:   500 * time.Millisecond,
 		},
 	}
+}
+
+// SetTLSConfig configures TLS/mTLS for both server listening and client outbound connections.
+func (t *HTTPTransport) SetTLSConfig(cfg *tls.Config) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.tlsConfig = cfg
+	if tr, ok := t.client.Transport.(*http.Transport); ok {
+		tr.TLSClientConfig = cfg
+	}
+}
+
+// SetClusterSecret configures an internal shared secret header required on all Raft RPCs.
+func (t *HTTPTransport) SetClusterSecret(secret string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.clusterSecret = secret
 }
 
 // RegisterHandler registers an RPCHandler for a specific consensus group.
@@ -105,11 +126,15 @@ func (t *HTTPTransport) Start() error {
 	if err != nil {
 		return fmt.Errorf("http transport listen on %s: %w", t.addr, err)
 	}
+	if t.tlsConfig != nil {
+		ln = tls.NewListener(ln, t.tlsConfig)
+	}
 	t.listener = ln
 	t.addr = ln.Addr().String()
 
 	t.server = &http.Server{
 		Handler:           mux,
+		TLSConfig:         t.tlsConfig,
 		ReadHeaderTimeout: 2 * time.Second,
 		ReadTimeout:       5 * time.Second,
 		WriteTimeout:      5 * time.Second,
@@ -123,6 +148,31 @@ func (t *HTTPTransport) Start() error {
 	}()
 
 	return nil
+}
+
+func (t *HTTPTransport) authenticateRequest(w http.ResponseWriter, r *http.Request) bool {
+	t.mu.RLock()
+	secret := t.clusterSecret
+	tlsCfg := t.tlsConfig
+	t.mu.RUnlock()
+
+	// Check mutual TLS if enforced
+	if tlsCfg != nil && tlsCfg.ClientAuth == tls.RequireAndVerifyClientCert {
+		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+			http.Error(w, "client certificate required", http.StatusUnauthorized)
+			return false
+		}
+	}
+
+	// Check cluster secret if configured
+	if secret != "" {
+		incoming := r.Header.Get("X-Orbit-Cluster-Secret")
+		if subtle.ConstantTimeCompare([]byte(incoming), []byte(secret)) != 1 {
+			http.Error(w, "invalid cluster secret", http.StatusUnauthorized)
+			return false
+		}
+	}
+	return true
 }
 
 // Addr returns the bound network address.
@@ -153,6 +203,9 @@ func (t *HTTPTransport) Close() error {
 func (t *HTTPTransport) serveRequestVote(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !t.authenticateRequest(w, r) {
 		return
 	}
 
@@ -215,6 +268,9 @@ func (t *HTTPTransport) serveAppendEntries(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if !t.authenticateRequest(w, r) {
+		return
+	}
 
 	t.mu.RLock()
 	handlersCount := len(t.handlers)
@@ -274,7 +330,15 @@ func (t *HTTPTransport) SendRequestVote(ctx context.Context, target string, grou
 	if groupID == "" {
 		groupID = DefaultGroupID
 	}
-	url := fmt.Sprintf("http://%s/raft/vote", target)
+	scheme := "http"
+	t.mu.RLock()
+	if t.tlsConfig != nil {
+		scheme = "https"
+	}
+	secret := t.clusterSecret
+	t.mu.RUnlock()
+
+	url := fmt.Sprintf("%s://%s/raft/vote", scheme, target)
 	envelope := GroupRequestVoteRequest{
 		GroupID: groupID,
 		Request: *req,
@@ -289,6 +353,9 @@ func (t *HTTPTransport) SendRequestVote(ctx context.Context, target string, grou
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	if secret != "" {
+		httpReq.Header.Set("X-Orbit-Cluster-Secret", secret)
+	}
 
 	httpResp, err := t.client.Do(httpReq)
 	if err != nil {
@@ -315,7 +382,15 @@ func (t *HTTPTransport) SendAppendEntries(ctx context.Context, target string, gr
 	if groupID == "" {
 		groupID = DefaultGroupID
 	}
-	url := fmt.Sprintf("http://%s/raft/append", target)
+	scheme := "http"
+	t.mu.RLock()
+	if t.tlsConfig != nil {
+		scheme = "https"
+	}
+	secret := t.clusterSecret
+	t.mu.RUnlock()
+
+	url := fmt.Sprintf("%s://%s/raft/append", scheme, target)
 	envelope := GroupAppendEntriesRequest{
 		GroupID: groupID,
 		Request: *req,
@@ -330,6 +405,9 @@ func (t *HTTPTransport) SendAppendEntries(ctx context.Context, target string, gr
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	if secret != "" {
+		httpReq.Header.Set("X-Orbit-Cluster-Secret", secret)
+	}
 
 	httpResp, err := t.client.Do(httpReq)
 	if err != nil {
@@ -355,6 +433,9 @@ func (t *HTTPTransport) SendAppendEntries(ctx context.Context, target string, gr
 func (t *HTTPTransport) serveInstallSnapshot(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !t.authenticateRequest(w, r) {
 		return
 	}
 
@@ -416,7 +497,15 @@ func (t *HTTPTransport) SendInstallSnapshot(ctx context.Context, target string, 
 	if groupID == "" {
 		groupID = DefaultGroupID
 	}
-	url := fmt.Sprintf("http://%s/raft/install-snapshot", target)
+	scheme := "http"
+	t.mu.RLock()
+	if t.tlsConfig != nil {
+		scheme = "https"
+	}
+	secret := t.clusterSecret
+	t.mu.RUnlock()
+
+	url := fmt.Sprintf("%s://%s/raft/install-snapshot", scheme, target)
 	envelope := GroupInstallSnapshotRequest{
 		GroupID: groupID,
 		Request: *req,
@@ -431,6 +520,9 @@ func (t *HTTPTransport) SendInstallSnapshot(ctx context.Context, target string, 
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	if secret != "" {
+		httpReq.Header.Set("X-Orbit-Cluster-Secret", secret)
+	}
 
 	httpResp, err := t.client.Do(httpReq)
 	if err != nil {

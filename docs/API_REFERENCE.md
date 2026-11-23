@@ -49,7 +49,7 @@ Deletes a key by applying a durable tombstone.
 ## 2. Batch & Range Endpoints
 
 ### `POST /api/v1/kv/batch`
-Executes atomic multi-key writes or reads across shards.
+Executes batched multi-key writes or reads across shards with per-operation status reporting. Each operation is routed to its respective shard leader and executed independently, returning an array of per-key results with explicit status (`COMMITTED` or `ERROR` with error detail).
 - **Batch Write Request**:
   ```json
   {

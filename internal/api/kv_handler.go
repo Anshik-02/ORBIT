@@ -11,6 +11,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,33 +41,82 @@ type ErrorResponseWithReq struct {
 }
 
 // IdempotencyCache caches completed mutation responses by idempotency key.
-type idempotencyRecord struct {
-	statusCode int
-	body       []byte
-	timestamp  time.Time
+type IdempotencyRecord struct {
+	StatusCode int       `json:"status_code"`
+	Body       []byte    `json:"body"`
+	Timestamp  time.Time `json:"timestamp"`
 }
 
 type IdempotencyCache struct {
-	mu      sync.Mutex
-	entries map[string]idempotencyRecord
+	mu       sync.Mutex
+	entries  map[string]IdempotencyRecord
+	filePath string
 }
 
 func NewIdempotencyCache() *IdempotencyCache {
 	return &IdempotencyCache{
-		entries: make(map[string]idempotencyRecord),
+		entries: make(map[string]IdempotencyRecord),
 	}
 }
 
-func (c *IdempotencyCache) Get(key string) (idempotencyRecord, bool) {
+// SetStoragePath configures persistent storage for idempotency entries, enabling
+// cached responses to survive node crashes and server restarts.
+func (c *IdempotencyCache) SetStoragePath(path string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.filePath = path
+	return c.loadLocked()
+}
+
+func (c *IdempotencyCache) loadLocked() error {
+	if c.filePath == "" {
+		return nil
+	}
+	data, err := os.ReadFile(c.filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var loaded map[string]IdempotencyRecord
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		return err
+	}
+	for k, v := range loaded {
+		if time.Since(v.Timestamp) <= 10*time.Minute {
+			c.entries[k] = v
+		}
+	}
+	return nil
+}
+
+func (c *IdempotencyCache) saveLocked() {
+	if c.filePath == "" {
+		return
+	}
+	data, err := json.Marshal(c.entries)
+	if err != nil {
+		return
+	}
+	tmp := c.filePath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err == nil {
+		_ = os.Remove(c.filePath)
+		_ = os.Rename(tmp, c.filePath)
+	}
+}
+
+func (c *IdempotencyCache) Get(key string) (IdempotencyRecord, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	rec, ok := c.entries[key]
 	if !ok {
-		return idempotencyRecord{}, false
+		return IdempotencyRecord{}, false
 	}
-	if time.Since(rec.timestamp) > 10*time.Minute {
+	if time.Since(rec.Timestamp) > 10*time.Minute {
 		delete(c.entries, key)
-		return idempotencyRecord{}, false
+		c.saveLocked()
+		return IdempotencyRecord{}, false
 	}
 	return rec, true
 }
@@ -74,11 +124,12 @@ func (c *IdempotencyCache) Get(key string) (idempotencyRecord, bool) {
 func (c *IdempotencyCache) Set(key string, code int, body []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.entries[key] = idempotencyRecord{
-		statusCode: code,
-		body:       body,
-		timestamp:  time.Now(),
+	c.entries[key] = IdempotencyRecord{
+		StatusCode: code,
+		Body:       body,
+		Timestamp:  time.Now(),
 	}
+	c.saveLocked()
 }
 
 // BatchWriteOp describes a single mutation inside a batch request.
@@ -429,8 +480,8 @@ func (h *KVHandler) handlePut(w http.ResponseWriter, r *http.Request, key, reqID
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("X-Request-ID", reqID)
 			w.Header().Set("X-Idempotent-Replay", "true")
-			w.WriteHeader(rec.statusCode)
-			_, _ = w.Write(rec.body)
+			w.WriteHeader(rec.StatusCode)
+			_, _ = w.Write(rec.Body)
 			return
 		}
 	}
@@ -666,8 +717,8 @@ func (h *KVHandler) handleDelete(w http.ResponseWriter, r *http.Request, key, re
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("X-Request-ID", reqID)
 			w.Header().Set("X-Idempotent-Replay", "true")
-			w.WriteHeader(rec.statusCode)
-			_, _ = w.Write(rec.body)
+			w.WriteHeader(rec.StatusCode)
+			_, _ = w.Write(rec.Body)
 			return
 		}
 	}
@@ -1101,6 +1152,57 @@ func (h *KVHandler) handleBatch(w http.ResponseWriter, r *http.Request, reqID st
 	writeJSONErrorWithReq(w, http.StatusBadRequest, "invalid batch payload: must contain 'ops' or 'keys'", reqID)
 }
 
+func (h *KVHandler) queryShardScan(ctx context.Context, sid sharding.ShardID, start, end, prefix string, limit int) []storage.KVPair {
+	localInstances := h.provider.ShardInstances()
+	if inst, ok := localInstances[sid]; ok && inst.DB() != nil {
+		if prefix != "" {
+			pairs, _ := inst.DB().PrefixScan(prefix, limit)
+			return pairs
+		}
+		pairs, _ := inst.DB().Scan(start, end, limit)
+		return pairs
+	}
+
+	if h.forwarder != nil && h.metadata != nil {
+		shardInfo, err := h.metadata.GetShard(sid)
+		if err == nil {
+			var leader string
+			if h.forwarder.Resolver() != nil && h.forwarder.Resolver().Tracker() != nil {
+				leader, _ = h.forwarder.Resolver().Tracker().GetLeader(raft.GroupID(sid.GroupID()))
+			}
+			candidates := make([]string, 0, len(shardInfo.Replicas))
+			if leader != "" && leader != h.localNodeID {
+				candidates = append(candidates, leader)
+			}
+			for _, r := range shardInfo.Replicas {
+				if r != leader && r != h.localNodeID {
+					candidates = append(candidates, r)
+				}
+			}
+
+			path := fmt.Sprintf("/kv/scan?start=%s&end=%s&limit=%d", url.QueryEscape(start), url.QueryEscape(end), limit)
+			if prefix != "" {
+				path = fmt.Sprintf("/kv/prefix?prefix=%s&limit=%d", url.QueryEscape(prefix), limit)
+			}
+
+			for _, target := range candidates {
+				resp, err := h.forwarder.Forward(ctx, target, http.MethodGet, path, nil, 0, "internal-scan")
+				if err == nil {
+					if resp.StatusCode == http.StatusOK {
+						var scanResp ScanResponse
+						if err := json.NewDecoder(resp.Body).Decode(&scanResp); err == nil {
+							_ = resp.Body.Close()
+							return scanResp.Items
+						}
+					}
+					_ = resp.Body.Close()
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func (h *KVHandler) handleScan(w http.ResponseWriter, r *http.Request, reqID string) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", "GET")
@@ -1109,6 +1211,10 @@ func (h *KVHandler) handleScan(w http.ResponseWriter, r *http.Request, reqID str
 	}
 
 	start := r.URL.Query().Get("start")
+	cursor := r.URL.Query().Get("cursor")
+	if cursor != "" && start == "" {
+		start = cursor
+	}
 	end := r.URL.Query().Get("end")
 	limit := 50
 	if lStr := r.URL.Query().Get("limit"); lStr != "" {
@@ -1121,17 +1227,13 @@ func (h *KVHandler) handleScan(w http.ResponseWriter, r *http.Request, reqID str
 	}
 
 	allPairs := make(map[string]string)
-	localInstances := h.provider.ShardInstances()
-
 	for sid := sharding.ShardID(0); sid < sharding.ShardID(h.metadata.ShardCount); sid++ {
-		inst, ok := localInstances[sid]
-		if ok && inst.DB() != nil {
-			pairs, err := inst.DB().Scan(start, end, limit+1)
-			if err == nil {
-				for _, p := range pairs {
-					allPairs[p.Key] = p.Value
-				}
+		pairs := h.queryShardScan(r.Context(), sid, start, end, "", limit+1)
+		for _, p := range pairs {
+			if cursor != "" && p.Key <= cursor {
+				continue
 			}
+			allPairs[p.Key] = p.Value
 		}
 	}
 
@@ -1178,6 +1280,7 @@ func (h *KVHandler) handlePrefixScan(w http.ResponseWriter, r *http.Request, req
 		return
 	}
 
+	cursor := r.URL.Query().Get("cursor")
 	limit := 50
 	if lStr := r.URL.Query().Get("limit"); lStr != "" {
 		if l, err := strconv.Atoi(lStr); err == nil && l > 0 {
@@ -1189,17 +1292,13 @@ func (h *KVHandler) handlePrefixScan(w http.ResponseWriter, r *http.Request, req
 	}
 
 	allPairs := make(map[string]string)
-	localInstances := h.provider.ShardInstances()
-
 	for sid := sharding.ShardID(0); sid < sharding.ShardID(h.metadata.ShardCount); sid++ {
-		inst, ok := localInstances[sid]
-		if ok && inst.DB() != nil {
-			pairs, err := inst.DB().PrefixScan(prefix, limit+1)
-			if err == nil {
-				for _, p := range pairs {
-					allPairs[p.Key] = p.Value
-				}
+		pairs := h.queryShardScan(r.Context(), sid, "", "", prefix, limit+1)
+		for _, p := range pairs {
+			if cursor != "" && p.Key <= cursor {
+				continue
 			}
+			allPairs[p.Key] = p.Value
 		}
 	}
 

@@ -22,9 +22,12 @@ var (
 	ErrNilHandler      = errors.New("raft: rpc handler cannot be nil")
 	ErrInvalidGroupID  = errors.New("raft: invalid group id")
 	ErrTransportClosed = errors.New("raft: transport is already closed")
-	ErrSnapshotBehind  = errors.New("raft: snapshot index is behind current applied state")
-	ErrCorruptSnapshot = errors.New("raft: snapshot is corrupted or invalid")
-	ErrNoSnapshot      = errors.New("raft: no snapshot available")
+	ErrSnapshotBehind     = errors.New("raft: snapshot index is behind current applied state")
+	ErrCorruptSnapshot    = errors.New("raft: snapshot is corrupted or invalid")
+	ErrNoSnapshot         = errors.New("raft: no snapshot available")
+	ErrLearnerNotCaughtUp = errors.New("raft: learner replica has not caught up to commit index")
+	ErrPeerAlreadyExists  = errors.New("raft: peer already exists in replica set")
+	ErrPeerNotFound       = errors.New("raft: peer not found in replica set")
 )
 
 // GroupID uniquely identifies an independent consensus group (e.g. "shard-0").

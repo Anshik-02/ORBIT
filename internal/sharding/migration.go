@@ -2,8 +2,10 @@ package sharding
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -37,10 +39,11 @@ type ShardMigrationTask struct {
 
 // MigrationCoordinator coordinates shard data transfers, log catch-up, and atomic placement commits.
 type MigrationCoordinator struct {
-	mu      sync.RWMutex
-	cluster *DynamicCluster
-	tasks   map[string]*ShardMigrationTask
-	nextID  int
+	mu       sync.RWMutex
+	cluster  *DynamicCluster
+	tasks    map[string]*ShardMigrationTask
+	nextID   int
+	filePath string
 }
 
 // NewMigrationCoordinator initializes a coordinator attached to dynamic cluster topology.
@@ -50,6 +53,82 @@ func NewMigrationCoordinator(cluster *DynamicCluster) *MigrationCoordinator {
 		tasks:   make(map[string]*ShardMigrationTask),
 		nextID:  1,
 	}
+}
+
+// SetStoragePath configures persistent storage for migration tasks and loads existing tasks from disk.
+func (mc *MigrationCoordinator) SetStoragePath(path string) error {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	mc.filePath = path
+	return mc.loadTasksLocked()
+}
+
+func (mc *MigrationCoordinator) loadTasksLocked() error {
+	if mc.filePath == "" {
+		return nil
+	}
+	data, err := os.ReadFile(mc.filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	var saved []*ShardMigrationTask
+	if err := json.Unmarshal(data, &saved); err != nil {
+		return fmt.Errorf("sharding migration: parse tasks json: %w", err)
+	}
+
+	for _, t := range saved {
+		mc.tasks[t.ID] = t
+		// Ensure nextID advances beyond saved IDs
+		var sid int
+		var node string
+		var seq int
+		if _, err := fmt.Sscanf(t.ID, "mig-%d-%s-%d", &sid, &node, &seq); err == nil && seq >= mc.nextID {
+			mc.nextID = seq + 1
+		}
+	}
+	return nil
+}
+
+func (mc *MigrationCoordinator) saveTasksLocked() error {
+	if mc.filePath == "" {
+		return nil
+	}
+
+	var list []*ShardMigrationTask
+	for _, t := range mc.tasks {
+		list = append(list, t)
+	}
+
+	data, err := json.MarshalIndent(list, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	tmpPath := mc.filePath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return err
+	}
+	_ = os.Remove(mc.filePath)
+	return os.Rename(tmpPath, mc.filePath)
+}
+
+// ResumeIncompleteTasks returns all migration tasks that were left incomplete across a coordinator restart.
+func (mc *MigrationCoordinator) ResumeIncompleteTasks() []*ShardMigrationTask {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	var incomplete []*ShardMigrationTask
+	for _, t := range mc.tasks {
+		if t.State == MigrationStateTransferringSnapshot || t.State == MigrationStateCatchingUp || t.State == MigrationStatePending {
+			incomplete = append(incomplete, t)
+		}
+	}
+	return incomplete
 }
 
 // PlanMigration validates and registers a pending migration task.
@@ -101,6 +180,7 @@ func (mc *MigrationCoordinator) PlanMigration(shardID ShardID, sourceNode, targe
 		StartedAt:  time.Now(),
 	}
 	mc.tasks[taskID] = task
+	_ = mc.saveTasksLocked()
 	return task, nil
 }
 
@@ -120,6 +200,7 @@ func (mc *MigrationCoordinator) UpdateTaskState(taskID string, state MigrationSt
 	if state == MigrationStateCompleted || state == MigrationStateFailed || state == MigrationStateAborted {
 		task.CompletedAt = time.Now()
 	}
+	_ = mc.saveTasksLocked()
 	return nil
 }
 
@@ -158,11 +239,13 @@ func (mc *MigrationCoordinator) CommitPlacement(taskID string) error {
 		task.State = MigrationStateFailed
 		task.Error = err.Error()
 		task.CompletedAt = time.Now()
+		_ = mc.saveTasksLocked()
 		return fmt.Errorf("commit placement: %w", err)
 	}
 
 	task.State = MigrationStateCompleted
 	task.CompletedAt = time.Now()
+	_ = mc.saveTasksLocked()
 	return nil
 }
 

@@ -260,6 +260,13 @@ func (m *Manifest) LevelTables(level uint32) []SSTableRecord {
 	return copied
 }
 
+// Sequence returns the manifest update generation sequence.
+func (m *Manifest) Sequence() uint64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.sequence
+}
+
 // NextID returns and advances the monotonic SSTable ID counter.
 func (m *Manifest) NextID() uint64 {
 	m.mu.Lock()

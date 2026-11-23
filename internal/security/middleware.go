@@ -66,13 +66,43 @@ func (rl *RateLimiter) Allow(ip string) bool {
 	return false
 }
 
-// ExtractClientIP extracts the host portion of the request's RemoteAddr.
-func ExtractClientIP(r *http.Request) string {
-	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+// ExtractClientIP extracts the client IP address.
+// If trustedProxies is specified and r.RemoteAddr matches a trusted proxy,
+// the client IP is extracted from X-Forwarded-For or X-Real-IP.
+// Otherwise, r.RemoteAddr is strictly used to prevent IP spoofing and rate-limiting bypass.
+func ExtractClientIP(r *http.Request, trustedProxies ...string) string {
+	remoteHost, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		remoteHost = r.RemoteAddr
 	}
-	return ip
+
+	isTrusted := false
+	for _, proxy := range trustedProxies {
+		if proxy == remoteHost {
+			isTrusted = true
+			break
+		}
+	}
+
+	if isTrusted {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			parts := strings.Split(xff, ",")
+			if len(parts) > 0 {
+				clientIP := strings.TrimSpace(parts[0])
+				if net.ParseIP(clientIP) != nil {
+					return clientIP
+				}
+			}
+		}
+		if xrip := r.Header.Get("X-Real-IP"); xrip != "" {
+			clientIP := strings.TrimSpace(xrip)
+			if net.ParseIP(clientIP) != nil {
+				return clientIP
+			}
+		}
+	}
+
+	return remoteHost
 }
 
 // SecurityConfig bundles security parameters for HTTP middleware.
@@ -81,6 +111,7 @@ type SecurityConfig struct {
 	RateLimiter    *RateLimiter
 	MaxBodyBytes   int64
 	AllowedOrigins []string
+	TrustedProxies []string
 	EnforceHSTS    bool
 }
 
@@ -112,9 +143,9 @@ func (sc *SecurityConfig) Wrap(next http.Handler, requiredPerm Permission) http.
 			}
 		}
 
-		// 3. Rate Limiting
+		// 3. Rate Limiting with Anti-Spoofing Client IP extraction
 		if sc.RateLimiter != nil {
-			clientIP := ExtractClientIP(r)
+			clientIP := ExtractClientIP(r, sc.TrustedProxies...)
 			if !sc.RateLimiter.Allow(clientIP) {
 				w.Header().Set("Retry-After", "1")
 				w.Header().Set("Content-Type", "application/json")

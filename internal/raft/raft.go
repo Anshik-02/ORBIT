@@ -68,7 +68,8 @@ type Raft struct {
 
 	id        string
 	groupID   GroupID
-	peers     map[string]string // peerID -> address
+	peers     map[string]string // peerID -> address (voting members)
+	learners  map[string]string // peerID -> address (non-voting learners)
 	storage   Storage
 	transport Transport
 
@@ -148,6 +149,7 @@ func New(cfg Config) (*Raft, error) {
 		id:                 cfg.ID,
 		groupID:            groupID,
 		peers:              cfg.Peers,
+		learners:           make(map[string]string),
 		storage:            cfg.Storage,
 		transport:          cfg.Transport,
 		currentTerm:        term,
@@ -310,6 +312,115 @@ func (r *Raft) ReplicationLag() map[string]uint64 {
 		}
 	}
 	return lags
+}
+
+// AddLearner registers a non-voting learner replica into this Raft group.
+// The leader replicates log entries to learners so they catch up, but learners
+// do not count towards voting quorums until explicitly promoted.
+func (r *Raft) AddLearner(peerID, addr string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.closed {
+		return ErrStopped
+	}
+	if peerID == r.id {
+		return errors.New("cannot add self as learner")
+	}
+	if _, exists := r.peers[peerID]; exists {
+		return ErrPeerAlreadyExists
+	}
+	if _, exists := r.learners[peerID]; exists {
+		return ErrPeerAlreadyExists
+	}
+
+	if r.learners == nil {
+		r.learners = make(map[string]string)
+	}
+	r.learners[peerID] = addr
+
+	if r.role == Leader {
+		lastLogIndex, _ := r.storage.LastLogInfo()
+		r.nextIndex[peerID] = lastLogIndex + 1
+		r.matchIndex[peerID] = 0
+		r.broadcastAppendEntriesLocked(true)
+	}
+	return nil
+}
+
+// PromoteLearner promotes a caught-up learner into an active voting peer.
+// Invariant: The learner must have replicated entries up to at least the current leader's commitIndex.
+func (r *Raft) PromoteLearner(peerID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.closed {
+		return ErrStopped
+	}
+	if r.role != Leader {
+		return ErrNotLeader
+	}
+	addr, ok := r.learners[peerID]
+	if !ok {
+		return ErrPeerNotFound
+	}
+
+	if r.matchIndex[peerID] < r.commitIndex {
+		return fmt.Errorf("%w: matched %d, needed commitIndex %d", ErrLearnerNotCaughtUp, r.matchIndex[peerID], r.commitIndex)
+	}
+
+	delete(r.learners, peerID)
+	if r.peers == nil {
+		r.peers = make(map[string]string)
+	}
+	r.peers[peerID] = addr
+	return nil
+}
+
+// RemovePeer removes a peer from active voting peers and learners.
+// If the removed node is the local node, it steps down to Follower.
+func (r *Raft) RemovePeer(peerID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.closed {
+		return ErrStopped
+	}
+
+	delete(r.peers, peerID)
+	delete(r.learners, peerID)
+	delete(r.nextIndex, peerID)
+	delete(r.matchIndex, peerID)
+
+	if peerID == r.id {
+		r.role = Follower
+		r.leaderID = ""
+	} else if r.role == Leader {
+		r.checkAndUpdateCommitIndexLocked()
+	}
+	return nil
+}
+
+// Peers returns a snapshot of active voting peers.
+func (r *Raft) Peers() map[string]string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	res := make(map[string]string, len(r.peers))
+	for k, v := range r.peers {
+		res[k] = v
+	}
+	return res
+}
+
+// Learners returns a snapshot of active non-voting learners.
+func (r *Raft) Learners() map[string]string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	res := make(map[string]string, len(r.learners))
+	for k, v := range r.learners {
+		res[k] = v
+	}
+	return res
 }
 
 // CommitIndex returns the highest log index known to be committed.
@@ -804,7 +915,15 @@ func (r *Raft) broadcastAppendEntriesLocked(isHeartbeat bool) {
 	leaderCommit := r.commitIndex
 	firstIndex := r.storage.FirstIndex()
 
-	for peerID, peerAddr := range r.peers {
+	targets := make(map[string]string, len(r.peers)+len(r.learners))
+	for k, v := range r.peers {
+		targets[k] = v
+	}
+	for k, v := range r.learners {
+		targets[k] = v
+	}
+
+	for peerID, peerAddr := range targets {
 		nextIdx := r.nextIndex[peerID]
 		if nextIdx == 0 {
 			nextIdx = 1

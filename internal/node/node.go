@@ -451,6 +451,13 @@ func (n *Node) Shard(id sharding.ShardID) (*ShardReplica, bool) {
 	return s, ok
 }
 
+// ShardInstance returns a specific shard replica hosted on this physical node, or nil if not hosted.
+func (n *Node) ShardInstance(id sharding.ShardID) *ShardReplica {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.shards[id]
+}
+
 // Metadata returns the cluster topology metadata, if configured.
 func (n *Node) Metadata() *sharding.ClusterMetadata {
 	return n.metadata
