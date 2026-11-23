@@ -199,6 +199,7 @@ type KVHandler struct {
 	wsHub       *observability.WebSocketHub
 	eventBus    *observability.DistributedEventBus
 	idempotency *IdempotencyCache
+	metrics     *observability.MetricsCollector
 }
 
 // NewKVHandler constructs a new KVHandler.
@@ -208,7 +209,11 @@ func NewKVHandler(
 	forwarder *router.RequestForwarder,
 	localNodeID string,
 ) *KVHandler {
-	monitor := observability.NewClusterMonitor(metadata, forwarder.Resolver().Tracker())
+	var tracker *router.LeaderTracker
+	if forwarder != nil && forwarder.Resolver() != nil {
+		tracker = forwarder.Resolver().Tracker()
+	}
+	monitor := observability.NewClusterMonitor(metadata, tracker)
 	eventHub := observability.NewEventHub()
 	wsHub := observability.NewWebSocketHub(eventHub)
 
@@ -222,7 +227,13 @@ func NewKVHandler(
 		eventHub:    eventHub,
 		wsHub:       wsHub,
 		idempotency: NewIdempotencyCache(),
+		metrics:     observability.NewMetricsCollector(),
 	}
+}
+
+// Metrics returns the MetricsCollector instance.
+func (h *KVHandler) Metrics() *observability.MetricsCollector {
+	return h.metrics
 }
 
 // EventHub returns the internal EventHub.
@@ -285,6 +296,7 @@ func RegisterKVRoutes(mux *http.ServeMux, h *KVHandler) {
 	mux.HandleFunc("/cluster/health", h.handleClusterHealth)
 	mux.HandleFunc("/cluster/shards", h.handleClusterShards)
 	mux.HandleFunc("/cluster/nodes", h.handleClusterNodes)
+	mux.HandleFunc("/metrics", h.metrics.ServeHTTP)
 
 	// Versioned v1 API routes (/api/v1/...)
 	mux.HandleFunc("/api/v1/kv/", h.handleKV)
@@ -301,6 +313,7 @@ func RegisterKVRoutes(mux *http.ServeMux, h *KVHandler) {
 	mux.HandleFunc("/api/v1/cluster/health", h.handleClusterHealth)
 	mux.HandleFunc("/api/v1/cluster/shards", h.handleClusterShards)
 	mux.HandleFunc("/api/v1/cluster/nodes", h.handleClusterNodes)
+	mux.HandleFunc("/api/v1/metrics", h.metrics.ServeHTTP)
 
 	if h.wsHub != nil {
 		h.wsHub.RegisterRoutes(mux, "/ws/events")

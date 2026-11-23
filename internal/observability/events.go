@@ -42,6 +42,7 @@ const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 // ClusterEvent defines the standard JSON schema for cluster observability events.
 type ClusterEvent struct {
 	EventID   string            `json:"event_id"`
+	Sequence  uint64            `json:"sequence"`
 	Type      EventType         `json:"type"`
 	Timestamp time.Time         `json:"timestamp"`
 	NodeID    string            `json:"node_id"`
@@ -78,23 +79,37 @@ type EventHub struct {
 	mu          sync.RWMutex
 	subscribers map[chan ClusterEvent]struct{}
 	closed      bool
+	seq         uint64
+	history     []ClusterEvent
+	maxHistory  int
 }
 
-// NewEventHub creates an initialized EventHub.
+// NewEventHub creates an initialized EventHub with event retention.
 func NewEventHub() *EventHub {
 	return &EventHub{
 		subscribers: make(map[chan ClusterEvent]struct{}),
+		history:     make([]ClusterEvent, 0, 500),
+		maxHistory:  500,
 	}
 }
 
-// Publish broadcasts an event to all active subscriber channels without blocking.
+// Publish broadcasts an event to all active subscriber channels and records it in history.
 func (h *EventHub) Publish(event ClusterEvent) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
+	h.mu.Lock()
 	if h.closed {
+		h.mu.Unlock()
 		return
 	}
+	h.seq++
+	event.Sequence = h.seq
+	if len(h.history) >= h.maxHistory {
+		h.history = h.history[1:]
+	}
+	h.history = append(h.history, event)
+	h.mu.Unlock()
+
+	h.mu.RLock()
+	defer h.mu.RUnlock()
 
 	for ch := range h.subscribers {
 		select {
@@ -103,6 +118,20 @@ func (h *EventHub) Publish(event ClusterEvent) {
 			// Non-blocking drop if consumer buffer is full
 		}
 	}
+}
+
+// EventsSince returns all retained events with Sequence > seq for reconnection catch-up.
+func (h *EventHub) EventsSince(seq uint64) []ClusterEvent {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	var result []ClusterEvent
+	for _, evt := range h.history {
+		if evt.Sequence > seq {
+			result = append(result, evt)
+		}
+	}
+	return result
 }
 
 // Subscribe registers a new subscriber channel with a buffer.
