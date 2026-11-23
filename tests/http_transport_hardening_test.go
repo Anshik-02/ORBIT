@@ -30,7 +30,7 @@ func TestHTTPTransport_MethodNotAllowed(t *testing.T) {
 	t.Parallel()
 
 	transport := raft.NewHTTPTransport("127.0.0.1:0")
-	transport.RegisterHandler(&mockRaftHandler{})
+	_ = transport.RegisterHandler(raft.DefaultGroupID, &mockRaftHandler{})
 	if err := transport.Start(); err != nil {
 		t.Fatalf("start transport failed: %v", err)
 	}
@@ -60,7 +60,7 @@ func TestHTTPTransport_MalformedJSON(t *testing.T) {
 	t.Parallel()
 
 	transport := raft.NewHTTPTransport("127.0.0.1:0")
-	transport.RegisterHandler(&mockRaftHandler{})
+	_ = transport.RegisterHandler(raft.DefaultGroupID, &mockRaftHandler{})
 	if err := transport.Start(); err != nil {
 		t.Fatalf("start transport failed: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestHTTPTransport_UnknownFields(t *testing.T) {
 	t.Parallel()
 
 	transport := raft.NewHTTPTransport("127.0.0.1:0")
-	transport.RegisterHandler(&mockRaftHandler{})
+	_ = transport.RegisterHandler(raft.DefaultGroupID, &mockRaftHandler{})
 	if err := transport.Start(); err != nil {
 		t.Fatalf("start transport failed: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestHTTPTransport_TrailingGarbage(t *testing.T) {
 	t.Parallel()
 
 	transport := raft.NewHTTPTransport("127.0.0.1:0")
-	transport.RegisterHandler(&mockRaftHandler{})
+	_ = transport.RegisterHandler(raft.DefaultGroupID, &mockRaftHandler{})
 	if err := transport.Start(); err != nil {
 		t.Fatalf("start transport failed: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestHTTPTransport_OversizedPayload(t *testing.T) {
 	t.Parallel()
 
 	transport := raft.NewHTTPTransport("127.0.0.1:0")
-	transport.RegisterHandler(&mockRaftHandler{})
+	_ = transport.RegisterHandler(raft.DefaultGroupID, &mockRaftHandler{})
 	if err := transport.Start(); err != nil {
 		t.Fatalf("start transport failed: %v", err)
 	}
@@ -182,7 +182,7 @@ func TestHTTPTransport_CanceledContext(t *testing.T) {
 
 	transport := raft.NewHTTPTransport("127.0.0.1:0")
 	slowHandler := &slowRaftHandler{delay: 600 * time.Millisecond}
-	transport.RegisterHandler(slowHandler)
+	_ = transport.RegisterHandler(raft.DefaultGroupID, slowHandler)
 	if err := transport.Start(); err != nil {
 		t.Fatalf("start transport failed: %v", err)
 	}
@@ -193,7 +193,7 @@ func TestHTTPTransport_CanceledContext(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	_, err := clientTransport.SendRequestVote(ctx, transport.Addr(), &raft.RequestVoteRequest{
+	_, err := clientTransport.SendRequestVote(ctx, transport.Addr(), raft.DefaultGroupID, &raft.RequestVoteRequest{
 		Term:        1,
 		CandidateID: "candidate",
 	})
@@ -226,5 +226,84 @@ func (s *slowRaftHandler) HandleAppendEntries(ctx context.Context, req *raft.App
 		return &raft.AppendEntriesResponse{Term: req.Term, Success: true}, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	}
+}
+
+func TestHTTPTransport_MultiGroupRouting(t *testing.T) {
+	t.Parallel()
+
+	transport := raft.NewHTTPTransport("127.0.0.1:0")
+	h0 := &mockRaftHandler{}
+	h1 := &mockRaftHandler{}
+
+	if err := transport.RegisterHandler(raft.GroupID("shard-0"), h0); err != nil {
+		t.Fatalf("register shard-0: %v", err)
+	}
+	if err := transport.RegisterHandler(raft.GroupID("shard-1"), h1); err != nil {
+		t.Fatalf("register shard-1: %v", err)
+	}
+	if err := transport.Start(); err != nil {
+		t.Fatalf("start transport: %v", err)
+	}
+	defer transport.Close()
+
+	client := raft.NewHTTPTransport("127.0.0.1:0")
+
+	// 1. Send to shard-0
+	ctx := context.Background()
+	_, err := client.SendRequestVote(ctx, transport.Addr(), raft.GroupID("shard-0"), &raft.RequestVoteRequest{
+		Term:        10,
+		CandidateID: "candidate-a",
+	})
+	if err != nil {
+		t.Fatalf("send vote to shard-0: %v", err)
+	}
+	if h0.voteReq == nil || h0.voteReq.Term != 10 {
+		t.Errorf("shard-0 handler did not receive expected vote request: %+v", h0.voteReq)
+	}
+	if h1.voteReq != nil {
+		t.Errorf("shard-1 handler should not have received vote request, got: %+v", h1.voteReq)
+	}
+
+	// 2. Send to shard-1
+	_, err = client.SendAppendEntries(ctx, transport.Addr(), raft.GroupID("shard-1"), &raft.AppendEntriesRequest{
+		Term:     15,
+		LeaderID: "leader-b",
+	})
+	if err != nil {
+		t.Fatalf("send append to shard-1: %v", err)
+	}
+	if h1.appendReq == nil || h1.appendReq.Term != 15 {
+		t.Errorf("shard-1 handler did not receive expected append request: %+v", h1.appendReq)
+	}
+
+	// 3. Send to non-existent shard-99 -> should fail with ErrGroupNotFound
+	_, err = client.SendRequestVote(ctx, transport.Addr(), raft.GroupID("shard-99"), &raft.RequestVoteRequest{
+		Term: 20,
+	})
+	if err == nil {
+		t.Fatal("expected error for non-existent group shard-99, got nil")
+	}
+
+	// 4. Unregister shard-0, future requests should fail with ErrGroupNotFound
+	transport.UnregisterHandler(raft.GroupID("shard-0"))
+	_, err = client.SendRequestVote(ctx, transport.Addr(), raft.GroupID("shard-0"), &raft.RequestVoteRequest{
+		Term: 30,
+	})
+	if err == nil {
+		t.Fatal("expected error for unregistered group shard-0, got nil")
+	}
+}
+
+func TestHTTPTransport_DuplicateGroupRegistrationRejected(t *testing.T) {
+	t.Parallel()
+
+	transport := raft.NewHTTPTransport("127.0.0.1:0")
+	if err := transport.RegisterHandler(raft.GroupID("shard-0"), &mockRaftHandler{}); err != nil {
+		t.Fatalf("first registration: %v", err)
+	}
+	// Second registration of same group ID must fail
+	if err := transport.RegisterHandler(raft.GroupID("shard-0"), &mockRaftHandler{}); err == nil {
+		t.Fatal("expected error registering duplicate group ID, got nil")
 	}
 }

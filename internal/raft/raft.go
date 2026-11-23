@@ -11,6 +11,7 @@ import (
 // Config holds configuration parameters for a Raft consensus node.
 type Config struct {
 	ID                 string
+	GroupID            GroupID           // Consensus group ID (e.g. "shard-0"). Defaults to DefaultGroupID.
 	Peers              map[string]string // PeerID -> Network/Raft address
 	Storage            Storage
 	Transport          Transport
@@ -37,6 +38,7 @@ type Raft struct {
 	mu sync.Mutex
 
 	id        string
+	groupID   GroupID
 	peers     map[string]string // peerID -> address
 	storage   Storage
 	transport Transport
@@ -98,8 +100,14 @@ func New(cfg Config) (*Raft, error) {
 		return nil, fmt.Errorf("read raft initial state: %w", err)
 	}
 
+	groupID := cfg.GroupID
+	if groupID == "" {
+		groupID = DefaultGroupID
+	}
+
 	r := &Raft{
 		id:                 cfg.ID,
+		groupID:            groupID,
 		peers:              cfg.Peers,
 		storage:            cfg.Storage,
 		transport:          cfg.Transport,
@@ -122,8 +130,10 @@ func New(cfg Config) (*Raft, error) {
 	r.resetElectionTimeoutLocked()
 	r.lastHeartbeat = time.Now()
 
-	// Register Raft as the RPC handler on the transport
-	r.transport.RegisterHandler(r)
+	// Register Raft as the RPC handler for this group on the transport
+	if err := r.transport.RegisterHandler(r.groupID, r); err != nil {
+		return nil, fmt.Errorf("register raft handler for group %q: %w", r.groupID, err)
+	}
 
 	return r, nil
 }
@@ -171,8 +181,14 @@ func (r *Raft) Stop() error {
 		<-r.stoppedCh
 	}
 
+	r.transport.UnregisterHandler(r.groupID)
 	_ = r.transport.Close()
 	return r.storage.Close()
+}
+
+// GroupID returns the consensus group identifier for this Raft instance.
+func (r *Raft) GroupID() GroupID {
+	return r.groupID
 }
 
 // ID returns the local node identifier.
@@ -382,7 +398,7 @@ func (r *Raft) ReadIndex(ctx context.Context) (uint64, error) {
 				LeaderCommit: readIndex,
 			}
 
-			resp, err := r.transport.SendAppendEntries(ctx, pAddr, req)
+			resp, err := r.transport.SendAppendEntries(ctx, pAddr, r.groupID, req)
 			if err != nil {
 				return
 			}
@@ -550,7 +566,7 @@ func (r *Raft) startElectionLocked() {
 			ctx, cancel := context.WithTimeout(context.Background(), r.electionTimeoutMin)
 			defer cancel()
 
-			resp, err := r.transport.SendRequestVote(ctx, targetAddr, req)
+			resp, err := r.transport.SendRequestVote(ctx, targetAddr, r.groupID, req)
 			if err != nil {
 				return
 			}
@@ -687,7 +703,7 @@ func (r *Raft) sendAppendEntriesToPeer(peerID, peerAddr string, req *AppendEntri
 	ctx, cancel := context.WithTimeout(context.Background(), r.heartbeatInterval*3)
 	defer cancel()
 
-	resp, err := r.transport.SendAppendEntries(ctx, peerAddr, req)
+	resp, err := r.transport.SendAppendEntries(ctx, peerAddr, r.groupID, req)
 	if err != nil {
 		return
 	}

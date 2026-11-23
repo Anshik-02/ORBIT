@@ -12,13 +12,13 @@ import (
 )
 
 var (
-	ErrEmptyNodeID       = errors.New("node: id must not be empty")
-	ErrEmptyDataDir      = errors.New("node: data_dir must not be empty")
-	ErrInvalidAddress    = errors.New("node: invalid address")
-	ErrInvalidRaftAddr   = errors.New("node: invalid raft address")
-	ErrDuplicatePeerID   = errors.New("node: duplicate peer id detected")
-	ErrSelfInPeers       = errors.New("node: peer list must not contain self")
-	ErrInvalidTimeouts   = errors.New("node: election timeout min must be less than max")
+	ErrEmptyNodeID     = errors.New("node: id must not be empty")
+	ErrEmptyDataDir    = errors.New("node: data_dir must not be empty")
+	ErrInvalidAddress  = errors.New("node: invalid address")
+	ErrInvalidRaftAddr = errors.New("node: invalid raft address")
+	ErrDuplicatePeerID = errors.New("node: duplicate peer id detected")
+	ErrSelfInPeers     = errors.New("node: peer list must not contain self")
+	ErrInvalidTimeouts = errors.New("node: election timeout min must be less than max")
 )
 
 // PeerConfig holds connectivity info for a remote peer in the ORBIT cluster.

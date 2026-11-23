@@ -35,8 +35,9 @@ func (n *MockNetwork) CreateTransport(nodeID string, addrs ...string) *MockTrans
 	defer n.mu.Unlock()
 
 	t := &MockTransport{
-		nodeID:  nodeID,
-		network: n,
+		nodeID:   nodeID,
+		network:  n,
+		handlers: make(map[GroupID]RPCHandler),
 	}
 	n.nodes[nodeID] = t
 	for _, addr := range addrs {
@@ -70,19 +71,40 @@ func (n *MockNetwork) DropVotes(nodeID string, drop bool) {
 	}
 }
 
-// MockTransport implements Transport over an in-memory MockNetwork.
+// MockTransport implements Transport over an in-memory MockNetwork with multi-group support.
 type MockTransport struct {
-	mu      sync.RWMutex
-	nodeID  string
-	network *MockNetwork
-	handler RPCHandler
-	closed  bool
+	mu       sync.RWMutex
+	nodeID   string
+	network  *MockNetwork
+	handlers map[GroupID]RPCHandler
+	closed   bool
 }
 
-func (t *MockTransport) RegisterHandler(handler RPCHandler) {
+func (t *MockTransport) RegisterHandler(groupID GroupID, handler RPCHandler) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.handler = handler
+
+	if groupID == "" {
+		groupID = DefaultGroupID
+	}
+	if t.handlers == nil {
+		t.handlers = make(map[GroupID]RPCHandler)
+	}
+	if _, exists := t.handlers[groupID]; exists {
+		return fmt.Errorf("%w: group %q", ErrDuplicateGroup, groupID)
+	}
+	t.handlers[groupID] = handler
+	return nil
+}
+
+func (t *MockTransport) UnregisterHandler(groupID GroupID) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if groupID == "" {
+		groupID = DefaultGroupID
+	}
+	delete(t.handlers, groupID)
 }
 
 func (t *MockTransport) Start() error {
@@ -96,7 +118,11 @@ func (t *MockTransport) Close() error {
 	return nil
 }
 
-func (t *MockTransport) SendRequestVote(ctx context.Context, target string, req *RequestVoteRequest) (*RequestVoteResponse, error) {
+func (t *MockTransport) SendRequestVote(ctx context.Context, target string, groupID GroupID, req *RequestVoteRequest) (*RequestVoteResponse, error) {
+	if groupID == "" {
+		groupID = DefaultGroupID
+	}
+
 	t.network.mu.RLock()
 	targetNode, exists := t.network.nodes[target]
 	if !exists {
@@ -111,18 +137,25 @@ func (t *MockTransport) SendRequestVote(ctx context.Context, target string, req 
 	t.network.mu.RUnlock()
 
 	targetNode.mu.RLock()
-	handler := targetNode.handler
+	handler := targetNode.handlers[groupID]
 	targetClosed := targetNode.closed
 	targetNode.mu.RUnlock()
 
-	if targetClosed || handler == nil {
+	if targetClosed {
 		return nil, ErrNetworkPartition
+	}
+	if handler == nil {
+		return nil, fmt.Errorf("%w: group %s on target %s", ErrGroupNotFound, groupID, target)
 	}
 
 	return handler.HandleRequestVote(ctx, req)
 }
 
-func (t *MockTransport) SendAppendEntries(ctx context.Context, target string, req *AppendEntriesRequest) (*AppendEntriesResponse, error) {
+func (t *MockTransport) SendAppendEntries(ctx context.Context, target string, groupID GroupID, req *AppendEntriesRequest) (*AppendEntriesResponse, error) {
+	if groupID == "" {
+		groupID = DefaultGroupID
+	}
+
 	t.network.mu.RLock()
 	targetNode, exists := t.network.nodes[target]
 	if !exists {
@@ -137,12 +170,15 @@ func (t *MockTransport) SendAppendEntries(ctx context.Context, target string, re
 	t.network.mu.RUnlock()
 
 	targetNode.mu.RLock()
-	handler := targetNode.handler
+	handler := targetNode.handlers[groupID]
 	targetClosed := targetNode.closed
 	targetNode.mu.RUnlock()
 
-	if targetClosed || handler == nil {
+	if targetClosed {
 		return nil, ErrNetworkPartition
+	}
+	if handler == nil {
+		return nil, fmt.Errorf("%w: group %s on target %s", ErrGroupNotFound, groupID, target)
 	}
 
 	return handler.HandleAppendEntries(ctx, req)

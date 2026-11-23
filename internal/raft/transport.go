@@ -12,10 +12,12 @@ type RPCHandler interface {
 
 // Transport abstracts network communication between cluster nodes.
 // Enables both real HTTP/TCP transport for production and in-memory mock transport for deterministic testing.
+// A single transport instance can multiplex RPCs for multiple independent Raft consensus groups using GroupID.
 type Transport interface {
-	SendRequestVote(ctx context.Context, target string, req *RequestVoteRequest) (*RequestVoteResponse, error)
-	SendAppendEntries(ctx context.Context, target string, req *AppendEntriesRequest) (*AppendEntriesResponse, error)
-	RegisterHandler(handler RPCHandler)
+	SendRequestVote(ctx context.Context, target string, groupID GroupID, req *RequestVoteRequest) (*RequestVoteResponse, error)
+	SendAppendEntries(ctx context.Context, target string, groupID GroupID, req *AppendEntriesRequest) (*AppendEntriesResponse, error)
+	RegisterHandler(groupID GroupID, handler RPCHandler) error
+	UnregisterHandler(groupID GroupID)
 	Start() error
 	Close() error
 }

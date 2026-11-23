@@ -58,17 +58,17 @@ type metadataState struct {
 //   - Index 0 is a sentinel representing the base state (term 0).
 //   - All operations are thread-safe protected by mu.
 type FileStorage struct {
-	mu           sync.Mutex
-	dir          string
-	metaPath     string
-	logPath      string
-	logFile      *os.File
-	currentTerm  uint64
-	votedFor     string
-	entries      []LogEntry // 1-based indexing; entries[0] is sentinel {Index:0, Term:0}
-	closed       bool
-	poisoned     bool
-	poisonErr    error
+	mu          sync.Mutex
+	dir         string
+	metaPath    string
+	logPath     string
+	logFile     *os.File
+	currentTerm uint64
+	votedFor    string
+	entries     []LogEntry // 1-based indexing; entries[0] is sentinel {Index:0, Term:0}
+	closed      bool
+	poisoned    bool
+	poisonErr   error
 }
 
 // computeEntryChecksum calculates a length-prefixed CRC32-IEEE checksum over an entry's fields.

@@ -15,11 +15,11 @@ import (
 
 const maxRPCRequestBodyBytes = 4 * 1024 * 1024 // 4MB maximum Raft RPC payload size
 
-// HTTPTransport implements inter-node Raft communication over HTTP/JSON.
+// HTTPTransport implements inter-node Raft communication over HTTP/JSON with multi-group support.
 type HTTPTransport struct {
 	mu       sync.RWMutex
 	addr     string
-	handler  RPCHandler
+	handlers map[GroupID]RPCHandler
 	server   *http.Server
 	client   *http.Client
 	listener net.Listener
@@ -39,7 +39,8 @@ func NewHTTPTransport(addr string) *HTTPTransport {
 	}
 
 	return &HTTPTransport{
-		addr: addr,
+		addr:     addr,
+		handlers: make(map[GroupID]RPCHandler),
 		client: &http.Client{
 			Transport: transport,
 			Timeout:   500 * time.Millisecond,
@@ -47,15 +48,45 @@ func NewHTTPTransport(addr string) *HTTPTransport {
 	}
 }
 
-func (t *HTTPTransport) RegisterHandler(handler RPCHandler) {
+// RegisterHandler registers an RPCHandler for a specific consensus group.
+func (t *HTTPTransport) RegisterHandler(groupID GroupID, handler RPCHandler) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.handler = handler
+
+	if groupID == "" {
+		groupID = DefaultGroupID
+	}
+	if t.handlers == nil {
+		t.handlers = make(map[GroupID]RPCHandler)
+	}
+	if _, exists := t.handlers[groupID]; exists {
+		return fmt.Errorf("%w: group %q", ErrDuplicateGroup, groupID)
+	}
+	t.handlers[groupID] = handler
+	return nil
+}
+
+// UnregisterHandler removes an RPCHandler for a specific consensus group.
+func (t *HTTPTransport) UnregisterHandler(groupID GroupID) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if groupID == "" {
+		groupID = DefaultGroupID
+	}
+	delete(t.handlers, groupID)
 }
 
 func (t *HTTPTransport) Start() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
+	if t.closed {
+		return errors.New("http transport is closed")
+	}
+	if t.server != nil || t.listener != nil {
+		return nil
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/raft/vote", t.serveRequestVote)
@@ -116,11 +147,11 @@ func (t *HTTPTransport) serveRequestVote(w http.ResponseWriter, r *http.Request)
 	}
 
 	t.mu.RLock()
-	h := t.handler
+	handlersCount := len(t.handlers)
 	t.mu.RUnlock()
 
-	if h == nil {
-		http.Error(w, "raft handler not registered", http.StatusServiceUnavailable)
+	if handlersCount == 0 {
+		http.Error(w, "no raft handlers registered", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -128,8 +159,8 @@ func (t *HTTPTransport) serveRequestVote(w http.ResponseWriter, r *http.Request)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 
-	var req RequestVoteRequest
-	if err := dec.Decode(&req); err != nil {
+	var envelope GroupRequestVoteRequest
+	if err := dec.Decode(&envelope); err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
 			http.Error(w, "request payload exceeds size limit", http.StatusRequestEntityTooLarge)
@@ -145,7 +176,21 @@ func (t *HTTPTransport) serveRequestVote(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	resp, err := h.HandleRequestVote(r.Context(), &req)
+	targetGroup := envelope.GroupID
+	if targetGroup == "" {
+		targetGroup = DefaultGroupID
+	}
+
+	t.mu.RLock()
+	h, exists := t.handlers[targetGroup]
+	t.mu.RUnlock()
+
+	if !exists || h == nil {
+		http.Error(w, fmt.Sprintf("raft group %q not found on this node", targetGroup), http.StatusNotFound)
+		return
+	}
+
+	resp, err := h.HandleRequestVote(r.Context(), &envelope.Request)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -162,11 +207,11 @@ func (t *HTTPTransport) serveAppendEntries(w http.ResponseWriter, r *http.Reques
 	}
 
 	t.mu.RLock()
-	h := t.handler
+	handlersCount := len(t.handlers)
 	t.mu.RUnlock()
 
-	if h == nil {
-		http.Error(w, "raft handler not registered", http.StatusServiceUnavailable)
+	if handlersCount == 0 {
+		http.Error(w, "no raft handlers registered", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -174,8 +219,8 @@ func (t *HTTPTransport) serveAppendEntries(w http.ResponseWriter, r *http.Reques
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 
-	var req AppendEntriesRequest
-	if err := dec.Decode(&req); err != nil {
+	var envelope GroupAppendEntriesRequest
+	if err := dec.Decode(&envelope); err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
 			http.Error(w, "request payload exceeds size limit", http.StatusRequestEntityTooLarge)
@@ -191,7 +236,21 @@ func (t *HTTPTransport) serveAppendEntries(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	resp, err := h.HandleAppendEntries(r.Context(), &req)
+	targetGroup := envelope.GroupID
+	if targetGroup == "" {
+		targetGroup = DefaultGroupID
+	}
+
+	t.mu.RLock()
+	h, exists := t.handlers[targetGroup]
+	t.mu.RUnlock()
+
+	if !exists || h == nil {
+		http.Error(w, fmt.Sprintf("raft group %q not found on this node", targetGroup), http.StatusNotFound)
+		return
+	}
+
+	resp, err := h.HandleAppendEntries(r.Context(), &envelope.Request)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -201,9 +260,16 @@ func (t *HTTPTransport) serveAppendEntries(w http.ResponseWriter, r *http.Reques
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-func (t *HTTPTransport) SendRequestVote(ctx context.Context, target string, req *RequestVoteRequest) (*RequestVoteResponse, error) {
+func (t *HTTPTransport) SendRequestVote(ctx context.Context, target string, groupID GroupID, req *RequestVoteRequest) (*RequestVoteResponse, error) {
+	if groupID == "" {
+		groupID = DefaultGroupID
+	}
 	url := fmt.Sprintf("http://%s/raft/vote", target)
-	data, err := json.Marshal(req)
+	envelope := GroupRequestVoteRequest{
+		GroupID: groupID,
+		Request: *req,
+	}
+	data, err := json.Marshal(envelope)
 	if err != nil {
 		return nil, fmt.Errorf("marshal vote request: %w", err)
 	}
@@ -220,6 +286,9 @@ func (t *HTTPTransport) SendRequestVote(ctx context.Context, target string, req 
 	}
 	defer httpResp.Body.Close()
 
+	if httpResp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("%w: group %s on target %s", ErrGroupNotFound, groupID, target)
+	}
 	if httpResp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("vote request returned status %d", httpResp.StatusCode)
 	}
@@ -232,9 +301,16 @@ func (t *HTTPTransport) SendRequestVote(ctx context.Context, target string, req 
 	return &resp, nil
 }
 
-func (t *HTTPTransport) SendAppendEntries(ctx context.Context, target string, req *AppendEntriesRequest) (*AppendEntriesResponse, error) {
+func (t *HTTPTransport) SendAppendEntries(ctx context.Context, target string, groupID GroupID, req *AppendEntriesRequest) (*AppendEntriesResponse, error) {
+	if groupID == "" {
+		groupID = DefaultGroupID
+	}
 	url := fmt.Sprintf("http://%s/raft/append", target)
-	data, err := json.Marshal(req)
+	envelope := GroupAppendEntriesRequest{
+		GroupID: groupID,
+		Request: *req,
+	}
+	data, err := json.Marshal(envelope)
 	if err != nil {
 		return nil, fmt.Errorf("marshal append request: %w", err)
 	}
@@ -251,6 +327,9 @@ func (t *HTTPTransport) SendAppendEntries(ctx context.Context, target string, re
 	}
 	defer httpResp.Body.Close()
 
+	if httpResp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("%w: group %s on target %s", ErrGroupNotFound, groupID, target)
+	}
 	if httpResp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("append request returned status %d", httpResp.StatusCode)
 	}

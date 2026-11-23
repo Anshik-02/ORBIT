@@ -25,6 +25,7 @@ var (
 //   - RaftIndex: Consensus log position across the distributed cluster.
 //   - RaftTerm:  The election term when the leader proposed this entry.
 //   - WAL Sequence: The physical local node's append-only sequence number.
+//
 // These concepts are strictly decoupled.
 type CommittedCommand struct {
 	RaftIndex uint64 // consensus replicated log index (0 for standalone mode)

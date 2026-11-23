@@ -26,6 +26,11 @@ func (s ShardID) String() string {
 	return fmt.Sprintf("shard-%d", uint32(s))
 }
 
+// GroupID returns the string group identifier for this shard's consensus group (e.g. "shard-0").
+func (s ShardID) GroupID() string {
+	return s.String()
+}
+
 // ShardInfo describes the logical identity and replica assignment of one shard.
 // It is the authoritative descriptor stored in ClusterMetadata and distributed
 // to all physical nodes.

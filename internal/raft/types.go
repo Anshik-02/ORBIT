@@ -7,17 +7,25 @@ import (
 
 // Sentinel Raft errors.
 var (
-	ErrNotLeader     = errors.New("raft: node is not the cluster leader")
-	ErrStopped       = errors.New("raft: consensus engine is stopped")
-	ErrNilStorage    = errors.New("raft: storage implementation cannot be nil")
-	ErrNilTransport  = errors.New("raft: transport implementation cannot be nil")
-	ErrEntryNotFound = errors.New("raft: log entry not found")
-	ErrInvalidIndex  = errors.New("raft: invalid log index")
+	ErrNotLeader      = errors.New("raft: node is not the cluster leader")
+	ErrStopped        = errors.New("raft: consensus engine is stopped")
+	ErrNilStorage     = errors.New("raft: storage implementation cannot be nil")
+	ErrNilTransport   = errors.New("raft: transport implementation cannot be nil")
+	ErrEntryNotFound  = errors.New("raft: log entry not found")
+	ErrInvalidIndex   = errors.New("raft: invalid log index")
 	ErrCorruptState   = errors.New("raft: persistent state is corrupted")
 	ErrQuorumLost     = errors.New("raft: lost majority quorum; cannot confirm leadership")
 	ErrLeaderNotReady = errors.New("raft: leader has not yet committed an entry in current term")
 	ErrStorageHalted  = errors.New("raft: consensus halted due to fatal storage error")
+	ErrGroupNotFound  = errors.New("raft: consensus group not found on this node")
+	ErrDuplicateGroup = errors.New("raft: consensus group handler already registered")
 )
+
+// GroupID uniquely identifies an independent consensus group (e.g. "shard-0").
+type GroupID string
+
+// DefaultGroupID is the fallback group identifier for single-group clusters.
+const DefaultGroupID GroupID = "default"
 
 // Role represents the current consensus role of a node in the Raft cluster.
 type Role int
@@ -74,7 +82,7 @@ type RequestVoteResponse struct {
 // and periodically as heartbeats (M4).
 type AppendEntriesRequest struct {
 	Term         uint64     `json:"term"`           // leader's term
-	LeaderID     string     `json:"leader_id"`     // so follower can redirect clients
+	LeaderID     string     `json:"leader_id"`      // so follower can redirect clients
 	PrevLogIndex uint64     `json:"prev_log_index"` // index of log entry immediately preceding new ones
 	PrevLogTerm  uint64     `json:"prev_log_term"`  // term of prevLogIndex entry
 	Entries      []LogEntry `json:"entries"`        // log entries to store (empty for heartbeat)
@@ -87,4 +95,16 @@ type AppendEntriesResponse struct {
 	Success       bool   `json:"success"`        // true if follower contained entry matching prevLogIndex and prevLogTerm
 	ConflictIndex uint64 `json:"conflict_index"` // fast recovery: first index for conflicting term (or log length)
 	ConflictTerm  uint64 `json:"conflict_term"`  // fast recovery: term of conflicting entry
+}
+
+// GroupRequestVoteRequest is the RPC envelope tagging a vote request with its target consensus group.
+type GroupRequestVoteRequest struct {
+	GroupID GroupID            `json:"group_id"`
+	Request RequestVoteRequest `json:"request"`
+}
+
+// GroupAppendEntriesRequest is the RPC envelope tagging an append request with its target consensus group.
+type GroupAppendEntriesRequest struct {
+	GroupID GroupID              `json:"group_id"`
+	Request AppendEntriesRequest `json:"request"`
 }
