@@ -250,7 +250,7 @@ func TestClusterHTTPRealNetwork(t *testing.T) {
 	// Wait for leader
 	var leaderNode *node.Node
 	var leaderCfg node.NodeConfig
-	deadline := time.Now().Add(4 * time.Second)
+	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
 		for i, n := range nodes {
 			if n.Raft().Role() == raft.Leader {

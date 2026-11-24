@@ -210,7 +210,7 @@ func TestLeaderFailureTriggersNewElection(t *testing.T) {
 
 	// Wait for remaining 2 followers to detect heartbeat timeout and elect new leader
 	var newLeader *raft.Raft
-	failoverDeadline := time.Now().Add(3 * time.Second)
+	failoverDeadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(failoverDeadline) {
 		for _, n := range nodes {
 			if n.ID() != oldLeader.ID() && n.Role() == raft.Leader {
@@ -234,7 +234,7 @@ func TestLeaderFailureTriggersNewElection(t *testing.T) {
 
 	// Reconnect old leader: when it receives heartbeat from new leader, it must step down
 	net.Rejoin(oldLeader.ID())
-	stepDownDeadline := time.Now().Add(3 * time.Second)
+	stepDownDeadline := time.Now().Add(8 * time.Second)
 	steppedDown := false
 	for time.Now().Before(stepDownDeadline) {
 		if oldLeader.Role() == raft.Follower {

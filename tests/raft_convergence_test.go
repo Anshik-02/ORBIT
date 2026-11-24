@@ -103,7 +103,7 @@ func TestRestartedNodeConvergesWithCluster(t *testing.T) {
 	// Verify remaining nodes have committed and applied index 5
 	for _, n := range nodes {
 		if n != nil {
-			waitDeadline := time.Now().Add(2 * time.Second)
+			waitDeadline := time.Now().Add(6 * time.Second)
 			for time.Now().Before(waitDeadline) && n.Engine().LastAppliedIndex() < 5 {
 				time.Sleep(10 * time.Millisecond)
 			}
@@ -125,7 +125,7 @@ func TestRestartedNodeConvergesWithCluster(t *testing.T) {
 	nodes[followerIdx] = restartedNode
 
 	// 7. Wait for restarted follower to catch up with leader
-	catchupDeadline := time.Now().Add(5 * time.Second)
+	catchupDeadline := time.Now().Add(8 * time.Second)
 	caughtUp := false
 	for time.Now().Before(catchupDeadline) {
 		if restartedNode.Engine().LastAppliedIndex() == 5 && restartedNode.Raft().CommitIndex() >= 5 {

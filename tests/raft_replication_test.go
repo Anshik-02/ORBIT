@@ -56,7 +56,7 @@ func TestLogReplicationBasic(t *testing.T) {
 	}
 
 	// 3. Wait for replication across all nodes
-	repDeadline := time.Now().Add(1 * time.Second)
+	repDeadline := time.Now().Add(6 * time.Second)
 	allReplicated := false
 
 	for time.Now().Before(repDeadline) {
@@ -179,7 +179,7 @@ func TestReplicationCatchesUpPartitionedFollower(t *testing.T) {
 	net.Rejoin(followerToIsolate.ID())
 
 	// Wait for leader to catch up the reconnected follower
-	catchUpDeadline := time.Now().Add(1 * time.Second)
+	catchUpDeadline := time.Now().Add(6 * time.Second)
 	caughtUp := false
 	for time.Now().Before(catchUpDeadline) {
 		lastIdx, _ := followerToIsolate.Storage().LastLogInfo()

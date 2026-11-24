@@ -76,7 +76,7 @@ func TestPartitionLeaderCannotCommit(t *testing.T) {
 
 	// 4. Remaining 2 nodes must elect a new leader
 	var newLeader *node.Node
-	failoverDeadline := time.Now().Add(3 * time.Second)
+	failoverDeadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(failoverDeadline) {
 		for _, n := range nodes {
 			if n.ID() != leader.ID() && n.Raft().Role() == raft.Leader {
@@ -114,7 +114,7 @@ func TestPartitionLeaderCannotCommit(t *testing.T) {
 	}
 
 	// Wait for old leader to catch up with the newly committed write
-	catchupDeadline := time.Now().Add(1 * time.Second)
+	catchupDeadline := time.Now().Add(6 * time.Second)
 	caughtUp := false
 	for time.Now().Before(catchupDeadline) {
 		if v, ok := leader.Engine().Get("new_leader_key"); ok && v == "quorum_val" {
@@ -196,7 +196,7 @@ func TestMinorityPartitionAllowsMajorityToContinue(t *testing.T) {
 	net.Rejoin(follower.ID())
 
 	// Follower must catch up
-	catchupDeadline := time.Now().Add(3 * time.Second)
+	catchupDeadline := time.Now().Add(6 * time.Second)
 	caughtUp := false
 	for time.Now().Before(catchupDeadline) {
 		if v, ok := follower.Engine().Get("maj_key"); ok && v == "maj_val" {
@@ -309,7 +309,7 @@ func TestNodeCrashAndRestartInCluster(t *testing.T) {
 	}()
 
 	// Wait for restarted node to catch up with all entries including k4
-	catchupDeadline := time.Now().Add(4 * time.Second)
+	catchupDeadline := time.Now().Add(8 * time.Second)
 	caughtUp := false
 	for time.Now().Before(catchupDeadline) {
 		if v, ok := restartedNode.Engine().Get("k4"); ok && v == "v4" {

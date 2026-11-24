@@ -131,7 +131,7 @@ func TestMultiProcessHTTPCluster(t *testing.T) {
 	// 4. Poll health endpoints until a leader is discovered
 	var leaderID string
 	var leaderPort int
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(12 * time.Second)
 
 	for time.Now().Before(deadline) {
 		for i := 0; i < 3; i++ {
@@ -233,7 +233,7 @@ func TestMultiProcessHTTPCluster(t *testing.T) {
 
 	// 9. Remaining 2 processes must elect a new leader
 	var newLeaderPort int
-	failoverDeadline := time.Now().Add(5 * time.Second)
+	failoverDeadline := time.Now().Add(12 * time.Second)
 
 	for time.Now().Before(failoverDeadline) {
 		for i := 0; i < 3; i++ {

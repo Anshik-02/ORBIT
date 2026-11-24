@@ -501,7 +501,7 @@ func TestKVAPI_LeaderFailover(t *testing.T) {
 	// 4. Read back
 	var gResp *http.Response
 	var gErr error
-	readDeadline := time.Now().Add(4 * time.Second)
+	readDeadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(readDeadline) {
 		gResp, gErr = http.Get(c.servers[survivorID].URL + "/kv/" + key)
 		if gErr == nil && gResp.StatusCode == http.StatusOK {

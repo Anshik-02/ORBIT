@@ -122,10 +122,18 @@ func TestCrossProcessLockingLifecycle(t *testing.T) {
 	// Small pause to allow OS handle cleanup
 	time.Sleep(50 * time.Millisecond)
 
-	// Parent can now acquire lock
-	parentWAL, err := wal.Open(walPath)
-	if err != nil {
-		t.Fatalf("parent failed to acquire lock after child closed: %v", err)
+	// Parent can now acquire lock with retry loop to accommodate Windows OS handle release
+	var parentWAL *wal.Log
+	var openErr error
+	for attempt := 0; attempt < 25; attempt++ {
+		parentWAL, openErr = wal.Open(walPath)
+		if openErr == nil {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	if openErr != nil {
+		t.Fatalf("parent failed to acquire lock after child closed: %v", openErr)
 	}
 
 	// Append a valid record to confirm normal functionality
@@ -164,13 +172,13 @@ func TestCrossProcessLockingLifecycle(t *testing.T) {
 
 	// OS kernel must automatically release file locks held by terminated process
 	var recoveredWAL *wal.Log
-	var openErr error
-	for attempt := 0; attempt < 10; attempt++ {
+	openErr = nil
+	for attempt := 0; attempt < 25; attempt++ {
 		recoveredWAL, openErr = wal.Open(walPath)
 		if openErr == nil {
 			break
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(30 * time.Millisecond)
 	}
 
 	if openErr != nil {

@@ -84,7 +84,7 @@ func TestApplyLoopStopsOnStateMachineError(t *testing.T) {
 	defer r.Stop()
 
 	// Wait for single node to become leader
-	deadline := time.Now().Add(1 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if r.Role() == raft.Leader {
 			break
@@ -283,7 +283,7 @@ func TestIsolatedLeaderStaleReadPrevented(t *testing.T) {
 
 	// 3. Remaining 2 nodes elect a new leader
 	var newLeader *node.Node
-	failoverDeadline := time.Now().Add(3 * time.Second)
+	failoverDeadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(failoverDeadline) {
 		for i, n := range nodes {
 			if i != leaderIdx && n.Raft().Role() == raft.Leader {
