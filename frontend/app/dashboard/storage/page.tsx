@@ -10,6 +10,8 @@ import WalExplorer, { WalLogFile } from '@/components/storage/WalExplorer';
 import SSTableExplorer, { SSTableItem } from '@/components/storage/SSTableExplorer';
 import CompactionMonitor from '@/components/storage/CompactionMonitor';
 import StorageAnalytics from '@/components/storage/StorageAnalytics';
+import { useStorageMetrics } from '@/hooks/useStorageMetrics';
+import LiveIndicator from '@/components/shared/LiveIndicator';
 
 const INITIAL_MEMTABLES: MemtableItem[] = [
   {
@@ -169,14 +171,20 @@ const INITIAL_SSTABLES: SSTableItem[] = [
 ];
 
 export default function StoragePage() {
+  const {
+    metrics,
+    isLive,
+    isLoading,
+    isRefreshing,
+    lastUpdated,
+    refresh,
+  } = useStorageMetrics();
   const [memtables, setMemtables] = useState<MemtableItem[]>(INITIAL_MEMTABLES);
   const [walFiles, setWalFiles] = useState<WalLogFile[]>(INITIAL_WAL_FILES);
   const [sstables, setSstables] = useState<SSTableItem[]>(INITIAL_SSTABLES);
-  const [isRefreshing, setIsRefreshing] = useState(false);
 
   const handleRefresh = () => {
-    setIsRefreshing(true);
-    setTimeout(() => setIsRefreshing(false), 400);
+    refresh();
   };
 
   return (
@@ -193,6 +201,7 @@ export default function StoragePage() {
                 <CheckCircle2 className="w-3.5 h-3.5" />
                 STRICT_SYNC WAL PERSISTENCE
               </span>
+              <LiveIndicator isLive={isLive} lastUpdated={lastUpdated} />
             </div>
             <p className="text-xs sm:text-sm text-[#64748B] mt-1 font-normal">
               Memtable memory buffers, Write-Ahead Log checkpoints and multi-level SSTable compaction.
@@ -216,9 +225,9 @@ export default function StoragePage() {
         {/* 02. SECTION A: STORAGE OVERVIEW METRICS */}
         <StorageOverviewCards
           activeMemtables={3}
-          immutableMemtables={1}
-          walSizeBytes={31457280}
-          sstableCount={sstables.length}
+          immutableMemtables={metrics.immutableMemtablesCount || 1}
+          walSizeBytes={metrics.walSizeBytes || 31457280}
+          sstableCount={metrics.sstableCountL0 + metrics.sstableCountL1 + metrics.sstableCountL2 || sstables.length}
           compactionStatus="IDLE (Optimal)"
         />
 

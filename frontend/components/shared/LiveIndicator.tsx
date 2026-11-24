@@ -3,24 +3,35 @@
 import React from 'react';
 import { Wifi, Radio, AlertTriangle } from 'lucide-react';
 
-interface LiveIndicatorProps {
-  isLiveBackend: boolean;
-  connectionState: 'connected' | 'reconnecting' | 'disconnected';
+export interface LiveIndicatorProps {
+  isLiveBackend?: boolean;
+  isLive?: boolean;
+  connectionState?: 'connected' | 'reconnecting' | 'disconnected';
+  lastUpdated?: Date;
   onToggleMode?: () => void;
 }
 
 export default function LiveIndicator({
   isLiveBackend,
-  connectionState,
+  isLive,
+  connectionState = 'connected',
+  lastUpdated,
   onToggleMode,
 }: LiveIndicatorProps) {
-  if (isLiveBackend) {
+  const active = Boolean(isLive ?? isLiveBackend);
+
+  if (active) {
     return (
       <div className="flex items-center gap-2">
         <span className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-50 border border-emerald-200 text-[#10B981] font-mono text-xs font-semibold shadow-xs">
           <span className="w-2 h-2 rounded-full bg-[#10B981] animate-pulse" />
           <span>LIVE BACKEND TELEMETRY</span>
         </span>
+        {lastUpdated && (
+          <span className="hidden sm:inline text-[11px] font-mono text-[#64748B]">
+            {lastUpdated.toLocaleTimeString('en-US', { hour12: false })}
+          </span>
+        )}
         {onToggleMode && (
           <button
             onClick={onToggleMode}

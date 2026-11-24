@@ -3,6 +3,7 @@
 import React, { useState, useEffect } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useClusterHealth } from "@/hooks/useClusterHealth";
 import {
   Database,
   LayoutDashboard,
@@ -55,6 +56,8 @@ export default function DashboardLayout({
   const [statusModalOpen, setStatusModalOpen] = useState(false);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
 
+  const { status, health, activeEndpoint, isLive, loading, refetch } = useClusterHealth(4000);
+
   useEffect(() => {
     const updateTime = () => {
       const now = new Date();
@@ -64,6 +67,15 @@ export default function DashboardLayout({
     const interval = setInterval(updateTime, 1000);
     return () => clearInterval(interval);
   }, []);
+
+  const handleRefresh = async () => {
+    await refetch();
+    onRefresh?.();
+  };
+
+  const onlineNodeCount = health?.available_nodes ?? (isLive ? 0 : 5);
+  const totalNodeCount = health?.total_nodes ?? status?.node_count ?? 5;
+  const activeShardCount = health?.healthy_shards ?? status?.shard_count ?? 3;
 
   return (
     <div className="min-h-screen bg-[#F4F7FC] text-[#17243A] flex flex-col font-sans select-none antialiased">
@@ -102,41 +114,67 @@ export default function DashboardLayout({
             <div className="relative">
               <button
                 onClick={() => setStatusModalOpen(!statusModalOpen)}
-                className="flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-50 border border-emerald-200 text-[#10B981] hover:bg-emerald-100/60 transition-all font-mono text-xs font-semibold shadow-sm"
+                className={`flex items-center gap-2 px-3 py-1 rounded-full border font-mono text-xs font-semibold shadow-sm transition-all ${
+                  isLive
+                    ? "bg-emerald-50 border-emerald-200 text-[#10B981] hover:bg-emerald-100/60"
+                    : "bg-sky-50 border-sky-200 text-[#0891D5] hover:bg-sky-100/60"
+                }`}
               >
-                <span className="w-2 h-2 rounded-full bg-[#10B981] animate-pulse" />
-                <span className="tracking-wide">CLUSTER ONLINE</span>
+                <span
+                  className={`w-2 h-2 rounded-full animate-pulse ${
+                    isLive ? "bg-[#10B981]" : "bg-[#0891D5]"
+                  }`}
+                />
+                <span className="tracking-wide">
+                  {isLive ? "CLUSTER ONLINE" : "CLUSTER STANDBY"}
+                </span>
               </button>
 
               {/* Status Popover */}
               {statusModalOpen && (
-                <div className="absolute right-0 mt-2 w-72 bg-white p-4 rounded-xl border border-[#DCE5F0] shadow-xl z-50 animate-fadeIn text-xs font-mono">
+                <div className="absolute right-0 mt-2 w-80 bg-white p-4 rounded-xl border border-[#DCE5F0] shadow-xl z-50 animate-fadeIn text-xs font-mono">
                   <div className="flex items-center justify-between pb-2 mb-2 border-b border-[#DCE5F0]">
                     <span className="font-bold text-[#17243A] uppercase tracking-wider text-[11px]">
                       Cluster Health Status
                     </span>
-                    <span className="text-[10px] text-[#10B981] font-bold">100% OPERATIONAL</span>
+                    <span
+                      className={`text-[10px] font-bold ${
+                        isLive ? "text-[#10B981]" : "text-[#0891D5]"
+                      }`}
+                    >
+                      {isLive ? "LIVE CLUSTER CONNECTED" : "ARCHITECTURAL STANDBY"}
+                    </span>
                   </div>
                   <div className="space-y-1.5 text-[#17243A] text-[11px]">
                     <div className="flex justify-between">
                       <span className="text-[#64748B]">Physical Nodes:</span>
-                      <span className="text-[#10B981] font-semibold">5 / 5 Connected</span>
+                      <span className="text-[#10B981] font-semibold">
+                        {onlineNodeCount} / {totalNodeCount} Active
+                      </span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-[#64748B]">Logical Shards:</span>
-                      <span className="text-[#0891D5] font-semibold">3 / 3 Active</span>
+                      <span className="text-[#0891D5] font-semibold">
+                        {activeShardCount} / 3 Active
+                      </span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-[#64748B]">Raft Quorum:</span>
-                      <span className="text-[#7965E8] font-semibold">Stable (3 Groups)</span>
+                      <span className="text-[#7965E8] font-semibold">
+                        {isLive ? "Consensus Established" : "Stable (3 Groups)"}
+                      </span>
                     </div>
                     <div className="flex justify-between">
-                      <span className="text-[#64748B]">Consensus Term:</span>
-                      <span className="text-[#17243A] font-semibold">Term 4</span>
+                      <span className="text-[#64748B]">Endpoint:</span>
+                      <span className="text-[#17243A] font-semibold">
+                        {activeEndpoint ?? "Probing :2525..:2529"}
+                      </span>
                     </div>
                   </div>
                   <div className="mt-3 pt-2 border-t border-[#DCE5F0] text-[10px] text-[#64748B] text-center">
-                    All nodes communicating over TCP raft transport.
+                    {isLive
+                      ? "Real-time Go node telemetry streaming over HTTP & WebSockets."
+                      : "Local cluster offline. Showing architectural control plane model."}
                   </div>
                 </div>
               )}
@@ -164,7 +202,9 @@ export default function DashboardLayout({
                 <div className="absolute right-0 mt-2 w-80 bg-white p-4 rounded-xl border border-[#DCE5F0] shadow-xl z-50 animate-fadeIn text-xs font-mono">
                   <div className="flex items-center justify-between pb-2 mb-2 border-b border-[#DCE5F0]">
                     <span className="font-bold text-[#17243A] uppercase text-[11px]">System Alerts</span>
-                    <span className="text-[10px] text-[#0891D5] font-semibold">0 Critical</span>
+                    <span className="text-[10px] text-[#0891D5] font-semibold">
+                      {isLive ? "Live Telemetry" : "0 Critical"}
+                    </span>
                   </div>
                   <div className="space-y-2 text-[11px]">
                     <div className="p-2.5 rounded-lg bg-[#F4F7FC] border border-[#DCE5F0] flex items-start gap-2">
@@ -188,11 +228,15 @@ export default function DashboardLayout({
 
             {/* Manual Refresh Trigger */}
             <button
-              onClick={onRefresh}
+              onClick={handleRefresh}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white hover:bg-slate-50 text-[#17243A] border border-[#DCE5F0] font-mono text-xs shadow-sm transition-colors"
               title="Refresh Cluster State"
             >
-              <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? "animate-spin text-[#0891D5]" : "text-[#64748B]"}`} />
+              <RefreshCw
+                className={`w-3.5 h-3.5 ${
+                  isRefreshing || loading ? "animate-spin text-[#0891D5]" : "text-[#64748B]"
+                }`}
+              />
               <span className="hidden sm:inline font-medium">Refresh</span>
             </button>
           </div>

@@ -2,10 +2,11 @@
 
 import React, { useState } from 'react';
 import { Activity, Clock, Filter, AlertTriangle, CheckCircle, Info, ShieldAlert, Cpu } from 'lucide-react';
+import { useEventStream } from '@/hooks/useEventStream';
 
 export type EventCategory = 'ALL' | 'RAFT' | 'REPLICATION' | 'STORAGE' | 'CLUSTER' | 'RECOVERY' | 'CHAOS';
 
-interface ClusterEvent {
+interface ClusterEventItem {
   id: string;
   category: Exclude<EventCategory, 'ALL'>;
   timestamp: string;
@@ -16,8 +17,9 @@ interface ClusterEvent {
 
 export default function RecentClusterEvents() {
   const [filter, setFilter] = useState<EventCategory>('ALL');
+  const { events: liveEvents, isConnected } = useEventStream();
 
-  const events: ClusterEvent[] = [
+  const defaultEvents: ClusterEventItem[] = [
     {
       id: 'evt-1',
       category: 'RAFT',
@@ -63,39 +65,41 @@ export default function RecentClusterEvents() {
       category: 'STORAGE',
       timestamp: '3m ago',
       node: 'Node A',
-      level: 'info',
-      message: 'Minor compaction finished: 3 L0 SSTables merged into L1-00018 (reduced read amp)',
-    },
-    {
-      id: 'evt-7',
-      category: 'CHAOS',
-      timestamp: '4m ago',
-      node: 'Cluster',
-      level: 'info',
-      message: 'Chaos experiment "Follower Crash Simulation" healed with zero data loss',
-    },
-    {
-      id: 'evt-8',
-      category: 'RAFT',
-      timestamp: '6m ago',
-      node: 'Node B',
-      level: 'success',
-      message: 'Shard 2 leader election concluded: Node B elected leader for Term 5',
-    },
-    {
-      id: 'evt-9',
-      category: 'REPLICATION',
-      timestamp: '8m ago',
-      node: 'Node E',
-      level: 'info',
-      message: 'Catch-up stream completed: 12 log entries synchronized from leader Node D',
+      level: 'warn',
+      message: 'Level 0 compaction initiated: merging 4 SSTables into L1',
     },
   ];
+
+  const events: ClusterEventItem[] = liveEvents.length > 0
+    ? liveEvents.map((e) => {
+        let cat: Exclude<EventCategory, 'ALL'> = 'CLUSTER';
+        const c = (e.category || '').toUpperCase();
+        if (c.includes('RAFT')) cat = 'RAFT';
+        else if (c.includes('REPLICATION')) cat = 'REPLICATION';
+        else if (c.includes('STORAGE')) cat = 'STORAGE';
+        else if (c.includes('CHAOS')) cat = 'CHAOS';
+        else if (c.includes('RECOVERY')) cat = 'RECOVERY';
+
+        let lvl: 'info' | 'success' | 'warn' | 'error' = 'info';
+        if (e.severity === 'ERROR') lvl = 'error';
+        else if (e.severity === 'WARN') lvl = 'warn';
+        else lvl = 'info';
+
+        return {
+          id: e.id,
+          category: cat,
+          timestamp: e.timestamp,
+          node: e.nodeId ? e.nodeId.toUpperCase() : 'Cluster',
+          level: lvl,
+          message: e.description,
+        };
+      })
+    : defaultEvents;
 
   const filteredEvents =
     filter === 'ALL' ? events : events.filter((e) => e.category === filter);
 
-  const getCategoryBadge = (category: ClusterEvent['category']) => {
+  const getCategoryBadge = (category: ClusterEventItem['category']) => {
     switch (category) {
       case 'RAFT':
         return 'bg-[#F59E0B]/10 text-[#D97706] border-[#F59E0B]/25';
@@ -114,7 +118,7 @@ export default function RecentClusterEvents() {
     }
   };
 
-  const getLevelDot = (level: ClusterEvent['level']) => {
+  const getLevelDot = (level: ClusterEventItem['level']) => {
     switch (level) {
       case 'success':
         return 'bg-[#10B981] shadow-[0_0_6px_rgba(16,185,129,0.5)]';
@@ -141,6 +145,10 @@ export default function RecentClusterEvents() {
               <h3 className="text-base font-semibold text-[#17243A] tracking-tight">
                 Recent Cluster Events
               </h3>
+              <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold bg-emerald-50 text-[#10B981] border border-emerald-200">
+                <span className="w-1.5 h-1.5 rounded-full bg-[#10B981] animate-pulse" />
+                {isConnected ? 'LIVE WS' : 'STREAM BUS'}
+              </span>
             </div>
             <p className="text-xs text-[#64748B] mt-1">
               Live audit journal of consensus ticks, storage flushes & network transitions

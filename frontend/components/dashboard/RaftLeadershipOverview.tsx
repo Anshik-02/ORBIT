@@ -2,6 +2,7 @@
 
 import React from 'react';
 import { ShieldCheck, Crown, CheckCircle2 } from 'lucide-react';
+import { useClusterHealth } from '@/hooks/useClusterHealth';
 
 interface ShardReplica {
   nodeId: string;
@@ -28,7 +29,9 @@ interface ShardOverview {
 }
 
 export default function RaftLeadershipOverview() {
-  const shards: ShardOverview[] = [
+  const { health, isLive } = useClusterHealth();
+
+  const defaultShards: ShardOverview[] = [
     {
       shardId: 0,
       name: 'Shard 0',
@@ -84,6 +87,36 @@ export default function RaftLeadershipOverview() {
       ],
     },
   ];
+
+  const shards: ShardOverview[] = isLive && health?.shards && Object.keys(health.shards).length > 0
+    ? Object.values(health.shards).map((s, idx) => {
+        const defaultRef = defaultShards.find((ds) => ds.shardId === s.shard_id) || defaultShards[idx % defaultShards.length];
+        const colors = ['#0891D5', '#7965E8', '#10B981'];
+        return {
+          shardId: s.shard_id,
+          name: `Shard ${s.shard_id}`,
+          keyRange: defaultRef.keyRange,
+          leaderName: s.current_leader ? s.current_leader.toUpperCase() : 'None',
+          leaderNodeId: s.current_leader || '',
+          term: s.current_term,
+          commitIndex: s.commit_index ?? defaultRef.commitIndex,
+          appliedIndex: s.last_applied_index ?? defaultRef.appliedIndex,
+          lag: '0 entries (In sync)',
+          status: (s.healthy ? 'STABLE' : 'DEGRADED') as 'STABLE' | 'DEGRADED',
+          color: colors[s.shard_id % colors.length],
+          replicas: s.replica_node_ids && s.replica_node_ids.length > 0
+            ? s.replica_node_ids.map((nodeId) => ({
+                nodeId,
+                nodeName: nodeId.toUpperCase(),
+                role: (nodeId === s.current_leader ? 'Leader' : 'Follower') as 'Leader' | 'Follower',
+                matchIndex: s.commit_index ?? 14892,
+                syncPercent: 100,
+                isLeader: nodeId === s.current_leader,
+              }))
+            : defaultRef.replicas,
+        };
+      })
+    : defaultShards;
 
   return (
     <div className="bg-white border border-[#DCE5F0] rounded-2xl p-6 shadow-xs hover:shadow-md transition-shadow overflow-hidden">

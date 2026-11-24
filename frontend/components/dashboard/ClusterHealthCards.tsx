@@ -2,6 +2,7 @@
 
 import React from 'react';
 import { Server, Database, ShieldCheck, Activity } from 'lucide-react';
+import { useClusterHealth } from '@/hooks/useClusterHealth';
 
 interface MetricCardProps {
   label: string;
@@ -15,46 +16,58 @@ interface MetricCardProps {
 }
 
 export default function ClusterHealthCards() {
+  const { status, health, isLive } = useClusterHealth();
+
+  const onlineNodes = health?.available_nodes ?? 5;
+  const totalNodes = health?.total_nodes ?? status?.node_count ?? 5;
+  const healthyShards = health?.healthy_shards ?? status?.shard_count ?? 3;
+  const totalShards = health?.total_shards ?? status?.shard_count ?? 3;
+  const leaderCount = totalShards - (health?.leaderless_shards ?? 0);
+
+  const isClusterHealthy = (health?.replication_health === 'healthy') || (!isLive && true);
+
   const cards: MetricCardProps[] = [
     {
       label: 'PHYSICAL NODES',
-      value: '5 / 5',
-      subValue: '100% Online',
-      statusText: 'All nodes connected',
-      statusColor: 'green',
+      value: `${onlineNodes} / ${totalNodes}`,
+      subValue: isLive ? `${Math.round((onlineNodes / totalNodes) * 100)}% Online (Live)` : '100% Online (Standby)',
+      statusText: onlineNodes === totalNodes ? 'All nodes connected' : 'Degraded peer count',
+      statusColor: onlineNodes === totalNodes ? 'green' : 'amber',
       icon: Server,
-      description: 'Nodes A, B, C, D, E active across cluster network',
-      badge: '5 HEALTHY',
+      description: isLive
+        ? `Nodes actively participating: ${status?.nodes?.join(', ') || 'Online fleet'}`
+        : 'Nodes A, B, C, D, E active across cluster network',
+      badge: `${onlineNodes} HEALTHY`,
     },
     {
       label: 'LOGICAL SHARDS',
-      value: '3 / 3',
+      value: `${healthyShards} / ${totalShards}`,
       subValue: 'RF = 3 Replicated',
-      statusText: 'All shards operational',
-      statusColor: 'blue',
+      statusText: healthyShards === totalShards ? 'All shards operational' : 'Quorum warning',
+      statusColor: healthyShards === totalShards ? 'blue' : 'amber',
       icon: Database,
       description: 'Murmur3-partitioned ring with uniform distribution',
-      badge: 'QUORUM OK',
+      badge: healthyShards === totalShards ? 'QUORUM OK' : 'QUORUM RISK',
     },
     {
       label: 'RAFT LEADERS',
-      value: '3 / 3',
+      value: `${leaderCount} / ${totalShards}`,
       subValue: '0 Elections Pending',
       statusText: 'One leader per shard',
       statusColor: 'purple',
       icon: ShieldCheck,
       description: 'Stable terms, zero split-brain, heartbeat tick 50ms',
-      badge: '3 STABLE',
+      badge: `${leaderCount} STABLE`,
     },
     {
       label: 'CLUSTER HEALTH',
-      value: '100%',
-      subValue: 'Zero Warnings',
-      statusText: 'Fully Operational',
-      statusColor: 'green',
+      value: isClusterHealthy ? '100%' : 'DEGRADED',
+      subValue: isLive ? (health?.replication_health === 'healthy' ? 'Zero Warnings' : 'Issues Detected') : 'Zero Warnings',
+      statusText: isLive ? (isClusterHealthy ? 'Live Operational' : 'Degraded') : 'Fully Operational',
+      statusColor: isClusterHealthy ? 'green' : 'amber',
       icon: Activity,
       description: 'All monitored components, WAL disks & LSM engines healthy',
-      badge: 'OPTIMAL',
+      badge: isLive ? 'LIVE CLUSTER' : 'OPTIMAL',
     },
   ];
 

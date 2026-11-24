@@ -22,7 +22,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className="dark scroll-smooth">
+    <html lang="en" className="scroll-smooth">
       <head>
         <link rel="preconnect" href="https://api.fontshare.com" />
         <link rel="preconnect" href="https://cdn.fontshare.com" crossOrigin="anonymous" />
@@ -31,7 +31,7 @@ export default function RootLayout({
           href="https://api.fontshare.com/v2/css?f[]=switzer@100,200,300,400,500,600,700,800,900&display=swap"
         />
       </head>
-      <body className="bg-[#030712] text-slate-100 min-h-screen font-sans antialiased selection:bg-sky-500/30 selection:text-sky-200">
+      <body className="bg-[#F4F7FC] text-[#17243A] min-h-screen font-sans antialiased selection:bg-[#0891D5]/20 selection:text-[#0891D5]">
         {children}
       </body>
     </html>

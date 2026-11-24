@@ -7,81 +7,18 @@ import EventSummaryCards from '@/components/events/EventSummaryCards';
 import EventFilterBar, { EventCategory, EventSeverity } from '@/components/events/EventFilterBar';
 import EventStreamTable, { ClusterEventItem } from '@/components/events/EventStreamTable';
 import EventTimelineView from '@/components/events/EventTimelineView';
-
-const INITIAL_EVENTS: ClusterEventItem[] = [
-  {
-    id: 'evt-101',
-    timestamp: '14:30:21',
-    category: 'CLUSTER',
-    severity: 'INFO',
-    nodeId: 'node-a',
-    description: 'Node A heartbeat acknowledged by all cluster peers.',
-    metadata: { rttAvgMs: 0.8, ackCount: 4 },
-  },
-  {
-    id: 'evt-102',
-    timestamp: '14:30:19',
-    category: 'RAFT',
-    severity: 'INFO',
-    nodeId: 'node-d',
-    shardId: 1,
-    description: 'Shard 1 committed log entry #14818 via majority quorum.',
-    metadata: { commitIndex: 14818, term: 2, entriesCount: 1 },
-  },
-  {
-    id: 'evt-103',
-    timestamp: '14:30:16',
-    category: 'RAFT',
-    severity: 'INFO',
-    nodeId: 'node-a',
-    shardId: 0,
-    description: 'Leader elected: Node A won majority quorum (2/3) for Shard 0.',
-    metadata: { term: 3, votesReceived: ['node-a', 'node-b'] },
-  },
-  {
-    id: 'evt-104',
-    timestamp: '14:30:12',
-    category: 'REPLICATION',
-    severity: 'INFO',
-    nodeId: 'node-b',
-    shardId: 0,
-    description: 'Replica synchronization completed: MatchIndex caught up to CommitIndex.',
-    metadata: { matchIndex: 14820, lag: 0 },
-  },
-  {
-    id: 'evt-105',
-    timestamp: '14:30:08',
-    category: 'CLUSTER',
-    severity: 'INFO',
-    nodeId: 'node-c',
-    description: 'Node C established Raft transport peering with all active nodes.',
-    metadata: { remoteAddr: '127.0.0.1:3527', transport: 'TCP' },
-  },
-  {
-    id: 'evt-106',
-    timestamp: '14:28:44',
-    category: 'STORAGE',
-    severity: 'INFO',
-    nodeId: 'node-a',
-    shardId: 0,
-    description: 'LSM Memtable flushed to L0 SSTable file sst_001.sst (42.1 KB).',
-    metadata: { sstableId: 'sst_001', sizeBytes: 43110, level: 0 },
-  },
-  {
-    id: 'evt-107',
-    timestamp: '14:25:30',
-    category: 'NETWORK',
-    severity: 'WARN',
-    nodeId: 'node-e',
-    shardId: 1,
-    description: 'Transient latency spike detected on Raft heartbeat (34ms). Restored to baseline.',
-    metadata: { peakLatencyMs: 34.2, normalMs: 1.1 },
-  },
-];
+import { useEventStream } from '@/hooks/useEventStream';
+import LiveIndicator from '@/components/shared/LiveIndicator';
 
 export default function EventsPage() {
-  const [events, setEvents] = useState<ClusterEventItem[]>(INITIAL_EVENTS);
-  const [isPaused, setIsPaused] = useState(false);
+  const {
+    events,
+    isPaused,
+    setIsPaused,
+    isConnected,
+    exportJSON,
+    exportCSV,
+  } = useEventStream();
   const [search, setSearch] = useState('');
   const [severity, setSeverity] = useState<EventSeverity>('ALL');
   const [category, setCategory] = useState<EventCategory>('ALL');
@@ -168,9 +105,13 @@ export default function EventsPage() {
               <h1 className="text-xl sm:text-2xl font-bold text-[#17243A] tracking-tight">
                 Cluster Event Stream & Observability
               </h1>
-              <span className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-50 border border-emerald-200 text-[#10B981] text-xs font-semibold">
-                <span className="w-2 h-2 rounded-full bg-[#10B981] animate-ping" />
-                LIVE STREAM CONNECTED
+              <span className={`flex items-center gap-1.5 px-3 py-1 rounded-full font-mono text-xs font-semibold ${
+                isConnected
+                  ? 'bg-emerald-50 border border-emerald-200 text-[#10B981]'
+                  : 'bg-amber-50 border border-amber-200 text-[#F59E0B]'
+              }`}>
+                <span className={`w-2 h-2 rounded-full ${isConnected ? 'bg-[#10B981] animate-ping' : 'bg-[#F59E0B]'}`} />
+                {isConnected ? 'LIVE WEBSOCKET CONNECTED' : 'POLLING EVENT BUS'}
               </span>
             </div>
             <p className="text-xs sm:text-sm text-[#64748B] mt-1 font-normal">

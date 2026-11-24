@@ -1,7 +1,9 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import DashboardLayout from '@/components/dashboard/DashboardLayout';
+import { fetchClusterSettings, saveClusterSettings } from '@/lib/api/client';
+import LiveIndicator from '@/components/shared/LiveIndicator';
 import {
   Settings,
   Save,
@@ -30,6 +32,7 @@ export default function SettingsPage() {
   const [activeTab, setActiveTab] = useState<SettingsTab>('cluster');
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [restartMessage, setRestartMessage] = useState<string | null>(null);
 
   // Settings State matching configs/cluster.json
   const [clusterId, setClusterId] = useState('orbit-cluster-01');
@@ -62,14 +65,62 @@ export default function SettingsPage() {
   const [themePreference, setThemePreference] = useState<'light' | 'dark' | 'system'>('light');
   const [fpsLimit, setFpsLimit] = useState(60);
 
-  const handleSave = () => {
+  // Load live config files on mount
+  useEffect(() => {
+    async function loadConfig() {
+      try {
+        const { nodeConfig, clusterConfig } = await fetchClusterSettings();
+        if (clusterConfig) {
+          if (clusterConfig.cluster_id) setClusterId(clusterConfig.cluster_id);
+          if (clusterConfig.shard_count) setShardCount(clusterConfig.shard_count);
+          if (clusterConfig.replication_factor) setReplicationFactor(clusterConfig.replication_factor);
+        }
+        if (nodeConfig) {
+          if (nodeConfig.heartbeat_interval) {
+            setHeartbeatIntervalMs(parseInt(nodeConfig.heartbeat_interval) || 50);
+          }
+          if (nodeConfig.election_timeout_min) {
+            setElectionTimeoutMinMs(parseInt(nodeConfig.election_timeout_min) || 150);
+          }
+          if (nodeConfig.election_timeout_max) {
+            setElectionTimeoutMaxMs(parseInt(nodeConfig.election_timeout_max) || 300);
+          }
+        }
+      } catch (err) {
+        console.warn('Load config notice:', err);
+      }
+    }
+    loadConfig();
+  }, []);
+
+  const handleSave = async () => {
     setIsSaving(true);
     setSaveSuccess(false);
-    setTimeout(() => {
+    setRestartMessage(null);
+
+    try {
+      const res = await saveClusterSettings({
+        clusterConfig: {
+          cluster_id: clusterId,
+          shard_count: shardCount,
+          replication_factor: replicationFactor,
+        },
+        nodeConfig: {
+          heartbeat_interval: `${heartbeatIntervalMs}ms`,
+          election_timeout_min: `${electionTimeoutMinMs}ms`,
+          election_timeout_max: `${electionTimeoutMaxMs}ms`,
+        },
+      });
+
       setIsSaving(false);
       setSaveSuccess(true);
-      setTimeout(() => setSaveSuccess(false), 3000);
-    }, 600);
+      if (res.restartRequired) {
+        setRestartMessage(res.message);
+      }
+      setTimeout(() => setSaveSuccess(false), 4000);
+    } catch {
+      setIsSaving(false);
+    }
   };
 
   return (
@@ -109,6 +160,13 @@ export default function SettingsPage() {
             <span>
               Configuration changes successfully validated and saved to cluster state.
             </span>
+          </div>
+        )}
+
+        {restartMessage && (
+          <div className="p-3.5 rounded-xl bg-amber-50 border border-amber-200 text-amber-800 flex items-center gap-2 animate-fadeIn">
+            <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+            <span>{restartMessage}</span>
           </div>
         )}
 

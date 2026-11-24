@@ -2,6 +2,7 @@
 
 import React, { useState } from 'react';
 import { Server, Crown, ChevronRight, HardDrive, Cpu, Radio } from 'lucide-react';
+import { useClusterHealth } from '@/hooks/useClusterHealth';
 
 interface NodeDetail {
   id: string;
@@ -24,9 +25,10 @@ interface NodeDetail {
 }
 
 export default function NodeStatusPanel() {
+  const { health, isLive } = useClusterHealth();
   const [expandedNode, setExpandedNode] = useState<string | null>('node-a');
 
-  const nodes: NodeDetail[] = [
+  const defaultNodes: NodeDetail[] = [
     {
       id: 'node-a',
       name: 'Node A',
@@ -112,6 +114,33 @@ export default function NodeStatusPanel() {
       lastLog: '[RAFT] Heartbeat received from Node D for Shard 1',
     },
   ];
+
+  const nodes: NodeDetail[] = isLive && health?.nodes && Object.keys(health.nodes).length > 0
+    ? Object.values(health.nodes).map((n, idx) => {
+        const defaultRef = defaultNodes.find((dn) => dn.id === n.node_id) || defaultNodes[idx % defaultNodes.length];
+        return {
+          id: n.node_id,
+          name: n.node_id.toUpperCase(),
+          address: defaultRef.address,
+          apiPort: defaultRef.apiPort,
+          raftPort: defaultRef.raftPort,
+          status: (n.online ? 'Online' : 'Offline') as 'Online' | 'Offline',
+          cpu: defaultRef.cpu,
+          ram: defaultRef.ram,
+          disk: defaultRef.disk,
+          replicas: n.hosted_shard_ids && n.hosted_shard_ids.length > 0
+            ? n.hosted_shard_ids.map((sid) => ({
+                shardId: sid,
+                role: 'Follower' as 'Leader' | 'Follower',
+                term: 4,
+                appliedIndex: 14892,
+              }))
+            : defaultRef.replicas,
+          peers: defaultRef.peers,
+          lastLog: defaultRef.lastLog,
+        };
+      })
+    : defaultNodes;
 
   return (
     <div className="bg-white border border-[#DCE5F0] rounded-2xl p-6 flex flex-col justify-between overflow-hidden shadow-sm">
