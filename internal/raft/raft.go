@@ -169,9 +169,14 @@ func New(cfg Config) (*Raft, error) {
 		peerLastContact:         make(map[string]time.Time),
 		activeSnapshotTransfers: make(map[string]bool),
 		stopCh:                  make(chan struct{}),
-		stoppedCh:          make(chan struct{}),
-		rng:                rand.New(rand.NewSource(time.Now().UnixNano() + int64(len(cfg.ID)))),
+		stoppedCh:               make(chan struct{}),
 	}
+
+	var idHash int64 = 17
+	for _, b := range []byte(cfg.ID + "/" + string(r.groupID)) {
+		idHash = idHash*37 + int64(b)
+	}
+	r.rng = rand.New(rand.NewSource(time.Now().UnixNano() ^ (idHash << 16)))
 
 	r.applyCond = sync.NewCond(&r.mu)
 	r.resetElectionTimeoutLocked()
