@@ -68,55 +68,63 @@ export default function RaftLogInspector({ entries }: RaftLogInspectorProps) {
             </tr>
           </thead>
           <tbody className="divide-y divide-[#F1F5F9]">
-            {entries.map((entry) => (
-              <tr key={entry.index} className="hover:bg-[#F8FAFC]">
-                <td className="py-2.5 px-3 font-bold text-[#0891D5]">
-                  #{entry.index.toLocaleString()}
-                </td>
-                <td className="py-2.5 px-3 text-[#17243A] font-semibold">
-                  Term {entry.term}
-                </td>
-                <td className="py-2.5 px-3">
-                  <span
-                    className={`px-2 py-0.5 rounded-full border text-[10px] font-bold ${getCommandBadge(
-                      entry.type
-                    )}`}
-                  >
-                    {entry.type}
-                  </span>
-                </td>
-                <td className="py-2.5 px-3 text-[#17243A] font-mono text-[11px]">
-                  {entry.payloadSummary}
-                </td>
-                <td className="py-2.5 px-3">
-                  {entry.committed ? (
-                    <span className="inline-flex items-center gap-1 text-[#10B981] font-semibold text-[11px]">
-                      <CheckCircle2 className="w-3.5 h-3.5" />
-                      Committed
-                    </span>
-                  ) : (
-                    <span className="text-amber-500 font-semibold text-[11px]">
-                      Pending Quorum
-                    </span>
-                  )}
-                </td>
-                <td className="py-2.5 px-3">
-                  {entry.applied ? (
-                    <span className="inline-flex items-center gap-1 text-[#0891D5] font-semibold text-[11px]">
-                      <Check className="w-3.5 h-3.5" />
-                      Applied to LSM
-                    </span>
-                  ) : (
-                    <span className="text-slate-400 font-semibold text-[11px]">
-                      Queueing
-                    </span>
-                  )}
-                </td>
-                <td className="py-2.5 px-3 text-right text-[#64748B]">
-                  {entry.timestamp}
+            {entries.length === 0 ? (
+              <tr>
+                <td colSpan={7} className="py-8 text-center text-[#64748B]">
+                  No consensus log entries recorded yet. Performing writes in the Query Console will append live entries here.
                 </td>
               </tr>
-            ))}
+            ) : (
+              entries.map((entry) => (
+                <tr key={entry.index} className="hover:bg-[#F8FAFC]">
+                  <td className="py-2.5 px-3 font-bold text-[#0891D5]">
+                    #{entry.index.toLocaleString()}
+                  </td>
+                  <td className="py-2.5 px-3 text-[#17243A] font-semibold">
+                    Term {entry.term}
+                  </td>
+                  <td className="py-2.5 px-3">
+                    <span
+                      className={`px-2 py-0.5 rounded-full border text-[10px] font-bold ${getCommandBadge(
+                        entry.type
+                      )}`}
+                    >
+                      {entry.type}
+                    </span>
+                  </td>
+                  <td className="py-2.5 px-3 text-[#17243A] font-mono text-[11px]">
+                    {entry.payloadSummary}
+                  </td>
+                  <td className="py-2.5 px-3">
+                    {entry.committed ? (
+                      <span className="inline-flex items-center gap-1 text-[#10B981] font-semibold text-[11px]">
+                        <CheckCircle2 className="w-3.5 h-3.5" />
+                        Committed
+                      </span>
+                    ) : (
+                      <span className="text-amber-500 font-semibold text-[11px]">
+                        Pending Quorum
+                      </span>
+                    )}
+                  </td>
+                  <td className="py-2.5 px-3">
+                    {entry.applied ? (
+                      <span className="inline-flex items-center gap-1 text-[#0891D5] font-semibold text-[11px]">
+                        <Check className="w-3.5 h-3.5" />
+                        Applied to LSM
+                      </span>
+                    ) : (
+                      <span className="text-slate-400 font-semibold text-[11px]">
+                        Queueing
+                      </span>
+                    )}
+                  </td>
+                  <td className="py-2.5 px-3 text-right text-[#64748B]">
+                    {entry.timestamp}
+                  </td>
+                </tr>
+              ))
+            )}
           </tbody>
         </table>
       </div>

@@ -402,16 +402,20 @@ export default function ClusterScene({
     };
     animate();
 
-    // Handle Resize
+    // Handle Resize responsively via ResizeObserver and window events
     const handleResize = () => {
       if (!mountRef.current) return;
       const w = mountRef.current.clientWidth;
       const h = mountRef.current.clientHeight;
+      if (w === 0 || h === 0) return;
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
     };
     window.addEventListener('resize', handleResize);
+
+    const resizeObserver = new ResizeObserver(handleResize);
+    resizeObserver.observe(mountRef.current);
 
     return () => {
       if (animFrameIdRef.current) cancelAnimationFrame(animFrameIdRef.current);
@@ -421,6 +425,7 @@ export default function ClusterScene({
       dom.removeEventListener('wheel', onWheel);
       dom.removeEventListener('click', onClick);
       window.removeEventListener('resize', handleResize);
+      resizeObserver.disconnect();
 
       // Deep GPU Resource Disposal to prevent WebGL memory leak
       scene.traverse((obj) => {
@@ -447,7 +452,25 @@ export default function ClusterScene({
     if (!scene || viewMode !== '3d') return;
 
     leaderRingsRef.current = [];
-    buildingMeshesRef.current.forEach((grp) => scene.remove(grp));
+    buildingMeshesRef.current.forEach((grp) => {
+      scene.remove(grp);
+      grp.traverse((child) => {
+        if (child instanceof THREE.Mesh || child instanceof THREE.Sprite) {
+          if (child.geometry) child.geometry.dispose();
+          if (Array.isArray(child.material)) {
+            child.material.forEach((m) => {
+              if ('map' in m && m.map) m.map.dispose();
+              m.dispose();
+            });
+          } else if (child.material) {
+            if ('map' in child.material && (child.material as any).map) {
+              (child.material as any).map.dispose();
+            }
+            child.material.dispose();
+          }
+        }
+      });
+    });
     buildingMeshesRef.current.clear();
 
     nodes.forEach((node) => {
@@ -474,10 +497,24 @@ export default function ClusterScene({
     const scene = sceneRef.current;
     if (!scene || viewMode !== '3d') return;
 
-    linkLinesRef.current.forEach(({ line }) => scene.remove(line));
+    linkLinesRef.current.forEach(({ line }) => {
+      scene.remove(line);
+      if (line.geometry) line.geometry.dispose();
+      if (line.material) {
+        if (Array.isArray(line.material)) line.material.forEach((m) => m.dispose());
+        else line.material.dispose();
+      }
+    });
     linkLinesRef.current.clear();
 
-    packetParticlesRef.current.forEach((p) => scene.remove(p.mesh));
+    packetParticlesRef.current.forEach((p) => {
+      scene.remove(p.mesh);
+      if (p.mesh.geometry) p.mesh.geometry.dispose();
+      if (p.mesh.material) {
+        if (Array.isArray(p.mesh.material)) p.mesh.material.forEach((m) => m.dispose());
+        else p.mesh.material.dispose();
+      }
+    });
     packetParticlesRef.current = [];
 
     const nodeMap = new Map(nodes.map((n) => [n.id, n]));

@@ -12,7 +12,7 @@ import {
   CheckCircle2,
 } from 'lucide-react';
 
-export type QueryMethod = 'GET' | 'PUT' | 'DELETE';
+export type QueryMethod = 'GET' | 'PUT' | 'DELETE' | 'SCAN' | 'BATCH';
 export type ConsistencyLevel = 'linearizable' | 'eventual';
 
 export interface QueryRequest {
@@ -58,9 +58,9 @@ export default function QueryEditor({
     }
   }, [initialQuery]);
 
-  // Validate JSON on PUT
+  // Validate JSON on PUT and BATCH
   useEffect(() => {
-    if (method === 'PUT') {
+    if (method === 'PUT' || method === 'BATCH') {
       try {
         JSON.parse(value);
         setJsonError(null);
@@ -132,13 +132,40 @@ export default function QueryEditor({
           </button>
           <button
             onClick={() => setMethod('DELETE')}
-            className={`px-3 py-1.5 rounded-lg font-bold transition-all ${
+            className={`px-3 py-1.5 rounded-lg font-bold transition-all cursor-pointer ${
               method === 'DELETE'
                 ? 'bg-rose-50 text-rose-600 border border-rose-200 shadow-2xs'
                 : 'text-[#64748B] hover:text-[#17243A]'
             }`}
           >
             DELETE
+          </button>
+          <button
+            onClick={() => {
+              setMethod('SCAN');
+              if (!key) setKey('user:');
+            }}
+            className={`px-3 py-1.5 rounded-lg font-bold transition-all cursor-pointer ${
+              method === 'SCAN'
+                ? 'bg-purple-50 text-[#7965E8] border border-purple-200 shadow-2xs'
+                : 'text-[#64748B] hover:text-[#17243A]'
+            }`}
+          >
+            SCAN
+          </button>
+          <button
+            onClick={() => {
+              setMethod('BATCH');
+              setKey('batch:ops');
+              setValue('[\n  { "type": "SET", "key": "user:2001", "value": "{\\"tier\\":\\"pro\\"}" },\n  { "type": "SET", "key": "user:2002", "value": "{\\"tier\\":\\"free\\"}" }\n]');
+            }}
+            className={`px-3 py-1.5 rounded-lg font-bold transition-all cursor-pointer ${
+              method === 'BATCH'
+                ? 'bg-amber-50 text-[#D97706] border border-amber-200 shadow-2xs'
+                : 'text-[#64748B] hover:text-[#17243A]'
+            }`}
+          >
+            BATCH
           </button>
         </div>
 
@@ -200,12 +227,12 @@ export default function QueryEditor({
         </div>
       </div>
 
-      {/* 03. JSON VALUE EDITOR (FOR PUT) */}
-      {method === 'PUT' && (
+      {/* 03. JSON VALUE EDITOR (FOR PUT & BATCH) */}
+      {(method === 'PUT' || method === 'BATCH') && (
         <div className="space-y-1.5 font-mono text-xs">
           <div className="flex items-center justify-between">
             <label className="text-[11px] font-semibold text-[#64748B] uppercase tracking-wider">
-              JSON PAYLOAD VALUE
+              {method === 'BATCH' ? 'BATCH OPERATIONS ARRAY' : 'JSON PAYLOAD VALUE'}
             </label>
             {jsonError ? (
               <span className="flex items-center gap-1 text-[11px] text-rose-600 font-semibold">

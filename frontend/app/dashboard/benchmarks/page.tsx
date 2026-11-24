@@ -161,6 +161,51 @@ export default function BenchmarksPage() {
     URL.revokeObjectURL(url);
   };
 
+  const handleExportCsv = (run: BenchmarkRunRecord) => {
+    const headers = [
+      'id',
+      'timestamp',
+      'workload',
+      'durationSec',
+      'concurrency',
+      'keyCount',
+      'payloadSize',
+      'qps',
+      'avgLatencyMs',
+      'p50Ms',
+      'p95Ms',
+      'p99Ms',
+      'maxLatencyMs',
+      'totalRequests',
+      'errorCount',
+    ];
+    const row = [
+      run.id,
+      `"${run.timestamp}"`,
+      run.config.workload,
+      run.config.durationSec,
+      run.config.concurrency,
+      run.config.keyCount,
+      run.config.payloadSize,
+      run.metrics.qps,
+      run.metrics.avgLatencyMs,
+      run.metrics.p50Ms,
+      run.metrics.p95Ms,
+      run.metrics.p99Ms,
+      run.metrics.maxLatencyMs,
+      run.metrics.totalRequests,
+      run.metrics.errorCount,
+    ];
+    const csvContent = headers.join(',') + '\n' + row.join(',');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `orbit_benchmark_${run.id}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   return (
     <DashboardLayout activeNav="benchmarks">
       <div className="space-y-6">
@@ -216,6 +261,7 @@ export default function BenchmarksPage() {
           runs={history}
           onRerun={handleStartBenchmark}
           onExport={handleExportReport}
+          onExportCsv={handleExportCsv}
         />
       </div>
     </DashboardLayout>

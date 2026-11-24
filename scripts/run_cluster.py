@@ -2,6 +2,7 @@
 """
 ORBIT Distributed Key-Value Database — Cluster Orchestrator Suite
 Cross-platform cluster lifecycle manager: start, stop, restart, status, logs.
+Strict PID-verified process management: zero broad or unsafe taskkill calls.
 """
 
 import os
@@ -29,8 +30,50 @@ NODES = [
 
 def is_port_in_use(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(0.3)
+        s.settimeout(0.2)
         return s.connect_ex(("127.0.0.1", port)) == 0
+
+def find_pid_by_port(port: int):
+    """Finds the specific PID listening on the given port."""
+    if sys.platform == "win32":
+        try:
+            cmd = f'powershell -NoProfile -Command "(Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue).OwningProcess"'
+            out = subprocess.check_output(cmd, shell=True, text=True).strip()
+            if out and out.isdigit():
+                return int(out)
+        except Exception:
+            pass
+    else:
+        try:
+            out = subprocess.check_output(["lsof", "-t", "-i", f":{port}", "-sTCP:LISTEN"], text=True).strip()
+            if out and out.isdigit():
+                return int(out)
+        except Exception:
+            pass
+    return None
+
+def verify_orbit_process(pid: int, expected_node_id: str) -> bool:
+    """Verifies that the process at PID is indeed an ORBIT instance for expected_node_id."""
+    if not pid or not isinstance(pid, int):
+        return False
+
+    if sys.platform == "win32":
+        try:
+            cmd = f'powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter \\"ProcessId = {pid}\\" -ErrorAction SilentlyContinue).CommandLine"'
+            cmdline = subprocess.check_output(cmd, shell=True, text=True).strip().lower()
+            return ("orbit" in cmdline) and (expected_node_id in cmdline)
+        except Exception:
+            return False
+    else:
+        try:
+            cmdline_path = f"/proc/{pid}/cmdline"
+            if os.path.exists(cmdline_path):
+                with open(cmdline_path, "rb") as f:
+                    cmdline = f.read().decode(errors="ignore").lower()
+                return ("orbit" in cmdline) and (expected_node_id in cmdline)
+        except Exception:
+            return False
+    return False
 
 def load_pids() -> dict:
     if os.path.exists(PID_FILE):
@@ -46,26 +89,27 @@ def save_pids(pids: dict):
     with open(PID_FILE, "w") as f:
         json.dump(pids, f, indent=2)
 
-def is_process_running(pid: int) -> bool:
-    if sys.platform == "win32":
-        try:
-            out = subprocess.check_output(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV"], text=True)
-            return str(pid) in out
-        except Exception:
-            return False
-    else:
-        try:
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
-
 def compile_binary_if_needed():
     if not os.path.exists(BIN_PATH):
         print(f"[ORCHESTRATOR] Compiling {BIN_NAME} from ./cmd/orbit...")
         cmd = ["go", "build", "-o", os.path.join("bin", BIN_NAME), "./cmd/orbit"]
         subprocess.run(cmd, cwd=ROOT_DIR, check=True)
         print("[ORCHESTRATOR] Binary compiled successfully.")
+
+def get_node_pid(node_id: str, pids: dict, port: int):
+    # 1. Check PID from state file
+    stored_pid = pids.get(node_id)
+    if stored_pid and verify_orbit_process(stored_pid, node_id):
+        return stored_pid
+
+    # 2. Re-discover from listening port
+    active_pid = find_pid_by_port(port)
+    if active_pid and verify_orbit_process(active_pid, node_id):
+        pids[node_id] = active_pid
+        save_pids(pids)
+        return active_pid
+
+    return None
 
 def start_node(node_info: dict, pids: dict):
     nid = node_info["id"]
@@ -107,14 +151,14 @@ def start_cluster():
 
     for node in NODES:
         nid = node["id"]
-        pid = pids.get(nid)
+        pid = get_node_pid(nid, pids, node["api_port"])
 
-        if pid and is_process_running(pid):
+        if pid:
             print(f"  * {nid:8s} is already running (PID: {pid})")
             continue
 
         if is_port_in_use(node["api_port"]):
-            print(f"  ! Port {node['api_port']} for {nid} is already in use. Skipping start.")
+            print(f"  ! Port {node['api_port']} for {nid} is in use by another process. Skipping.")
             continue
 
         start_node(node, pids)
@@ -126,21 +170,24 @@ def start_cluster():
     print("\n-----------------------------------------------------------------")
     print("Cluster fleet online! Active REST & Raft endpoints:")
     for node in NODES:
-        print(f"  - {node['id']:8s} => http://127.0.0.1:{node['api_port']} (Health: /health)")
+        print(f"  - {node['id']:8s} => http://127.0.0.1:{node['api_port']} (Health: /cluster/health)")
     print("Frontend UI: http://localhost:3000/dashboard")
     print("-----------------------------------------------------------------")
 
 def stop_node(node_id: str, pids: dict):
-    pid = pids.get(node_id)
-    if pid and is_process_running(pid):
-        print(f"  - Stopping {node_id} (PID: {pid})...")
+    node = next((n for n in NODES if n["id"] == node_id), None)
+    port = node["api_port"] if node else 2525
+    pid = get_node_pid(node_id, pids, port)
+
+    if pid and verify_orbit_process(pid, node_id):
+        print(f"  - Stopping {node_id} (PID: {pid}, verified)...")
         if sys.platform == "win32":
             subprocess.run(["taskkill", "/F", "/PID", str(pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             try:
                 os.kill(pid, signal.SIGTERM)
                 time.sleep(0.2)
-                if is_process_running(pid):
+                if verify_orbit_process(pid, node_id):
                     os.kill(pid, signal.SIGKILL)
             except OSError:
                 pass
@@ -154,17 +201,12 @@ def stop_cluster():
     print("=================================================================")
     pids = load_pids()
 
+    # Terminate strictly each verified node PID
     for node in NODES:
         stop_node(node["id"], pids)
 
-    # Secondary kill to guarantee zero leaked processes
-    if sys.platform == "win32":
-        subprocess.run(["taskkill", "/F", "/IM", BIN_NAME, "/T"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    else:
-        subprocess.run(["pkill", "-f", "orbit"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
     save_pids({})
-    print("\nAll ORBIT cluster node processes stopped successfully.")
+    print("\nAll ORBIT cluster node processes stopped safely via verified PIDs.")
 
 def restart_node(node_id: str):
     node = next((n for n in NODES if n["id"] == node_id), None)
@@ -178,7 +220,7 @@ def restart_node(node_id: str):
     time.sleep(0.5)
     start_node(node, pids)
     save_pids(pids)
-    print(f"Node '{node_id}' restarted.")
+    print(f"Node '{node_id}' restarted successfully.")
 
 def show_status():
     print("=================================================================")
@@ -191,13 +233,8 @@ def show_status():
 
     for node in NODES:
         nid = node["id"]
-        pid = pids.get(nid, "-")
-        is_alive = False
-
-        if isinstance(pid, int) and is_process_running(pid):
-            is_alive = True
-        elif is_port_in_use(node["api_port"]):
-            is_alive = True
+        pid = get_node_pid(nid, pids, node["api_port"])
+        is_alive = pid is not None
 
         health_str = "OFFLINE"
         shards_str = "—"
@@ -217,7 +254,7 @@ def show_status():
             except Exception:
                 health_str = "ONLINE"
 
-        pid_display = str(pid) if pid != "-" else "-"
+        pid_display = str(pid) if pid else "-"
         print(f"{nid:<10} | {pid_display:<8} | :{node['api_port']:<9} | :{node['raft_port']:<7} | {health_str:<10} | {shards_str}")
 
     print("-" * 65)

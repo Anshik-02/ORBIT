@@ -32,6 +32,7 @@ import {
   ClusterEventsResponse,
   StorageMetrics,
   StorageStatsResponse,
+  ClusterMetricsResponse,
   RaftOverviewResponse,
   RaftLogsResponse,
   NodeDetailResponse,
@@ -284,6 +285,14 @@ export async function fetchClusterHealth(options?: RequestOptions): Promise<{
     return { isLive: true, data, endpoint };
   } catch {
     return { isLive: false, data: null, endpoint: cachedActiveEndpoint };
+  }
+}
+
+export async function fetchClusterMetrics(options?: RequestOptions): Promise<ClusterMetricsResponse | null> {
+  try {
+    return await request<ClusterMetricsResponse>(ENDPOINTS.METRICS, 'GET', undefined, options);
+  } catch {
+    return null;
   }
 }
 

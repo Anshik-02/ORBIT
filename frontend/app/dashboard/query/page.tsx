@@ -9,6 +9,7 @@ import QueryHistory, { HistoryItem } from '@/components/query/QueryHistory';
 import DataExplorer, { StoredKV } from '@/components/query/DataExplorer';
 import QueryAnalytics from '@/components/query/QueryAnalytics';
 import LiveIndicator from '@/components/shared/LiveIndicator';
+import { QueryService } from '@/lib/services/query.service';
 import {
   executeGetKV,
   executePutKV,
@@ -169,6 +170,28 @@ export default function QueryConsolePage() {
         bodyData = res.ok ? res.data : { error: res.error, key: req.key };
 
         setStoredKeys((prev) => prev.filter((k) => k.key !== req.key));
+      } else if (req.method === 'SCAN') {
+        const start = performance.now();
+        const res = await QueryService.scan({ start: req.key || undefined, limit: 50 });
+        durationMs = Math.round((performance.now() - start) * 10) / 10;
+        statusCode = res ? 200 : 500;
+        statusText = res ? `Scan Completed (${res.items?.length || 0} items)` : 'Scan Failed';
+        bodyData = res || { error: 'Failed to scan keys' };
+      } else if (req.method === 'BATCH') {
+        const start = performance.now();
+        let ops = [];
+        try {
+          ops = JSON.parse(req.value || '[]');
+        } catch {
+          ops = [];
+        }
+        const res = await QueryService.batchWrite(ops);
+        durationMs = Math.round((performance.now() - start) * 10) / 10;
+        const committed = res.results?.filter((r) => r.status === 'COMMITTED').length || 0;
+        const failed = res.results?.filter((r) => r.status === 'ERROR').length || 0;
+        statusCode = failed === 0 ? 200 : 207;
+        statusText = `Batch Executed (${committed} committed, ${failed} failed)`;
+        bodyData = res;
       }
     } catch (err: any) {
       statusCode = 500;

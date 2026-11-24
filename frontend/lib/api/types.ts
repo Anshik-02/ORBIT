@@ -306,6 +306,29 @@ export interface ClusterEventsResponse {
 }
 
 // Observability & Metrics
+export interface ClusterMetricsResponse {
+  timestamp: string;
+  uptime_seconds: number;
+  total_requests: number;
+  read_requests: number;
+  write_requests: number;
+  error_requests: number;
+  requests_per_sec: number;
+  reads_per_sec: number;
+  writes_per_sec: number;
+  error_rate: number;
+  latency: {
+    p50_ms: number;
+    p95_ms: number;
+    p99_ms: number;
+    avg_ms: number;
+  };
+  memory_alloc_mb: number;
+  memory_sys_mb: number;
+  num_goroutines: number;
+  num_gc: number;
+}
+
 export interface StorageMetrics {
   activeMemtableBytes: number;
   immutableMemtablesBytes: number;

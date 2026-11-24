@@ -23,70 +23,70 @@ interface MetricCardProps {
 export default function ClusterHealthCards() {
   const { status, health, isLive } = useClusterHealth();
 
-  const onlineNodes = health?.available_nodes ?? 5;
-  const totalNodes = health?.total_nodes ?? status?.node_count ?? 5;
-  const healthyShards = health?.healthy_shards ?? status?.shard_count ?? 3;
-  const totalShards = health?.total_shards ?? status?.shard_count ?? 3;
-  const leaderCount = totalShards - (health?.leaderless_shards ?? 0);
+  const onlineNodes = isLive ? (health?.available_nodes ?? 0) : 0;
+  const totalNodes = isLive ? (health?.total_nodes ?? status?.node_count ?? 5) : 5;
+  const healthyShards = isLive ? (health?.healthy_shards ?? 0) : 0;
+  const totalShards = isLive ? (health?.total_shards ?? status?.shard_count ?? 3) : 3;
+  const leaderCount = isLive ? Math.max(0, totalShards - (health?.leaderless_shards ?? 0)) : 0;
 
-  const isClusterHealthy = (health?.replication_health === 'healthy') || (!isLive && true);
+  const isClusterHealthy = isLive && (health?.replication_health === 'healthy' || health?.replication_health === 'degraded');
 
   const cards: MetricCardProps[] = [
     {
       label: 'PHYSICAL NODES',
-      value: `${onlineNodes} / ${totalNodes}`,
-      subValue: isLive ? `${Math.round((onlineNodes / totalNodes) * 100)}% Online` : '100% Online',
-      statusText: onlineNodes === totalNodes ? 'All nodes connected' : 'Degraded peer count',
-      statusColor: onlineNodes === totalNodes ? 'green' : 'amber',
+      value: isLive ? `${onlineNodes} / ${totalNodes}` : 'OFFLINE',
+      subValue: isLive ? `${Math.round((onlineNodes / totalNodes) * 100)}% Online` : 'Cluster Disconnected',
+      statusText: isLive ? (onlineNodes === totalNodes ? 'All nodes connected' : 'Degraded peer count') : 'No reachable nodes',
+      statusColor: isLive ? (onlineNodes === totalNodes ? 'green' : 'amber') : 'amber',
       icon: Server,
       description: isLive
         ? `Nodes: ${status?.nodes?.join(', ') || 'fleet active'}`
-        : 'Nodes A, B, C, D, E active across cluster',
-      badge: `${onlineNodes} HEALTHY`,
-      badgePercent: '+100%',
-      sparklineColor: '#10B981',
+        : 'Connecting to cluster nodes on :2525-:2529...',
+      badge: isLive ? `${onlineNodes} HEALTHY` : 'DISCONNECTED',
+      badgePercent: isLive ? `${Math.round((onlineNodes / totalNodes) * 100)}%` : '0%',
+      sparklineColor: isLive ? '#10B981' : '#F59E0B',
       sparklinePath: 'M0,18 Q30,6 60,16 T120,8 T180,14 T240,4',
       href: '/dashboard/topology',
     },
     {
       label: 'LOGICAL SHARDS',
-      value: `${healthyShards} / ${totalShards}`,
-      subValue: 'RF = 3 Replicated',
-      statusText: healthyShards === totalShards ? 'All shards operational' : 'Quorum warning',
-      statusColor: healthyShards === totalShards ? 'blue' : 'amber',
+      value: isLive ? `${healthyShards} / ${totalShards}` : '0 / 3',
+      subValue: isLive ? 'RF = 3 Replicated' : 'Quorum Disconnected',
+      statusText: isLive ? (healthyShards === totalShards ? 'All shards operational' : 'Quorum warning') : 'Offline',
+      statusColor: isLive ? (healthyShards === totalShards ? 'blue' : 'amber') : 'amber',
       icon: Database,
-      description: 'Murmur3-partitioned ring with uniform distribution',
-      badge: healthyShards === totalShards ? 'QUORUM OK' : 'QUORUM RISK',
-      badgePercent: '+3 Shards',
-      sparklineColor: '#0891D5',
+      description: isLive ? 'Murmur3-partitioned ring with uniform distribution' : 'Awaiting cluster reconnect',
+      badge: isLive ? (healthyShards === totalShards ? 'QUORUM OK' : 'QUORUM RISK') : 'OFFLINE',
+      badgePercent: isLive ? `${healthyShards} Shards` : '0 Shards',
+      sparklineColor: isLive ? '#0891D5' : '#64748B',
       sparklinePath: 'M0,16 Q40,4 80,14 T160,6 T200,12 T240,6',
       href: '/dashboard/shards',
     },
     {
       label: 'RAFT LEADERS',
-      value: `${leaderCount} / ${totalShards}`,
-      subValue: '0 Elections Pending',
-      statusText: 'One leader per shard',
-      statusColor: 'purple',
+      value: isLive ? `${leaderCount} / ${totalShards}` : '0 / 3',
+      subValue: isLive ? '0 Elections Pending' : 'No Active Leaders',
+      statusText: isLive ? 'One leader per shard' : 'Consensus inactive',
+      statusColor: isLive ? 'purple' : 'amber',
       icon: ShieldCheck,
-      description: 'Stable terms, zero split-brain, heartbeat tick 50ms',
-      badge: `${leaderCount} STABLE`,
-      badgePercent: '100% Quorum',
-      sparklineColor: '#7965E8',
+      description: isLive ? 'Stable terms, zero split-brain, heartbeat tick 50ms' : 'Raft groups unreachable',
+      badge: isLive ? `${leaderCount} STABLE` : 'NO QUORUM',
+      badgePercent: isLive ? '100% Quorum' : '0%',
+      sparklineColor: isLive ? '#7965E8' : '#64748B',
       sparklinePath: 'M0,14 Q30,20 70,8 T140,16 T200,6 T240,4',
       href: '/dashboard/raft',
     },
     {
       label: 'CLUSTER HEALTH',
-      value: isClusterHealthy ? '100%' : 'DEGRADED',
-      subValue: isLive ? (health?.replication_health === 'healthy' ? 'Zero Warnings' : 'Issues Detected') : 'Zero Warnings',
-      statusText: isLive ? (isClusterHealthy ? 'Live Operational' : 'Degraded') : 'Fully Operational',
-      statusColor: isClusterHealthy ? 'green' : 'amber',
+      value: isLive ? (health?.replication_health === 'healthy' ? '100%' : 'DEGRADED') : 'OFFLINE',
+      subValue: isLive ? (health?.replication_health === 'healthy' ? 'Zero Warnings' : 'Issues Detected') : 'Cluster Offline',
+      statusText: isLive ? (health?.replication_health === 'healthy' ? 'Live Operational' : 'Degraded') : 'Cluster Unreachable',
+      statusColor: isLive ? (health?.replication_health === 'healthy' ? 'green' : 'amber') : 'amber',
       icon: Activity,
-      description: 'All monitored components, WAL disks & LSM engines healthy',
-      badge: isLive ? 'LIVE CLUSTER' : 'OPTIMAL',
-      badgePercent: '0 Loss',
-      sparklineColor: isClusterHealthy ? '#10B981' : '#F59E0B',
+      description: isLive ? 'All monitored components, WAL disks & LSM engines healthy' : 'Failed to reach cluster API',
+      badge: isLive ? 'LIVE CLUSTER' : 'OFFLINE',
+      badgePercent: isLive ? 'Active' : 'Offline',
+      sparklineColor: isLive ? (health?.replication_health === 'healthy' ? '#10B981' : '#F59E0B') : '#EF4444',
       sparklinePath: 'M0,12 Q50,4 100,16 T180,6 T240,10',
       href: '/dashboard/events',
     },

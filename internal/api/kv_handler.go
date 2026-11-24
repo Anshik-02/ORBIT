@@ -346,6 +346,7 @@ func RegisterKVRoutes(mux *http.ServeMux, h *KVHandler) {
 	})
 	mux.HandleFunc("/cluster/status", h.handleClusterStatus)
 	mux.HandleFunc("/cluster/health", h.handleClusterHealth)
+	mux.HandleFunc("/health", h.handleClusterHealth)
 	mux.HandleFunc("/cluster/shards", h.handleClusterShards)
 	mux.HandleFunc("/cluster/nodes", h.handleClusterNodes)
 	mux.HandleFunc("/cluster/nodes/", h.handleClusterNodeDetail)
@@ -370,6 +371,7 @@ func RegisterKVRoutes(mux *http.ServeMux, h *KVHandler) {
 	})
 	mux.HandleFunc("/api/v1/cluster/status", h.handleClusterStatus)
 	mux.HandleFunc("/api/v1/cluster/health", h.handleClusterHealth)
+	mux.HandleFunc("/api/v1/health", h.handleClusterHealth)
 	mux.HandleFunc("/api/v1/cluster/shards", h.handleClusterShards)
 	mux.HandleFunc("/api/v1/cluster/nodes", h.handleClusterNodes)
 	mux.HandleFunc("/api/v1/cluster/nodes/", h.handleClusterNodeDetail)
@@ -384,8 +386,7 @@ func RegisterKVRoutes(mux *http.ServeMux, h *KVHandler) {
 	if h.wsHub != nil {
 		h.wsHub.RegisterRoutes(mux, "/ws/events")
 		h.wsHub.RegisterRoutes(mux, "/api/v1/ws/events")
-		// Support both WebSocket and standard HTTP GET on /cluster/events
-		mux.HandleFunc("/cluster/events", func(w http.ResponseWriter, r *http.Request) {
+		eventsHandler := func(w http.ResponseWriter, r *http.Request) {
 			if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 				h.wsHub.HandleWebSocket(w, r)
 				return
@@ -403,7 +404,9 @@ func RegisterKVRoutes(mux *http.ServeMux, h *KVHandler) {
 				"events": evts,
 				"total":  len(evts),
 			})
-		})
+		}
+		mux.HandleFunc("/cluster/events", eventsHandler)
+		mux.HandleFunc("/api/v1/cluster/events", eventsHandler)
 	}
 
 	if h.eventBus != nil {

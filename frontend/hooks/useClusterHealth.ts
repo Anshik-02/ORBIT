@@ -21,11 +21,15 @@ export function useClusterHealth(pollIntervalMs: number = 3000) {
 
       setIsLive(healthRes.isLive);
       setEndpoint(healthRes.endpoint);
-      if (healthRes.data) {
+      if (healthRes.isLive && healthRes.data) {
         setData(healthRes.data);
+      } else if (!healthRes.isLive) {
+        setData(null);
       }
-      if (statusRes) {
+      if (healthRes.isLive && statusRes) {
         setStatus(statusRes);
+      } else if (!healthRes.isLive) {
+        setStatus(null);
       }
       setLastUpdated(new Date());
     } finally {

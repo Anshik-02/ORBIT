@@ -107,11 +107,11 @@ export function useRaftConsensus() {
               httpPort: nodePortMap[fid] || ':2525',
               online: isOnline,
               matchIndex,
-              nextIndex: progress?.next_index ?? matchIndex + 1,
+              nextIndex: progress?.next_index ?? (matchIndex + 1),
               replicationLag: lag,
-              latency: `${(0.6 + Math.random() * 0.4).toFixed(1)}ms`,
-              lastAck: `${Math.round(10 + Math.random() * 15)}ms ago`,
-              lastHeartbeat: `${Math.round(35 + Math.random() * 20)}ms ago`,
+              latency: isOnline ? '< 1.0ms' : 'Timeout',
+              lastAck: isOnline ? (lag === 0 ? 'In Sync' : `${lag} entries behind`) : 'Unreachable',
+              lastHeartbeat: isOnline ? '< 50ms (Tick OK)' : 'Expired',
             };
           });
         });
@@ -133,9 +133,12 @@ export function useRaftConsensus() {
                 timestamp: l.timestamp ? new Date(l.timestamp).toLocaleTimeString() : 'Recent',
               }))
             );
+          } else {
+            setLogEntries([]);
           }
         } catch {
-          // Keep current log entries
+          // If cluster query fails, set empty logs
+          setLogEntries([]);
         }
 
         // Derive election events from real cluster events
@@ -162,6 +165,7 @@ export function useRaftConsensus() {
         }
       } else {
         setIsLive(false);
+        setLogEntries([]);
       }
       setLastUpdated(new Date());
     } finally {

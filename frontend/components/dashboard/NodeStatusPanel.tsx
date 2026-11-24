@@ -140,14 +140,17 @@ export default function NodeStatusPanel() {
           lastLog: defaultRef.lastLog,
         };
       })
-    : defaultNodes;
+    : defaultNodes.map((n) => ({
+        ...n,
+        status: isLive ? n.status : 'Offline',
+      }));
 
   // Environment health progress bars (Cosmic Forge style)
   const healthBars = [
-    { label: 'Shard 0 Quorum', pct: '100%', color: 'bg-[#10B981]' },
-    { label: 'Shard 1 Quorum', pct: '100%', color: 'bg-[#0891D5]' },
-    { label: 'Shard 2 Quorum', pct: '100%', color: 'bg-[#7965E8]' },
-    { label: 'LSM Engine & WAL', pct: '99.98%', color: 'bg-[#10B981]' },
+    { label: 'Shard 0 Quorum', pct: isLive ? '100%' : '0%', color: isLive ? 'bg-[#10B981]' : 'bg-slate-300' },
+    { label: 'Shard 1 Quorum', pct: isLive ? '100%' : '0%', color: isLive ? 'bg-[#0891D5]' : 'bg-slate-300' },
+    { label: 'Shard 2 Quorum', pct: isLive ? '100%' : '0%', color: isLive ? 'bg-[#7965E8]' : 'bg-slate-300' },
+    { label: 'LSM Engine & WAL', pct: isLive ? '99.98%' : '0%', color: isLive ? 'bg-[#10B981]' : 'bg-slate-300' },
   ];
 
   return (
@@ -166,8 +169,12 @@ export default function NodeStatusPanel() {
               5 physical cluster nodes hosting multi-raft replicas
             </p>
           </div>
-          <span className="text-[11px] font-mono px-2.5 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-semibold">
-            {nodes.filter(n => n.status === 'Online').length} / {nodes.length} ACTIVE
+          <span className={`text-[11px] font-mono px-2.5 py-0.5 rounded-full border font-semibold ${
+            isLive
+              ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+              : 'bg-rose-50 border-rose-200 text-rose-700'
+          }`}>
+            {isLive ? `${nodes.filter(n => n.status === 'Online').length} / ${nodes.length} ACTIVE` : 'CLUSTER OFFLINE'}
           </span>
         </div>
 

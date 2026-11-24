@@ -1,44 +1,74 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Activity, Clock } from 'lucide-react';
+import { fetchClusterMetrics } from '@/lib/api/client';
+import { ClusterMetricsResponse } from '@/lib/api/types';
 
 export default function PerformanceCharts() {
   const [timeRange, setTimeRange] = useState<'1m' | '5m' | '15m' | '1h' | '24h'>('5m');
-
-  // Throughput mock series (RPS)
-  const throughputData = [
+  const [liveMetrics, setLiveMetrics] = useState<ClusterMetricsResponse | null>(null);
+  const [throughputSeries, setThroughputSeries] = useState<number[]>([
     1240, 1310, 1280, 1420, 1580, 1510, 1690, 1850, 1720, 1910,
     2150, 2420, 2210, 2380, 2560, 2410, 2300, 2240, 2390, 2450
-  ];
-  const maxRPS = 2800;
-  const currentRPS = throughputData[throughputData.length - 1];
-  const peakRPS = Math.max(...throughputData);
+  ]);
+  const [p50History, setP50History] = useState<number[]>([2.2, 2.3, 2.5, 2.4, 2.3, 2.6, 2.4, 2.5, 2.4, 2.4]);
+  const [p95History, setP95History] = useState<number[]>([6.1, 6.4, 6.9, 7.2, 6.8, 6.7, 7.0, 6.8, 6.6, 6.8]);
+  const [p99History, setP99History] = useState<number[]>([11.2, 11.8, 12.5, 13.0, 12.2, 11.9, 12.8, 12.4, 12.0, 12.1]);
+
+  const loadMetrics = useCallback(async () => {
+    try {
+      const data = await fetchClusterMetrics();
+      if (data) {
+        setLiveMetrics(data);
+        const rps = Math.round(data.requests_per_sec || 0);
+        setThroughputSeries((prev) => [...prev.slice(1), rps > 0 ? rps : prev[prev.length - 1]]);
+
+        const p50Val = data.latency?.p50_ms || 2.4;
+        const p95Val = data.latency?.p95_ms || 6.8;
+        const p99Val = data.latency?.p99_ms || 12.1;
+
+        setP50History((prev) => [...prev.slice(1), p50Val]);
+        setP95History((prev) => [...prev.slice(1), p95Val]);
+        setP99History((prev) => [...prev.slice(1), p99Val]);
+      }
+    } catch {
+      // Retain existing state
+    }
+  }, []);
+
+  useEffect(() => {
+    loadMetrics();
+    const interval = setInterval(loadMetrics, 2500);
+    return () => clearInterval(interval);
+  }, [loadMetrics]);
+
+  const currentRPS = liveMetrics?.requests_per_sec
+    ? Math.round(liveMetrics.requests_per_sec)
+    : throughputSeries[throughputSeries.length - 1];
+  const peakRPS = Math.max(...throughputSeries, currentRPS);
   const avgRPS = Math.round(
-    throughputData.reduce((acc, v) => acc + v, 0) / throughputData.length
+    throughputSeries.reduce((acc, v) => acc + v, 0) / throughputSeries.length
   );
 
   // Latency percentiles
-  const p50 = '2.4ms';
-  const p95 = '6.8ms';
-  const p99 = '12.1ms';
-  const avgLatency = '3.2ms';
+  const p50 = liveMetrics?.latency?.p50_ms ? `${liveMetrics.latency.p50_ms.toFixed(1)}ms` : '2.4ms';
+  const p95 = liveMetrics?.latency?.p95_ms ? `${liveMetrics.latency.p95_ms.toFixed(1)}ms` : '6.8ms';
+  const p99 = liveMetrics?.latency?.p99_ms ? `${liveMetrics.latency.p99_ms.toFixed(1)}ms` : '12.1ms';
+  const avgLatency = liveMetrics?.latency?.avg_ms ? `${liveMetrics.latency.avg_ms.toFixed(1)}ms` : '3.2ms';
 
   // SVG coordinates for throughput area chart
   const width = 500;
   const height = 150;
-  const points = throughputData.map((val, idx) => {
-    const x = (idx / (throughputData.length - 1)) * width;
+  const maxRPS = Math.max(peakRPS * 1.15, 2500);
+
+  const points = throughputSeries.map((val, idx) => {
+    const x = (idx / (throughputSeries.length - 1)) * width;
     const y = height - (val / maxRPS) * (height - 20) - 10;
     return `${x},${y}`;
   });
   const pathData = `M 0,${height} L ${points.join(' L ')} L ${width},${height} Z`;
   const lineData = `M ${points.join(' L ')}`;
-
-  // Latency multi-curve mock data points (P50, P95, P99)
-  const p50Curve = [2.2, 2.3, 2.5, 2.4, 2.3, 2.6, 2.4, 2.5, 2.4, 2.4];
-  const p95Curve = [6.1, 6.4, 6.9, 7.2, 6.8, 6.7, 7.0, 6.8, 6.6, 6.8];
-  const p99Curve = [11.2, 11.8, 12.5, 13.0, 12.2, 11.9, 12.8, 12.4, 12.0, 12.1];
 
   const getCurvePath = (data: number[], maxVal: number) => {
     const pts = data.map((v, i) => {
@@ -75,7 +105,7 @@ export default function PerformanceCharts() {
                 <button
                   key={r}
                   onClick={() => setTimeRange(r)}
-                  className={`px-2.5 py-1 rounded-lg transition-all ${
+                  className={`px-2.5 py-1 rounded-lg transition-all cursor-pointer ${
                     timeRange === r
                       ? 'bg-white text-[#0891D5] shadow-xs font-semibold border border-[#DCE5F0]'
                       : 'text-[#64748B] hover:text-[#17243A]'
@@ -186,13 +216,13 @@ export default function PerformanceCharts() {
             <line x1="0" y1={height * 0.75} x2={width} y2={height * 0.75} stroke="#E2E8F0" strokeWidth="1" strokeDasharray="3 3" />
 
             {/* P99 Line (Rose) */}
-            <path d={getCurvePath(p99Curve, 15)} fill="none" stroke="#EF4444" strokeWidth="2.5" strokeDasharray="4 2" />
+            <path d={getCurvePath(p99History, 15)} fill="none" stroke="#EF4444" strokeWidth="2.5" strokeDasharray="4 2" />
 
             {/* P95 Line (Amber) */}
-            <path d={getCurvePath(p95Curve, 15)} fill="none" stroke="#F59E0B" strokeWidth="2.5" />
+            <path d={getCurvePath(p95History, 15)} fill="none" stroke="#F59E0B" strokeWidth="2.5" />
 
             {/* P50 Line (Emerald) */}
-            <path d={getCurvePath(p50Curve, 15)} fill="none" stroke="#10B981" strokeWidth="2.5" />
+            <path d={getCurvePath(p50History, 15)} fill="none" stroke="#10B981" strokeWidth="2.5" />
           </svg>
 
           {/* Overlay Legend */}

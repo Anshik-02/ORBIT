@@ -43,6 +43,18 @@ export function useStorageMetrics() {
         }
         if (detailed) {
           setDetailedStats(detailed);
+          setMetrics((prev) => ({
+            ...prev,
+            activeMemtableBytes: detailed.active_memtable?.byte_size ?? prev.activeMemtableBytes,
+            walSizeBytes: detailed.wal_size_bytes ?? prev.walSizeBytes,
+            walRecordCount: detailed.wal_record_count ?? prev.walRecordCount,
+            immutableMemtablesCount: detailed.immutable_count ?? prev.immutableMemtablesCount,
+            compactionCount: detailed.compaction?.compaction_count ?? prev.compactionCount,
+            sstableTotalBytes: detailed.total_sstable_bytes ?? prev.sstableTotalBytes,
+            writeAmplification: detailed.write_amplification ?? prev.writeAmplification,
+            readAmplification: detailed.read_amplification ?? prev.readAmplification,
+            spaceAmplification: detailed.space_amplification ?? prev.spaceAmplification,
+          }));
         }
       } else {
         setIsLive(false);
