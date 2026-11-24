@@ -697,9 +697,9 @@ func TestPhase36_DeterministicNodeRecoveryActualRaftState(t *testing.T) {
 			Address:            fmt.Sprintf("127.0.0.1:%d", ports[nid].apiPort),
 			RaftAddress:        peerRaftAddrs[nid],
 			DataDir:            filepath.Join(tempDir, nid),
-			HeartbeatInterval:  25 * time.Millisecond,
-			ElectionTimeoutMin: 60 * time.Millisecond,
-			ElectionTimeoutMax: 120 * time.Millisecond,
+			HeartbeatInterval:  20 * time.Millisecond,
+			ElectionTimeoutMin: 150 * time.Millisecond,
+			ElectionTimeoutMax: 300 * time.Millisecond,
 			Peers:              peers,
 		}
 
@@ -747,16 +747,43 @@ func TestPhase36_DeterministicNodeRecoveryActualRaftState(t *testing.T) {
 	t.Logf("Elected leader: %s", leaderNode.ID())
 
 	// Propose 5 real key-value entries
-	shard0Leader, _ := leaderNode.Shard(0)
 	for i := 1; i <= 5; i++ {
 		k := fmt.Sprintf("user:%d", i)
 		v := fmt.Sprintf("data-val-%d", i)
-		idx, _, err := shard0Leader.Raft().Propose("SET", k, v)
-		if err != nil {
-			t.Fatalf("propose %s: %v", k, err)
+
+		var (
+			currLeaderNode *node.Node
+			idx            uint64
+			propErr        error
+		)
+		propDeadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(propDeadline) {
+			for _, n := range nodes {
+				if n == nil {
+					continue
+				}
+				sh, ok := n.Shard(0)
+				if ok && sh.Raft().Role() == raft.Leader {
+					idx, _, propErr = sh.Raft().Propose("SET", k, v)
+					if propErr == nil {
+						currLeaderNode = n
+						break
+					}
+				}
+			}
+			if currLeaderNode != nil {
+				leaderNode = currLeaderNode
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		if err := shard0Leader.Raft().WaitForApply(ctx, idx); err != nil {
+		if currLeaderNode == nil {
+			t.Fatalf("propose %s: %v", k, propErr)
+		}
+
+		sh, _ := currLeaderNode.Shard(0)
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		if err := sh.Raft().WaitForApply(ctx, idx); err != nil {
 			cancel()
 			t.Fatalf("wait for apply %d: %v", idx, err)
 		}
@@ -775,7 +802,13 @@ func TestPhase36_DeterministicNodeRecoveryActualRaftState(t *testing.T) {
 	followerShard, _ := targetNode.Shard(0)
 
 	// Wait for follower to apply all 5 entries
-	time.Sleep(200 * time.Millisecond)
+	applyDeadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(applyDeadline) {
+		if followerShard.Raft().LastApplied() >= 5 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	preStopTerm := followerShard.Raft().CurrentTerm()
 	preStopApplied := followerShard.Raft().LastApplied()
@@ -816,9 +849,9 @@ func TestPhase36_DeterministicNodeRecoveryActualRaftState(t *testing.T) {
 		Address:            fmt.Sprintf("127.0.0.1:%d", ports[followerID].apiPort),
 		RaftAddress:        peerRaftAddrs[followerID],
 		DataDir:            filepath.Join(tempDir, followerID),
-		HeartbeatInterval:  25 * time.Millisecond,
-		ElectionTimeoutMin: 60 * time.Millisecond,
-		ElectionTimeoutMax: 120 * time.Millisecond,
+		HeartbeatInterval:  20 * time.Millisecond,
+		ElectionTimeoutMin: 150 * time.Millisecond,
+		ElectionTimeoutMax: 300 * time.Millisecond,
 		Peers:              peers,
 	}
 
