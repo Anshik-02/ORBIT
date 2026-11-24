@@ -1,5 +1,6 @@
 # Persistent data files — never commit WAL logs or database state
 data/
+logs/
 
 # Go build artifacts
 *.exe
