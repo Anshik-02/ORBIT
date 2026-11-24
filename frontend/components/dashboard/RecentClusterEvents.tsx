@@ -98,63 +98,65 @@ export default function RecentClusterEvents() {
   const getCategoryBadge = (category: ClusterEvent['category']) => {
     switch (category) {
       case 'RAFT':
-        return 'bg-amber-500/10 text-amber-400 border-amber-500/30';
+        return 'bg-[#F59E0B]/10 text-[#D97706] border-[#F59E0B]/25';
       case 'REPLICATION':
-        return 'bg-sky-500/10 text-sky-400 border-sky-500/30';
+        return 'bg-[#0891D5]/10 text-[#0891D5] border-[#0891D5]/25';
       case 'STORAGE':
-        return 'bg-indigo-500/10 text-indigo-400 border-indigo-500/30';
+        return 'bg-[#7965E8]/10 text-[#7965E8] border-[#7965E8]/25';
       case 'CLUSTER':
-        return 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30';
+        return 'bg-[#10B981]/10 text-[#10B981] border-[#10B981]/25';
       case 'RECOVERY':
-        return 'bg-purple-500/10 text-purple-400 border-purple-500/30';
+        return 'bg-indigo-50 text-indigo-600 border-indigo-200';
       case 'CHAOS':
-        return 'bg-rose-500/10 text-rose-400 border-rose-500/30';
+        return 'bg-rose-50 text-rose-600 border-rose-200';
       default:
-        return 'bg-slate-800 text-slate-300 border-slate-700';
+        return 'bg-[#F1F5F9] text-[#64748B] border-[#E2E8F0]';
     }
   };
 
   const getLevelDot = (level: ClusterEvent['level']) => {
     switch (level) {
       case 'success':
-        return 'bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.7)]';
+        return 'bg-[#10B981] shadow-[0_0_6px_rgba(16,185,129,0.5)]';
       case 'warn':
-        return 'bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.7)]';
+        return 'bg-[#F59E0B] shadow-[0_0_6px_rgba(245,158,11,0.5)]';
       case 'error':
-        return 'bg-rose-400 shadow-[0_0_6px_rgba(244,63,94,0.7)]';
+        return 'bg-[#EF4444] shadow-[0_0_6px_rgba(239,68,68,0.5)]';
       case 'info':
       default:
-        return 'bg-sky-400 shadow-[0_0_6px_rgba(56,189,248,0.7)]';
+        return 'bg-[#0891D5] shadow-[0_0_6px_rgba(8,145,213,0.5)]';
     }
   };
 
   return (
-    <div className="bg-[#0a0f1d]/80 backdrop-blur-md border border-slate-800/80 rounded-xl p-5 flex flex-col justify-between overflow-hidden">
+    <div className="bg-white border border-[#DCE5F0] rounded-2xl p-6 shadow-xs hover:shadow-md transition-shadow flex flex-col justify-between overflow-hidden">
       <div>
         {/* Header */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 mb-3 border-b border-slate-800/80">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 mb-4 border-b border-[#DCE5F0]">
           <div>
             <div className="flex items-center gap-2">
-              <Activity className="w-4 h-4 text-sky-400" />
-              <h3 className="text-base font-semibold text-white tracking-wide">
+              <div className="w-8 h-8 rounded-lg bg-[#0891D5]/10 flex items-center justify-center">
+                <Activity className="w-4 h-4 text-[#0891D5]" />
+              </div>
+              <h3 className="text-base font-semibold text-[#17243A] tracking-tight">
                 Recent Cluster Events
               </h3>
             </div>
-            <p className="text-xs text-slate-400 mt-0.5">
+            <p className="text-xs text-[#64748B] mt-1">
               Live audit journal of consensus ticks, storage flushes & network transitions
             </p>
           </div>
 
           {/* Filter tabs */}
-          <div className="flex flex-wrap items-center gap-1 p-1 rounded-lg bg-slate-900/90 border border-slate-800 self-start sm:self-auto font-mono text-[11px]">
+          <div className="flex flex-wrap items-center gap-1 p-1 rounded-xl bg-[#F4F7FC] border border-[#DCE5F0] self-start sm:self-auto font-mono text-[11px]">
             {(['ALL', 'RAFT', 'REPLICATION', 'STORAGE', 'CLUSTER', 'RECOVERY', 'CHAOS'] as const).map((cat) => (
               <button
                 key={cat}
                 onClick={() => setFilter(cat)}
-                className={`px-2 py-0.5 rounded transition-colors ${
+                className={`px-2 py-1 rounded-lg transition-all ${
                   filter === cat
-                    ? 'bg-sky-500/20 text-sky-300 border border-sky-500/30 font-semibold'
-                    : 'text-slate-400 hover:text-slate-200'
+                    ? 'bg-white text-[#0891D5] shadow-xs font-semibold border border-[#DCE5F0]'
+                    : 'text-[#64748B] hover:text-[#17243A]'
                 }`}
               >
                 {cat}
@@ -168,26 +170,26 @@ export default function RecentClusterEvents() {
           {filteredEvents.map((evt) => (
             <div
               key={evt.id}
-              className="flex items-center justify-between p-2.5 rounded-lg bg-slate-950/40 border border-slate-800/70 hover:border-slate-700/80 transition-colors"
+              className="flex items-center justify-between p-2.5 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0] hover:border-[#CBD5E1] transition-colors"
             >
               <div className="flex items-center gap-3">
                 <span className={`w-2 h-2 rounded-full ${getLevelDot(evt.level)} shrink-0`} />
                 <span
-                  className={`text-[9px] px-1.5 py-0.5 rounded border uppercase tracking-wider shrink-0 font-semibold ${getCategoryBadge(
+                  className={`text-[9px] px-2 py-0.5 rounded-full border uppercase tracking-wider shrink-0 font-semibold ${getCategoryBadge(
                     evt.category
                   )}`}
                 >
                   {evt.category}
                 </span>
-                <span className="text-slate-400 text-[11px] shrink-0 font-semibold text-slate-300">
+                <span className="text-[#64748B] text-[11px] shrink-0 font-semibold">
                   [{evt.node}]
                 </span>
-                <span className="text-slate-300 text-xs line-clamp-1">
+                <span className="text-[#17243A] text-xs line-clamp-1 font-medium">
                   {evt.message}
                 </span>
               </div>
 
-              <span className="text-[11px] text-slate-400 shrink-0 ml-3">
+              <span className="text-[11px] text-[#64748B] shrink-0 ml-3">
                 {evt.timestamp}
               </span>
             </div>

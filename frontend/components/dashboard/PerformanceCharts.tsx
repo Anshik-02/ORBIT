@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState } from 'react';
-import { Activity, Clock, TrendingUp, Zap, BarChart2 } from 'lucide-react';
+import { Activity, Clock } from 'lucide-react';
 
 export default function PerformanceCharts() {
   const [timeRange, setTimeRange] = useState<'1m' | '5m' | '15m' | '1h' | '24h'>('5m');
@@ -50,33 +50,35 @@ export default function PerformanceCharts() {
   };
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
       {/* Request Throughput Chart */}
-      <div className="bg-[#0a0f1d]/80 backdrop-blur-md border border-slate-800/80 rounded-xl p-5 flex flex-col justify-between overflow-hidden">
+      <div className="bg-white border border-[#DCE5F0] rounded-2xl p-6 shadow-xs hover:shadow-md transition-shadow flex flex-col justify-between overflow-hidden">
         <div>
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
             <div>
               <div className="flex items-center gap-2">
-                <Activity className="w-4 h-4 text-sky-400" />
-                <h3 className="text-base font-semibold text-white tracking-wide">
+                <div className="w-8 h-8 rounded-lg bg-[#0891D5]/10 flex items-center justify-center">
+                  <Activity className="w-4 h-4 text-[#0891D5]" />
+                </div>
+                <h3 className="text-base font-semibold text-[#17243A] tracking-tight">
                   Request Throughput
                 </h3>
               </div>
-              <p className="text-xs text-slate-400 mt-0.5">
-                Total operations committed across consensus multi-raft groups
+              <p className="text-xs text-[#64748B] mt-1">
+                Committed operations across consensus multi-raft groups
               </p>
             </div>
 
             {/* Time range selector */}
-            <div className="flex items-center gap-1 p-0.5 rounded-lg bg-slate-900/90 border border-slate-800 self-start sm:self-auto font-mono text-xs">
+            <div className="flex items-center gap-1 p-1 rounded-xl bg-[#F4F7FC] border border-[#DCE5F0] self-start sm:self-auto font-mono text-xs">
               {(['1m', '5m', '15m', '1h', '24h'] as const).map((r) => (
                 <button
                   key={r}
                   onClick={() => setTimeRange(r)}
-                  className={`px-2 py-0.5 rounded transition-colors ${
+                  className={`px-2.5 py-1 rounded-lg transition-all ${
                     timeRange === r
-                      ? 'bg-sky-500/20 text-sky-300 border border-sky-500/30 font-semibold'
-                      : 'text-slate-400 hover:text-slate-200'
+                      ? 'bg-white text-[#0891D5] shadow-xs font-semibold border border-[#DCE5F0]'
+                      : 'text-[#64748B] hover:text-[#17243A]'
                   }`}
                 >
                   {r}
@@ -86,121 +88,123 @@ export default function PerformanceCharts() {
           </div>
 
           {/* Metric highlights */}
-          <div className="grid grid-cols-3 gap-3 mb-4 font-mono">
-            <div className="p-2.5 rounded-lg bg-slate-900/50 border border-slate-800/80">
-              <span className="text-[10px] text-slate-400 uppercase block">Current RPS</span>
-              <span className="text-lg font-bold text-white tracking-tight">
-                {currentRPS.toLocaleString()} <span className="text-[10px] text-slate-400 font-normal">req/s</span>
+          <div className="grid grid-cols-3 gap-3 mb-5 font-mono">
+            <div className="p-3 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0]">
+              <span className="text-[10px] text-[#64748B] font-semibold uppercase block tracking-wider">Current RPS</span>
+              <span className="text-lg font-bold text-[#17243A] tracking-tight">
+                {currentRPS.toLocaleString()} <span className="text-[10px] text-[#64748B] font-normal">req/s</span>
               </span>
             </div>
-            <div className="p-2.5 rounded-lg bg-slate-900/50 border border-slate-800/80">
-              <span className="text-[10px] text-slate-400 uppercase block">Peak Throughput</span>
-              <span className="text-lg font-bold text-sky-400 tracking-tight">
-                {peakRPS.toLocaleString()} <span className="text-[10px] text-slate-400 font-normal">req/s</span>
+            <div className="p-3 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0]">
+              <span className="text-[10px] text-[#64748B] font-semibold uppercase block tracking-wider">Peak RPS</span>
+              <span className="text-lg font-bold text-[#0891D5] tracking-tight">
+                {peakRPS.toLocaleString()} <span className="text-[10px] text-[#64748B] font-normal">req/s</span>
               </span>
             </div>
-            <div className="p-2.5 rounded-lg bg-slate-900/50 border border-slate-800/80">
-              <span className="text-[10px] text-slate-400 uppercase block">Mean Throughput</span>
-              <span className="text-lg font-bold text-emerald-400 tracking-tight">
-                {avgRPS.toLocaleString()} <span className="text-[10px] text-slate-400 font-normal">req/s</span>
+            <div className="p-3 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0]">
+              <span className="text-[10px] text-[#64748B] font-semibold uppercase block tracking-wider">Mean RPS</span>
+              <span className="text-lg font-bold text-[#10B981] tracking-tight">
+                {avgRPS.toLocaleString()} <span className="text-[10px] text-[#64748B] font-normal">req/s</span>
               </span>
             </div>
           </div>
         </div>
 
         {/* SVG Throughput Graph */}
-        <div className="relative w-full h-[150px] bg-slate-950/40 rounded-lg border border-slate-900 overflow-hidden">
-          <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-full preserve-3d" preserveAspectRatio="none">
+        <div className="relative w-full h-[155px] bg-[#F8FAFC] rounded-xl border border-[#E2E8F0] overflow-hidden">
+          <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-full" preserveAspectRatio="none">
             <defs>
-              <linearGradient id="throughputGrad" x1="0%" y1="0%" x2="0%" y2="100%">
-                <stop offset="0%" stopColor="#38bdf8" stopOpacity="0.35" />
-                <stop offset="100%" stopColor="#38bdf8" stopOpacity="0.0" />
+              <linearGradient id="throughputGradLight" x1="0%" y1="0%" x2="0%" y2="100%">
+                <stop offset="0%" stopColor="#0891D5" stopOpacity="0.25" />
+                <stop offset="100%" stopColor="#0891D5" stopOpacity="0.0" />
               </linearGradient>
             </defs>
 
             {/* Subtle horizontal grid lines */}
-            <line x1="0" y1={height * 0.25} x2={width} y2={height * 0.25} stroke="#334155" strokeWidth="0.5" strokeDasharray="3 3" />
-            <line x1="0" y1={height * 0.5} x2={width} y2={height * 0.5} stroke="#334155" strokeWidth="0.5" strokeDasharray="3 3" />
-            <line x1="0" y1={height * 0.75} x2={width} y2={height * 0.75} stroke="#334155" strokeWidth="0.5" strokeDasharray="3 3" />
+            <line x1="0" y1={height * 0.25} x2={width} y2={height * 0.25} stroke="#E2E8F0" strokeWidth="1" strokeDasharray="3 3" />
+            <line x1="0" y1={height * 0.5} x2={width} y2={height * 0.5} stroke="#E2E8F0" strokeWidth="1" strokeDasharray="3 3" />
+            <line x1="0" y1={height * 0.75} x2={width} y2={height * 0.75} stroke="#E2E8F0" strokeWidth="1" strokeDasharray="3 3" />
 
             {/* Fill Area */}
-            <path d={pathData} fill="url(#throughputGrad)" />
+            <path d={pathData} fill="url(#throughputGradLight)" />
 
             {/* Main Line */}
-            <path d={lineData} fill="none" stroke="#38bdf8" strokeWidth="2" strokeLinecap="round" />
+            <path d={lineData} fill="none" stroke="#0891D5" strokeWidth="2.5" strokeLinecap="round" />
           </svg>
         </div>
       </div>
 
       {/* Request Latency Chart */}
-      <div className="bg-[#0a0f1d]/80 backdrop-blur-md border border-slate-800/80 rounded-xl p-5 flex flex-col justify-between overflow-hidden">
+      <div className="bg-white border border-[#DCE5F0] rounded-2xl p-6 shadow-xs hover:shadow-md transition-shadow flex flex-col justify-between overflow-hidden">
         <div>
           <div className="flex items-center justify-between mb-4">
             <div>
               <div className="flex items-center gap-2">
-                <Clock className="w-4 h-4 text-indigo-400" />
-                <h3 className="text-base font-semibold text-white tracking-wide">
+                <div className="w-8 h-8 rounded-lg bg-[#7965E8]/10 flex items-center justify-center">
+                  <Clock className="w-4 h-4 text-[#7965E8]" />
+                </div>
+                <h3 className="text-base font-semibold text-[#17243A] tracking-tight">
                   Request Latency (End-to-End)
                 </h3>
               </div>
-              <p className="text-xs text-slate-400 mt-0.5">
-                Linearizable client round-trip including leader forwarding & replication
+              <p className="text-xs text-[#64748B] mt-1">
+                Linearizable client round-trip with quorum replication
               </p>
             </div>
-            <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-indigo-500/10 border border-indigo-500/30 text-indigo-400">
+            <span className="text-[11px] font-mono px-2.5 py-1 rounded-full bg-[#7965E8]/10 border border-[#7965E8]/30 text-[#7965E8] font-semibold">
               P99 &lt; 15ms SLA
             </span>
           </div>
 
           {/* Latency percentiles breakdown */}
-          <div className="grid grid-cols-4 gap-2 mb-4 font-mono">
-            <div className="p-2.5 rounded-lg bg-slate-900/50 border border-slate-800/80">
-              <span className="text-[10px] text-slate-400 uppercase block">Mean</span>
-              <span className="text-base font-bold text-slate-200">{avgLatency}</span>
+          <div className="grid grid-cols-4 gap-2 mb-5 font-mono">
+            <div className="p-3 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0]">
+              <span className="text-[10px] text-[#64748B] font-semibold uppercase block tracking-wider">Mean</span>
+              <span className="text-base font-bold text-[#17243A]">{avgLatency}</span>
             </div>
-            <div className="p-2.5 rounded-lg bg-slate-900/50 border border-slate-800/80">
-              <span className="text-[10px] text-slate-400 uppercase block">P50</span>
-              <span className="text-base font-bold text-emerald-400">{p50}</span>
+            <div className="p-3 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0]">
+              <span className="text-[10px] text-[#64748B] font-semibold uppercase block tracking-wider">P50</span>
+              <span className="text-base font-bold text-[#10B981]">{p50}</span>
             </div>
-            <div className="p-2.5 rounded-lg bg-slate-900/50 border border-slate-800/80">
-              <span className="text-[10px] text-slate-400 uppercase block">P95</span>
-              <span className="text-base font-bold text-amber-400">{p95}</span>
+            <div className="p-3 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0]">
+              <span className="text-[10px] text-[#64748B] font-semibold uppercase block tracking-wider">P95</span>
+              <span className="text-base font-bold text-[#F59E0B]">{p95}</span>
             </div>
-            <div className="p-2.5 rounded-lg bg-slate-900/50 border border-slate-800/80">
-              <span className="text-[10px] text-slate-400 uppercase block">P99</span>
-              <span className="text-base font-bold text-rose-400">{p99}</span>
+            <div className="p-3 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0]">
+              <span className="text-[10px] text-[#64748B] font-semibold uppercase block tracking-wider">P99</span>
+              <span className="text-base font-bold text-[#EF4444]">{p99}</span>
             </div>
           </div>
         </div>
 
         {/* Multi-line Latency Curves */}
-        <div className="relative w-full h-[150px] bg-slate-950/40 rounded-lg border border-slate-900 overflow-hidden">
+        <div className="relative w-full h-[155px] bg-[#F8FAFC] rounded-xl border border-[#E2E8F0] overflow-hidden">
           <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-full" preserveAspectRatio="none">
             {/* Horizontal guidelines */}
-            <line x1="0" y1={height * 0.25} x2={width} y2={height * 0.25} stroke="#334155" strokeWidth="0.5" strokeDasharray="3 3" />
-            <line x1="0" y1={height * 0.5} x2={width} y2={height * 0.5} stroke="#334155" strokeWidth="0.5" strokeDasharray="3 3" />
-            <line x1="0" y1={height * 0.75} x2={width} y2={height * 0.75} stroke="#334155" strokeWidth="0.5" strokeDasharray="3 3" />
+            <line x1="0" y1={height * 0.25} x2={width} y2={height * 0.25} stroke="#E2E8F0" strokeWidth="1" strokeDasharray="3 3" />
+            <line x1="0" y1={height * 0.5} x2={width} y2={height * 0.5} stroke="#E2E8F0" strokeWidth="1" strokeDasharray="3 3" />
+            <line x1="0" y1={height * 0.75} x2={width} y2={height * 0.75} stroke="#E2E8F0" strokeWidth="1" strokeDasharray="3 3" />
 
             {/* P99 Line (Rose) */}
-            <path d={getCurvePath(p99Curve, 15)} fill="none" stroke="#f43f5e" strokeWidth="2" strokeDasharray="4 2" />
+            <path d={getCurvePath(p99Curve, 15)} fill="none" stroke="#EF4444" strokeWidth="2.5" strokeDasharray="4 2" />
 
             {/* P95 Line (Amber) */}
-            <path d={getCurvePath(p95Curve, 15)} fill="none" stroke="#f59e0b" strokeWidth="2" />
+            <path d={getCurvePath(p95Curve, 15)} fill="none" stroke="#F59E0B" strokeWidth="2.5" />
 
             {/* P50 Line (Emerald) */}
-            <path d={getCurvePath(p50Curve, 15)} fill="none" stroke="#10b981" strokeWidth="2" />
+            <path d={getCurvePath(p50Curve, 15)} fill="none" stroke="#10B981" strokeWidth="2.5" />
           </svg>
 
           {/* Overlay Legend */}
-          <div className="absolute top-2 right-2 flex items-center gap-3 font-mono text-[10px] px-2 py-1 rounded bg-slate-900/90 border border-slate-800">
-            <div className="flex items-center gap-1 text-emerald-400">
-              <span className="w-2 h-0.5 bg-emerald-400 inline-block" /> P50
+          <div className="absolute top-2.5 right-2.5 flex items-center gap-3 font-mono text-[10px] px-2.5 py-1 rounded-lg bg-white/95 border border-[#DCE5F0] shadow-xs">
+            <div className="flex items-center gap-1.5 text-[#10B981] font-semibold">
+              <span className="w-2.5 h-1 bg-[#10B981] rounded-full inline-block" /> P50
             </div>
-            <div className="flex items-center gap-1 text-amber-400">
-              <span className="w-2 h-0.5 bg-amber-400 inline-block" /> P95
+            <div className="flex items-center gap-1.5 text-[#F59E0B] font-semibold">
+              <span className="w-2.5 h-1 bg-[#F59E0B] rounded-full inline-block" /> P95
             </div>
-            <div className="flex items-center gap-1 text-rose-400">
-              <span className="w-2 h-0.5 bg-rose-400 inline-block" /> P99
+            <div className="flex items-center gap-1.5 text-[#EF4444] font-semibold">
+              <span className="w-2.5 h-1 bg-[#EF4444] rounded-full inline-block" /> P99
             </div>
           </div>
         </div>

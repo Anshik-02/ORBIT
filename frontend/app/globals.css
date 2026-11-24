@@ -13,13 +13,18 @@
 }
 
 :root {
-  --background: #030712;
-  --foreground: #f8fafc;
+  --background: #F4F7FC;
+  --foreground: #17243A;
+  --card: #FFFFFF;
+  --border: #DCE5F0;
+  --accent: #0891D5;
+  --accent-purple: #7965E8;
+  --text-muted: #64748B;
 }
 
 html {
   scroll-behavior: smooth;
-  color-scheme: dark;
+  color-scheme: light;
 }
 
 body {
@@ -30,35 +35,33 @@ body {
   overflow-x: hidden;
 }
 
-/* Technical grid background */
+/* Light infrastructure subtle grid & mesh */
 .bg-tech-grid {
   background-image: 
-    linear-gradient(to right, rgba(255, 255, 255, 0.03) 1px, transparent 1px),
-    linear-gradient(to bottom, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+    linear-gradient(to right, rgba(8, 145, 213, 0.05) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(8, 145, 213, 0.05) 1px, transparent 1px);
   background-size: 48px 48px;
 }
 
 .bg-dot-matrix {
-  background-image: radial-gradient(rgba(56, 189, 248, 0.15) 1px, transparent 1px);
+  background-image: radial-gradient(rgba(8, 145, 213, 0.12) 1px, transparent 1px);
   background-size: 24px 24px;
 }
 
-/* Glassmorphism panel styling */
-.glass-panel {
-  background: rgba(10, 17, 36, 0.7);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  border: 1px solid rgba(56, 189, 248, 0.15);
+/* Light infrastructure card styling */
+.light-card {
+  background: #FFFFFF;
+  border: 1px solid #DCE5F0;
+  box-shadow: 0 4px 20px -2px rgba(15, 23, 42, 0.04), 0 2px 6px -1px rgba(15, 23, 42, 0.02);
 }
 
-.glass-panel-hover {
-  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+.light-card-hover {
+  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
-.glass-panel-hover:hover {
-  background: rgba(15, 23, 48, 0.85);
-  border-color: rgba(56, 189, 248, 0.35);
-  box-shadow: 0 10px 30px -10px rgba(56, 189, 248, 0.2);
+.light-card-hover:hover {
+  border-color: #CBD5E1;
+  box-shadow: 0 12px 30px -4px rgba(8, 145, 213, 0.12), 0 4px 10px -2px rgba(15, 23, 42, 0.04);
   transform: translateY(-2px);
 }
 
@@ -68,14 +71,14 @@ body {
 }
 
 ::-webkit-scrollbar-track {
-  background: #030712;
+  background: #F4F7FC;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(56, 189, 248, 0.2);
+  background: #CBD5E1;
   border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(56, 189, 248, 0.4);
+  background: #94A3B8;
 }

@@ -7,7 +7,7 @@ import Footer from "@/components/landing/Footer";
 
 export default function Home() {
   return (
-    <main className="min-h-screen bg-[#030712] text-slate-100 flex flex-col selection:bg-sky-500/30 selection:text-sky-200">
+    <main className="min-h-screen bg-[#F4F7FC] text-[#17243A] flex flex-col selection:bg-[#0891D5]/20 selection:text-[#0891D5]">
       {/* Section A: Navigation Bar */}
       <Navbar />
 
@@ -17,7 +17,7 @@ export default function Home() {
       {/* Section C: Architecture Overview with 5 Interactive Cards */}
       <ArchitectureOverview />
 
-      {/* Section D: Write Request Pipeline Animation */}
+      {/* Section D: Write Request Pipeline Animation with Failure Simulation Toggle */}
       <WritePipeline />
 
       {/* Section E: Technology Stack */}

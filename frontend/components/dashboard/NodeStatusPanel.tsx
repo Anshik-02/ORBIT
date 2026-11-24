@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState } from 'react';
-import { Server, Crown, ChevronRight, Activity, HardDrive, Cpu, Radio } from 'lucide-react';
+import { Server, Crown, ChevronRight, HardDrive, Cpu, Radio } from 'lucide-react';
 
 interface NodeDetail {
   id: string;
@@ -114,27 +114,27 @@ export default function NodeStatusPanel() {
   ];
 
   return (
-    <div className="bg-[#0a0f1d]/80 backdrop-blur-md border border-slate-800/80 rounded-xl p-5 flex flex-col justify-between overflow-hidden">
+    <div className="bg-white border border-[#DCE5F0] rounded-2xl p-6 flex flex-col justify-between overflow-hidden shadow-sm">
       {/* Header */}
-      <div className="flex items-center justify-between pb-3 mb-3 border-b border-slate-800/80">
+      <div className="flex items-center justify-between pb-3.5 mb-4 border-b border-[#DCE5F0]">
         <div>
           <div className="flex items-center gap-2">
-            <Server className="w-4 h-4 text-sky-400" />
-            <h2 className="text-base font-semibold text-white tracking-wide">
+            <Server className="w-4 h-4 text-[#0891D5]" />
+            <h2 className="text-base font-bold text-[#17243A] tracking-wide">
               Node Fleet Status
             </h2>
           </div>
-          <p className="text-xs text-slate-400 mt-0.5">
+          <p className="text-xs text-[#64748B] mt-0.5">
             5 physical cluster nodes hosting 7 shard replica instances
           </p>
         </div>
-        <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-400">
+        <span className="text-[11px] font-mono px-2.5 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-semibold">
           5 / 5 ACTIVE
         </span>
       </div>
 
       {/* Nodes List */}
-      <div className="space-y-2 max-h-[380px] overflow-y-auto pr-1">
+      <div className="space-y-2.5 max-h-[380px] overflow-y-auto pr-1">
         {nodes.map((node) => {
           const isExpanded = expandedNode === node.id;
           const hasLeader = node.replicas.some((r) => r.role === 'Leader');
@@ -142,47 +142,45 @@ export default function NodeStatusPanel() {
           return (
             <div
               key={node.id}
-              className={`border rounded-lg transition-all duration-200 overflow-hidden ${
+              className={`border rounded-xl transition-all duration-200 overflow-hidden ${
                 isExpanded
-                  ? 'bg-slate-900/90 border-sky-500/40 shadow-lg'
-                  : 'bg-slate-950/40 border-slate-800/80 hover:border-slate-700/80'
+                  ? 'bg-[#F8FAFC] border-sky-300 shadow-sm'
+                  : 'bg-white border-[#DCE5F0] hover:border-slate-300'
               }`}
             >
               {/* Row Header */}
               <button
                 onClick={() => setExpandedNode(isExpanded ? null : node.id)}
-                className="w-full flex items-center justify-between p-3 text-left transition-colors"
+                className="w-full flex items-center justify-between p-3.5 text-left transition-colors"
               >
                 <div className="flex items-center gap-3">
-                  <div className="relative">
-                    <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)] block" />
-                  </div>
+                  <span className="w-2.5 h-2.5 rounded-full bg-[#10B981] shadow-[0_0_8px_rgba(16,185,129,0.6)] block" />
                   <div>
                     <div className="flex items-center gap-2">
-                      <span className="text-sm font-semibold text-white font-mono">
+                      <span className="text-sm font-bold text-[#17243A] font-mono">
                         {node.name}
                       </span>
                       {hasLeader && (
-                        <span className="flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.2 rounded bg-amber-500/10 border border-amber-500/30 text-amber-400">
+                        <span className="flex items-center gap-1 text-[10px] font-mono px-2 py-0.2 rounded-full bg-amber-50 border border-amber-200 text-amber-700 font-semibold">
                           <Crown className="w-2.5 h-2.5" />
                           LEADER
                         </span>
                       )}
                     </div>
-                    <span className="text-[11px] font-mono text-slate-400">
+                    <span className="text-[11px] font-mono text-[#64748B]">
                       :{node.apiPort} · {node.replicas.length} Replicas
                     </span>
                   </div>
                 </div>
 
                 <div className="flex items-center gap-3 font-mono text-xs">
-                  <div className="hidden sm:flex items-center gap-3 text-slate-400 text-[11px]">
-                    <span>CPU: <strong className="text-slate-200">{node.cpu}</strong></span>
-                    <span>RAM: <strong className="text-slate-200">{node.ram}</strong></span>
+                  <div className="hidden sm:flex items-center gap-3 text-[#64748B] text-[11px]">
+                    <span>CPU: <strong className="text-[#17243A]">{node.cpu}</strong></span>
+                    <span>RAM: <strong className="text-[#17243A]">{node.ram}</strong></span>
                   </div>
                   <ChevronRight
-                    className={`w-4 h-4 text-slate-400 transition-transform duration-200 ${
-                      isExpanded ? 'rotate-90 text-sky-400' : ''
+                    className={`w-4 h-4 text-[#64748B] transition-transform duration-200 ${
+                      isExpanded ? 'rotate-90 text-[#0891D5]' : ''
                     }`}
                   />
                 </div>
@@ -190,48 +188,48 @@ export default function NodeStatusPanel() {
 
               {/* Expanded Details Drawer */}
               {isExpanded && (
-                <div className="p-3 pt-0 border-t border-slate-800/60 bg-slate-950/60 font-mono text-xs text-slate-300 space-y-2.5 animate-in slide-in-from-top-1 duration-150">
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-2">
-                    <div className="p-2 rounded bg-slate-900/60 border border-slate-800">
-                      <span className="text-[10px] text-slate-400 block">Raft Port</span>
-                      <span className="text-slate-200 font-semibold">{node.raftPort}</span>
+                <div className="p-3.5 pt-0 border-t border-[#DCE5F0] bg-white font-mono text-xs text-[#17243A] space-y-2.5">
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-2.5">
+                    <div className="p-2 rounded-lg bg-[#F8FAFC] border border-[#DCE5F0]">
+                      <span className="text-[10px] text-[#64748B] block">Raft Port</span>
+                      <span className="font-bold">{node.raftPort}</span>
                     </div>
-                    <div className="p-2 rounded bg-slate-900/60 border border-slate-800">
-                      <span className="text-[10px] text-slate-400 block">Disk Space</span>
-                      <span className="text-slate-200 font-semibold">{node.disk}</span>
+                    <div className="p-2 rounded-lg bg-[#F8FAFC] border border-[#DCE5F0]">
+                      <span className="text-[10px] text-[#64748B] block">Disk Space</span>
+                      <span className="font-bold">{node.disk}</span>
                     </div>
-                    <div className="p-2 rounded bg-slate-900/60 border border-slate-800">
-                      <span className="text-[10px] text-slate-400 block">CPU Usage</span>
-                      <span className="text-emerald-400 font-semibold">{node.cpu}</span>
+                    <div className="p-2 rounded-lg bg-[#F8FAFC] border border-[#DCE5F0]">
+                      <span className="text-[10px] text-[#64748B] block">CPU Usage</span>
+                      <span className="text-[#10B981] font-bold">{node.cpu}</span>
                     </div>
-                    <div className="p-2 rounded bg-slate-900/60 border border-slate-800">
-                      <span className="text-[10px] text-slate-400 block">Memory RSS</span>
-                      <span className="text-sky-400 font-semibold">{node.ram}</span>
+                    <div className="p-2 rounded-lg bg-[#F8FAFC] border border-[#DCE5F0]">
+                      <span className="text-[10px] text-[#64748B] block">Memory RSS</span>
+                      <span className="text-[#0891D5] font-bold">{node.ram}</span>
                     </div>
                   </div>
 
                   {/* Replicas on this node */}
                   <div>
-                    <span className="text-[10px] text-slate-400 uppercase tracking-wider block mb-1">
+                    <span className="text-[10px] text-[#64748B] uppercase tracking-wider block mb-1 font-semibold">
                       Assigned Shards
                     </span>
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                       {node.replicas.map((rep) => (
                         <div
                           key={rep.shardId}
-                          className="flex items-center justify-between p-2 rounded bg-slate-900/40 border border-slate-800"
+                          className="flex items-center justify-between p-2 rounded-lg bg-[#F8FAFC] border border-[#DCE5F0]"
                         >
                           <div className="flex items-center gap-1.5">
-                            <span className="w-2 h-2 rounded-full bg-sky-400" />
-                            <span className="font-semibold text-slate-200">Shard {rep.shardId}</span>
+                            <span className="w-2 h-2 rounded-full bg-[#0891D5]" />
+                            <span className="font-bold text-[#17243A]">Shard {rep.shardId}</span>
                           </div>
                           <div className="flex items-center gap-2 text-[11px]">
-                            <span className="text-slate-400">Term {rep.term}</span>
+                            <span className="text-[#64748B]">Term {rep.term}</span>
                             <span
-                              className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${
+                              className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
                                 rep.role === 'Leader'
-                                  ? 'bg-amber-500/10 text-amber-400 border border-amber-500/30'
-                                  : 'bg-slate-800 text-slate-300'
+                                  ? 'bg-amber-50 text-amber-700 border border-amber-200'
+                                  : 'bg-slate-100 text-[#64748B]'
                               }`}
                             >
                               {rep.role}
@@ -242,10 +240,10 @@ export default function NodeStatusPanel() {
                     </div>
                   </div>
 
-                  {/* Last Log Entry */}
-                  <div className="p-2 rounded bg-slate-950 border border-slate-800/80">
+                  {/* Last Log Entry in Sleek Developer Style */}
+                  <div className="p-2.5 rounded-lg bg-[#0B1120] border border-[#1E293B] text-slate-300">
                     <span className="text-[10px] text-slate-400 block mb-0.5">Telemetry Trace</span>
-                    <p className="text-[11px] text-sky-300/90 font-mono truncate">
+                    <p className="text-[11px] text-[#38BDF8] font-mono truncate">
                       {node.lastLog}
                     </p>
                   </div>

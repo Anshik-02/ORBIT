@@ -11,15 +11,19 @@ const config: Config = {
     extend: {
       colors: {
         orbit: {
-          bg: "#030712",
-          card: "rgba(10, 17, 40, 0.75)",
-          border: "rgba(56, 189, 248, 0.15)",
-          accent: "#38bdf8",
-          purple: "#a855f7",
-          green: "#10b981",
-          amber: "#f59e0b",
-          red: "#ef4444",
-          surface: "#080e22",
+          bg: "#F4F7FC",
+          bgSecondary: "#EAF1FA",
+          card: "#FFFFFF",
+          text: "#17243A",
+          muted: "#64748B",
+          accent: "#0891D5",
+          purple: "#7965E8",
+          border: "#DCE5F0",
+          success: "#10B981",
+          warning: "#F59E0B",
+          terminal: "#0B1120",
+          terminalBorder: "#1E293B",
+          terminalText: "#E2E8F0",
         },
       },
       fontFamily: {
@@ -35,16 +39,16 @@ const config: Config = {
       keyframes: {
         float: {
           "0%, 100%": { transform: "translateY(0px)" },
-          "50%": { transform: "translateY(-10px)" },
+          "50%": { transform: "translateY(-8px)" },
         },
         glow: {
-          "0%": { boxShadow: "0 0 15px rgba(56, 189, 248, 0.3)" },
-          "100%": { boxShadow: "0 0 35px rgba(56, 189, 248, 0.7)" },
+          "0%": { boxShadow: "0 0 15px rgba(8, 145, 213, 0.15)" },
+          "100%": { boxShadow: "0 0 30px rgba(121, 101, 232, 0.25)" },
         },
       },
       backgroundImage: {
-        "radial-gradient": "radial-gradient(circle at 50% 50%, rgba(56, 189, 248, 0.12), transparent 70%)",
-        "mesh-gradient": "radial-gradient(at 0% 0%, rgba(56, 189, 248, 0.15) 0px, transparent 50%), radial-gradient(at 100% 100%, rgba(168, 85, 247, 0.15) 0px, transparent 50%)",
+        "radial-light": "radial-gradient(circle at 50% 30%, rgba(8, 145, 213, 0.1) 0%, rgba(121, 101, 232, 0.05) 50%, transparent 80%)",
+        "mesh-light": "radial-gradient(at 10% 10%, rgba(8, 145, 213, 0.08) 0px, transparent 50%), radial-gradient(at 90% 90%, rgba(121, 101, 232, 0.08) 0px, transparent 50%)",
       },
     },
   },
