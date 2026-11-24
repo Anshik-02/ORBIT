@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import DashboardLayout from '@/components/dashboard/DashboardLayout';
 import { Flame, ShieldCheck, CheckCircle2, RefreshCw, AlertTriangle, XCircle, Info } from 'lucide-react';
 import ChaosExperimentLibrary, {
@@ -19,107 +19,49 @@ import { executeChaosExperiment } from '@/lib/api/client';
 import { ClusterService } from '@/lib/services/cluster.service';
 import LiveIndicator from '@/components/shared/LiveIndicator';
 
-const INITIAL_STEPS: ChaosTimelineStep[] = [
+const EMPTY_STEPS: ChaosTimelineStep[] = [
   {
-    id: 'step-1',
-    title: 'Started',
-    desc: 'Harness initialized & baseline quorum verified.',
+    id: 'step-init',
+    title: 'Harness Ready',
+    desc: 'Pre-flight safety gates active. Awaiting fault selection and execution.',
     status: 'DONE',
-    timestamp: '14:30:10',
-  },
-  {
-    id: 'step-2',
-    title: 'Fault Injected',
-    desc: 'SIGKILL sent to target leader process.',
-    status: 'DONE',
-    timestamp: '14:30:11',
-  },
-  {
-    id: 'step-3',
-    title: 'Failure Detected',
-    desc: 'Election timeout elapsed (210ms) without heartbeat.',
-    status: 'DONE',
-    timestamp: '14:30:11.2',
-  },
-  {
-    id: 'step-4',
-    title: 'Leader Election',
-    desc: 'Candidate broadcast RequestVote; won 2/3 votes.',
-    status: 'DONE',
-    timestamp: '14:30:11.4',
-  },
-  {
-    id: 'step-5',
-    title: 'Recovery',
-    desc: 'New leader established lease & resumed writes.',
-    status: 'DONE',
-    timestamp: '14:30:11.5',
-  },
-  {
-    id: 'step-6',
-    title: 'Consistency Check',
-    desc: 'Linearizable ReadIndex barrier verified 0 stale keys.',
-    status: 'DONE',
-    timestamp: '14:30:12',
-  },
-  {
-    id: 'step-7',
-    title: 'Completed',
-    desc: 'All 3 shards healthy with full write availability.',
-    status: 'DONE',
-    timestamp: '14:30:15',
+    timestamp: '--:--',
   },
 ];
 
-const INITIAL_IMPACT: ChaosImpactReport = {
-  downtimeMs: 184,
-  electionDurationMs: 210,
+const EMPTY_IMPACT: ChaosImpactReport = {
+  downtimeMs: 0,
+  electionDurationMs: 0,
   failedRequests: 0,
   dataConsistencyPct: 100,
-  recoveryDurationMs: 3800,
-  quorumAvailability: '2/3 Replicas (Majority)',
+  recoveryDurationMs: 0,
+  quorumAvailability: 'All 3 Shards Quorate',
 };
-
-const INITIAL_RECORDS: ChaosRunRecord[] = [
-  {
-    id: 'c-1',
-    timestamp: 'Today, 14:30:10',
-    experimentName: 'Leader Kill & Re-Election',
-    targetNode: 'node-a',
-    targetShard: 0,
-    durationSec: 8,
-    impact: INITIAL_IMPACT,
-    outcome: 'PASSED',
-  },
-  {
-    id: 'c-2',
-    timestamp: 'Today, 13:40:00',
-    experimentName: 'Follower Crash Simulation',
-    targetNode: 'node-b',
-    targetShard: 0,
-    durationSec: 5,
-    impact: {
-      downtimeMs: 0,
-      electionDurationMs: 0,
-      failedRequests: 0,
-      dataConsistencyPct: 100,
-      recoveryDurationMs: 1200,
-      quorumAvailability: '2/3 Replicas (Majority)',
-    },
-    outcome: 'PASSED',
-  },
-];
 
 export default function ChaosLabPage() {
   const [selectedExpId, setSelectedExpId] = useState<string>('leader-kill');
   const [isRunning, setIsRunning] = useState(false);
-  const [currentStepIndex, setCurrentStepIndex] = useState(7);
-  const [timelineSteps, setTimelineSteps] = useState<ChaosTimelineStep[]>(INITIAL_STEPS);
-  const [impact, setImpact] = useState<ChaosImpactReport>(INITIAL_IMPACT);
-  const [history, setHistory] = useState<ChaosRunRecord[]>(INITIAL_RECORDS);
+  const [currentStepIndex, setCurrentStepIndex] = useState(1);
+  const [timelineSteps, setTimelineSteps] = useState<ChaosTimelineStep[]>(EMPTY_STEPS);
+  const [impact, setImpact] = useState<ChaosImpactReport>(EMPTY_IMPACT);
+  const [history, setHistory] = useState<ChaosRunRecord[]>([]);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [preflightStatus, setPreflightStatus] = useState<string | null>(null);
-  const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+
+  // Load persistent history from localStorage
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem('orbit_chaos_history');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          setHistory(parsed);
+          setImpact(parsed[0].impact);
+        }
+      }
+    } catch {}
+  }, []);
 
   const selectedExperiment =
     CHAOS_EXPERIMENTS.find((e) => e.id === selectedExpId) || CHAOS_EXPERIMENTS[0];
@@ -158,44 +100,59 @@ export default function ChaosLabPage() {
 
     setPreflightStatus(null);
     setIsRunning(true);
-    setCurrentStepIndex(0);
+    abortControllerRef.current = new AbortController();
 
-    const stepIntervals = [0, 800, 1600, 2400, 3200, 4000, 4800];
-    stepIntervals.forEach((delay, idx) => {
-      setTimeout(() => {
-        setCurrentStepIndex(idx + 1);
-      }, delay);
-    });
+    const faultMap: Record<string, any> = {
+      'leader-kill': 'partition',
+      'follower-crash': 'wal-crash',
+      'network-partition': 'partition',
+      'torn-write': 'wal-crash',
+      'compaction-crash': 'compaction-crash',
+      'sstable-corrupt': 'corrupt-sstable',
+      'flush-crash': 'flush-crash',
+      'corrupt-snapshot': 'corrupt-snapshot',
+    };
+    const faultType = faultMap[selectedExperiment.id] || selectedExperiment.id || 'wal-crash';
+
+    setTimelineSteps([
+      {
+        id: 'step-1',
+        title: 'Pre-flight Gate',
+        desc: 'Verified cluster majority quorum and linearizability barrier.',
+        status: 'DONE',
+        timestamp: new Date().toLocaleTimeString(),
+      },
+      {
+        id: 'step-2',
+        title: `Injecting Fault: ${faultType}`,
+        desc: `Targeting ${targetNode} (Shard ${targetShard}). Harness actively executing fault...`,
+        status: 'DONE',
+        timestamp: new Date().toLocaleTimeString(),
+      },
+    ]);
+    setCurrentStepIndex(2);
 
     try {
-      const faultMap: Record<string, any> = {
-        'leader-kill': 'partition',
-        'follower-crash': 'wal-crash',
-        'network-partition': 'partition',
-        'torn-write': 'wal-crash',
-        'compaction-crash': 'compaction-crash',
-        'sstable-corrupt': 'corrupt-sstable',
-      };
-      const faultType = faultMap[selectedExperiment.id] || 'wal-crash';
-
-      const report = await executeChaosExperiment({
-        faultType,
-        target: targetNode,
-        durationSeconds: selectedExperiment.durationSec,
-      });
+      const report = await executeChaosExperiment(
+        {
+          faultType,
+          target: targetNode,
+          durationSeconds: selectedExperiment.durationSec,
+        },
+        { signal: abortControllerRef.current.signal }
+      );
 
       setIsRunning(false);
-      setCurrentStepIndex(7);
 
       // Verify report outcome strictly: Quorum must be maintained and no data loss detected
       const isPassed = report.quorumMaintained === true && !report.dataLossDetected;
 
       const updatedImpact: ChaosImpactReport = {
-        downtimeMs: report.recoveryDurationMs || 184,
-        electionDurationMs: Math.round((report.recoveryDurationMs || 184) * 0.7),
+        downtimeMs: report.recoveryDurationMs || 0,
+        electionDurationMs: Math.round((report.recoveryDurationMs || 0) * 0.7),
         failedRequests: report.dataLossDetected ? 12 : 0,
         dataConsistencyPct: report.dataLossDetected ? 94.2 : 100,
-        recoveryDurationMs: Math.max(120, (report.recoveryDurationMs || 184) * 10),
+        recoveryDurationMs: Math.max(100, (report.recoveryDurationMs || 0) * 8),
         quorumAvailability: report.quorumMaintained
           ? '2/3 Replicas (Majority Preserved)'
           : 'Quorum Compromised (Split-Brain Guard Active)',
@@ -211,7 +168,17 @@ export default function ChaosLabPage() {
           status: 'DONE',
           timestamp: item.timestamp,
         }));
+        dynamicSteps.push({
+          id: `step-final`,
+          title: isPassed ? 'Completed' : 'Validation Alert',
+          desc: isPassed
+            ? 'All 3 shards healthy with full write availability & consistent indexes.'
+            : 'Cluster anomaly detected during recovery verification.',
+          status: isPassed ? 'DONE' : 'FAILED',
+          timestamp: new Date().toLocaleTimeString(),
+        });
         setTimelineSteps(dynamicSteps);
+        setCurrentStepIndex(dynamicSteps.length);
       }
 
       const newRec: ChaosRunRecord = {
@@ -224,12 +191,21 @@ export default function ChaosLabPage() {
         impact: updatedImpact,
         outcome: isPassed ? 'PASSED' : 'FAILED',
       };
-      setHistory((prev) => [newRec, ...prev]);
+
+      setHistory((prev) => {
+        const next = [newRec, ...prev];
+        try {
+          localStorage.setItem('orbit_chaos_history', JSON.stringify(next));
+        } catch {}
+        return next;
+      });
     } catch (execErr: any) {
       setIsRunning(false);
-      setCurrentStepIndex(7);
-      const errDetail = execErr.message || 'Fault injection or recovery verification failed.';
-      setErrorMessage(`Chaos Experiment Execution Error: ${errDetail}`);
+      const isAbort = execErr?.name === 'AbortError' || execErr?.message?.includes('aborted');
+      const errDetail = isAbort
+        ? 'Experiment aborted by operator.'
+        : execErr.message || 'Fault injection or recovery verification failed.';
+      setErrorMessage(`Chaos Experiment Alert: ${errDetail}`);
 
       const failedImpact: ChaosImpactReport = {
         downtimeMs: 0,
@@ -237,7 +213,7 @@ export default function ChaosLabPage() {
         failedRequests: 1,
         dataConsistencyPct: 0,
         recoveryDurationMs: 0,
-        quorumAvailability: 'Verification Incomplete',
+        quorumAvailability: 'Verification Interrupted',
       };
 
       const failedRec: ChaosRunRecord = {
@@ -250,13 +226,22 @@ export default function ChaosLabPage() {
         impact: failedImpact,
         outcome: 'FAILED',
       };
-      setHistory((prev) => [failedRec, ...prev]);
+
+      setHistory((prev) => {
+        const next = [failedRec, ...prev];
+        try {
+          localStorage.setItem('orbit_chaos_history', JSON.stringify(next));
+        } catch {}
+        return next;
+      });
     }
   };
 
   const handleAbort = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
     setIsRunning(false);
-    setCurrentStepIndex(7);
     setPreflightStatus(null);
   };
 

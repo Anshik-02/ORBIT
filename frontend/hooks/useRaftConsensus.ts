@@ -20,26 +20,12 @@ export interface FollowerTelemetry {
   lastHeartbeat: string;
 }
 
-const DEFAULT_GROUPS: RaftGroupInfo[] = [
-  { shardId: 0, name: 'Shard 0 (0x00..0x55)', color: '#0891D5', leader: 'node-a', term: 3, commitIndex: 14820, replicas: ['node-a', 'node-b', 'node-c'] },
-  { shardId: 1, name: 'Shard 1 (0x55..0xAA)', color: '#7965E8', leader: 'node-d', term: 2, commitIndex: 14818, replicas: ['node-d', 'node-e', 'node-a'] },
-  { shardId: 2, name: 'Shard 2 (0xAA..0xFF)', color: '#10B981', leader: 'node-b', term: 4, commitIndex: 14822, replicas: ['node-b', 'node-c', 'node-d'] },
-];
-
-const DEFAULT_LOG_ENTRIES: RaftLogEntry[] = [
-  { index: 14820, term: 3, type: 'KV_PUT', payloadSummary: 'SET user:1002:profile', committed: true, applied: false, timestamp: '12ms ago' },
-  { index: 14819, term: 3, type: 'KV_PUT', payloadSummary: 'SET session:token:98a2', committed: true, applied: true, timestamp: '120ms ago' },
-  { index: 14818, term: 3, type: 'NO_OP', payloadSummary: 'NO_OP (Leader Election Barrier)', committed: true, applied: true, timestamp: '480ms ago' },
-  { index: 14817, term: 2, type: 'KV_DELETE', payloadSummary: 'DELETE auth:cache:77c1', committed: true, applied: true, timestamp: '1.2s ago' },
-  { index: 14816, term: 2, type: 'KV_PUT', payloadSummary: 'SET metrics:counter:ingest', committed: true, applied: true, timestamp: '2.1s ago' },
-];
-
 export function useRaftConsensus() {
   const [selectedShardId, setSelectedShardId] = useState<number>(0);
-  const [groups, setGroups] = useState<RaftGroupInfo[]>(DEFAULT_GROUPS);
+  const [groups, setGroups] = useState<RaftGroupInfo[]>([]);
   const [followersByShard, setFollowersByShard] = useState<Record<number, FollowerTelemetry[]>>({});
   const [electionEvents, setElectionEvents] = useState<ElectionEvent[]>([]);
-  const [logEntries, setLogEntries] = useState<RaftLogEntry[]>(DEFAULT_LOG_ENTRIES);
+  const [logEntries, setLogEntries] = useState<RaftLogEntry[]>([]);
   const [isLive, setIsLive] = useState<boolean>(false);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
@@ -64,7 +50,7 @@ export function useRaftConsensus() {
       const health = healthRes.status === 'fulfilled' ? healthRes.value : null;
       const events = eventsRes.status === 'fulfilled' ? eventsRes.value : null;
 
-      if (health?.isLive && health.data) {
+      if (health?.isLive && health.data && health.data.shards) {
         setIsLive(true);
         const colorPalette = ['#0891D5', '#7965E8', '#10B981'];
         const ranges = ['0x00..0x55', '0x55..0xAA', '0xAA..0xFF'];
@@ -74,17 +60,15 @@ export function useRaftConsensus() {
           const sid = Number(sidStr);
           return {
             shardId: sid,
-            name: `Shard ${sid} (${ranges[sid] || 'Range'})`,
+            name: `Shard ${sid} (${ranges[sid] || 'Partition'})`,
             color: colorPalette[sid % colorPalette.length],
-            leader: s.current_leader || 'node-a',
-            term: s.current_term || 1,
+            leader: s.current_leader || 'None (Electing)',
+            term: s.current_term || 0,
             commitIndex: s.commit_index || 0,
             replicas: s.replica_node_ids || [],
           };
         });
-        if (dynamicGroups.length > 0) {
-          setGroups(dynamicGroups);
-        }
+        setGroups(dynamicGroups);
 
         // Build follower telemetry per shard
         const followerMap: Record<number, FollowerTelemetry[]> = {};
@@ -96,7 +80,7 @@ export function useRaftConsensus() {
 
           followerMap[sid] = followers.map((fid) => {
             const nodeInfo = health.data?.nodes[fid];
-            const isOnline = nodeInfo?.online ?? true;
+            const isOnline = nodeInfo?.online ?? false;
             const progress = s.replication_progress?.[fid];
             const matchIndex = progress?.match_index ?? s.commit_index;
             const lag = s.commit_index > matchIndex ? s.commit_index - matchIndex : 0;
@@ -109,7 +93,7 @@ export function useRaftConsensus() {
               matchIndex,
               nextIndex: progress?.next_index ?? (matchIndex + 1),
               replicationLag: lag,
-              latency: isOnline ? '< 1.0ms' : 'Timeout',
+              latency: isOnline ? '< 1.0ms' : 'Unreachable',
               lastAck: isOnline ? (lag === 0 ? 'In Sync' : `${lag} entries behind`) : 'Unreachable',
               lastHeartbeat: isOnline ? '< 50ms (Tick OK)' : 'Expired',
             };
@@ -117,27 +101,37 @@ export function useRaftConsensus() {
         });
         setFollowersByShard(followerMap);
 
-        // Fetch real Raft logs from leader node
-        const activeLeader = health.data.shards[selectedShardId]?.current_leader || 'node-a';
-        try {
-          const liveLogs = await RaftService.getLogs(activeLeader, 20);
-          if (liveLogs && liveLogs.length > 0) {
-            setLogEntries(
-              liveLogs.map((l) => ({
-                index: l.index,
-                term: l.term,
-                type: l.type === 'KV_DELETE' ? 'KV_DELETE' : l.type === 'CONF_CHANGE' ? 'CONF_CHANGE' : l.type === 'NO_OP' ? 'NO_OP' : 'KV_PUT',
-                payloadSummary: l.key ? `${l.type} ${l.key}` : `Log entry index=${l.index}`,
-                committed: l.committed ?? true,
-                applied: l.applied ?? true,
-                timestamp: l.timestamp ? new Date(l.timestamp).toLocaleTimeString() : 'Recent',
-              }))
-            );
-          } else {
+        // Fetch real Raft logs from leader node if available
+        const activeLeader = health.data.shards[selectedShardId]?.current_leader;
+        if (activeLeader) {
+          try {
+            const liveLogs = await RaftService.getLogs(activeLeader, 25);
+            if (liveLogs && Array.isArray(liveLogs) && liveLogs.length > 0) {
+              setLogEntries(
+                liveLogs.map((l) => ({
+                  index: l.index,
+                  term: l.term,
+                  type:
+                    l.type === 'KV_DELETE'
+                      ? 'KV_DELETE'
+                      : l.type === 'CONF_CHANGE'
+                      ? 'CONF_CHANGE'
+                      : l.type === 'NO_OP'
+                      ? 'NO_OP'
+                      : 'KV_PUT',
+                  payloadSummary: l.key ? `${l.type} ${l.key}` : `Log entry index=${l.index}`,
+                  committed: l.committed ?? true,
+                  applied: l.applied ?? true,
+                  timestamp: l.timestamp ? new Date(l.timestamp).toLocaleTimeString() : 'Recent',
+                }))
+              );
+            } else {
+              setLogEntries([]);
+            }
+          } catch {
             setLogEntries([]);
           }
-        } catch {
-          // If cluster query fails, set empty logs
+        } else {
           setLogEntries([]);
         }
 
@@ -147,32 +141,33 @@ export function useRaftConsensus() {
             .filter((e) => e.type === 'LEADER_CHANGED' || e.type === 'HEARTBEAT_TIMEOUT')
             .map((e, idx) => ({
               id: e.event_id || `elec-${idx}`,
-              term: e.data?.term || 3,
+              term: e.data?.term || 1,
               shardId: e.shard_id ?? 0,
               type: (e.type === 'LEADER_CHANGED' ? 'NEW_LEADER_ELECTED' : 'HEARTBEAT_TIMEOUT') as any,
-              nodeId: e.node_id || 'node-a',
+              nodeId: e.node_id || 'node',
               votesReceived: 3,
               votesNeeded: 2,
-              durationMs: 82,
+              durationMs: 75,
               timestamp: e.timestamp ? new Date(e.timestamp).toLocaleTimeString() : 'Recent',
               outcome: 'SUCCESS' as const,
               description: `Shard ${e.shard_id ?? 0} consensus established on ${e.node_id}`,
             }));
 
-          if (leaderEvents.length > 0) {
-            setElectionEvents(leaderEvents);
-          }
+          setElectionEvents(leaderEvents);
         }
       } else {
         setIsLive(false);
+        setGroups([]);
         setLogEntries([]);
+        setFollowersByShard({});
+        setElectionEvents([]);
       }
       setLastUpdated(new Date());
     } finally {
       setIsLoading(false);
       setIsRefreshing(false);
     }
-  }, []);
+  }, [selectedShardId]);
 
   useEffect(() => {
     refresh();
@@ -180,7 +175,17 @@ export function useRaftConsensus() {
     return () => clearInterval(interval);
   }, [refresh]);
 
-  const activeGroup = groups.find((g) => g.shardId === selectedShardId) || groups[0];
+  const fallbackGroup: RaftGroupInfo = {
+    shardId: selectedShardId,
+    name: `Shard ${selectedShardId} (Connecting...)`,
+    color: '#0891D5',
+    leader: 'None',
+    term: 0,
+    commitIndex: 0,
+    replicas: [],
+  };
+
+  const activeGroup = groups.find((g) => g.shardId === selectedShardId) || groups[0] || fallbackGroup;
   const activeFollowers = followersByShard[selectedShardId] || [];
 
   return {

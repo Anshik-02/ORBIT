@@ -14,7 +14,7 @@ export interface ChaosTimelineStep {
   id: string;
   title: string;
   desc: string;
-  status: 'PENDING' | 'ACTIVE' | 'DONE';
+  status: 'PENDING' | 'ACTIVE' | 'DONE' | 'FAILED';
   timestamp?: string;
 }
 
@@ -73,7 +73,9 @@ export default function ChaosExecutionTimeline({
                   >
                     0{i + 1}. {st.title}
                   </span>
-                  {isDone ? (
+                  {st.status === 'FAILED' ? (
+                    <AlertTriangle className="w-3.5 h-3.5 text-rose-600" />
+                  ) : isDone ? (
                     <CheckCircle2 className="w-3.5 h-3.5 text-[#10B981]" />
                   ) : isActive ? (
                     <span className="w-2 h-2 rounded-full bg-rose-500 animate-ping" />

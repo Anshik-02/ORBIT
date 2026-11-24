@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React from 'react';
 import DashboardLayout from '@/components/dashboard/DashboardLayout';
 import { HardDrive, CheckCircle2, RefreshCw, Database } from 'lucide-react';
 import StorageOverviewCards from '@/components/storage/StorageOverviewCards';
@@ -13,163 +13,6 @@ import StorageAnalytics from '@/components/storage/StorageAnalytics';
 import { useStorageMetrics } from '@/hooks/useStorageMetrics';
 import LiveIndicator from '@/components/shared/LiveIndicator';
 
-const INITIAL_MEMTABLES: MemtableItem[] = [
-  {
-    id: 'memtable-active-s0',
-    shardId: 0,
-    type: 'ACTIVE',
-    entryCount: 1420,
-    sizeBytes: 18432000, // 18.4 MB
-    maxSizeBytes: 67108864, // 64 MB
-    flushStatus: 'Accepting concurrent writes',
-  },
-  {
-    id: 'memtable-active-s1',
-    shardId: 1,
-    type: 'ACTIVE',
-    entryCount: 980,
-    sizeBytes: 12288000,
-    maxSizeBytes: 67108864,
-    flushStatus: 'Accepting concurrent writes',
-  },
-  {
-    id: 'memtable-active-s2',
-    shardId: 2,
-    type: 'ACTIVE',
-    entryCount: 1110,
-    sizeBytes: 14336000,
-    maxSizeBytes: 67108864,
-    flushStatus: 'Accepting concurrent writes',
-  },
-  {
-    id: 'memtable-frozen-s0',
-    shardId: 0,
-    type: 'IMMUTABLE',
-    entryCount: 4890,
-    sizeBytes: 67108864, // 64 MB
-    maxSizeBytes: 67108864,
-    flushStatus: 'Queued for L0 SSTable flush',
-  },
-];
-
-const INITIAL_WAL_FILES: WalLogFile[] = [
-  {
-    filename: 'wal_shard0_0003.log',
-    shardId: 0,
-    sizeBytes: 12582912,
-    entryCount: 14820,
-    lastIndex: 14820,
-    status: 'ACTIVE_APPEND',
-  },
-  {
-    filename: 'wal_shard1_0002.log',
-    shardId: 1,
-    sizeBytes: 8388608,
-    entryCount: 14818,
-    lastIndex: 14818,
-    status: 'ACTIVE_APPEND',
-  },
-  {
-    filename: 'wal_shard2_0004.log',
-    shardId: 2,
-    sizeBytes: 10485760,
-    entryCount: 14822,
-    lastIndex: 14822,
-    status: 'ACTIVE_APPEND',
-  },
-  {
-    filename: 'wal_shard0_0002.log',
-    shardId: 0,
-    sizeBytes: 67108864,
-    entryCount: 4890,
-    lastIndex: 13400,
-    status: 'ROTATED_CLEAN',
-  },
-];
-
-const INITIAL_SSTABLES: SSTableItem[] = [
-  {
-    filename: 'sst_s0_l0_001.sst',
-    level: 'L0',
-    shardId: 0,
-    sizeBytes: 421000,
-    keyCount: 3200,
-    keyRange: 'user:0001 .. user:1400',
-    bloomFilterBits: 10,
-    status: 'ACTIVE',
-  },
-  {
-    filename: 'sst_s1_l0_002.sst',
-    level: 'L0',
-    shardId: 1,
-    sizeBytes: 389000,
-    keyCount: 2900,
-    keyRange: 'session:0001 .. session:2900',
-    bloomFilterBits: 10,
-    status: 'ACTIVE',
-  },
-  {
-    filename: 'sst_s0_l1_001.sst',
-    level: 'L1',
-    shardId: 0,
-    sizeBytes: 2097152, // 2MB
-    keyCount: 16000,
-    keyRange: 'account:0001 .. account:8000',
-    bloomFilterBits: 10,
-    status: 'ACTIVE',
-  },
-  {
-    filename: 'sst_s0_l1_002.sst',
-    level: 'L1',
-    shardId: 0,
-    sizeBytes: 2097152,
-    keyCount: 15800,
-    keyRange: 'account:8001 .. account:9999',
-    bloomFilterBits: 10,
-    status: 'ACTIVE',
-  },
-  {
-    filename: 'sst_s1_l1_001.sst',
-    level: 'L1',
-    shardId: 1,
-    sizeBytes: 2097152,
-    keyCount: 14200,
-    keyRange: 'metric:0001 .. metric:5000',
-    bloomFilterBits: 10,
-    status: 'ACTIVE',
-  },
-  {
-    filename: 'sst_s2_l1_001.sst',
-    level: 'L1',
-    shardId: 2,
-    sizeBytes: 2097152,
-    keyCount: 15100,
-    keyRange: 'order:0001 .. order:7500',
-    bloomFilterBits: 10,
-    status: 'ACTIVE',
-  },
-  {
-    filename: 'sst_s0_l2_001.sst',
-    level: 'L2',
-    shardId: 0,
-    sizeBytes: 10485760, // 10MB
-    keyCount: 82000,
-    keyRange: 'archive:0001 .. archive:9999',
-    bloomFilterBits: 10,
-    status: 'ACTIVE',
-  },
-  {
-    filename: 'sst_s1_l2_001.sst',
-    level: 'L2',
-    shardId: 1,
-    sizeBytes: 10485760,
-    keyCount: 79000,
-    keyRange: 'event_log:0001 .. event_log:9999',
-    bloomFilterBits: 10,
-    status: 'ACTIVE',
-  },
-];
-
 export default function StoragePage() {
   const {
     metrics,
@@ -180,21 +23,18 @@ export default function StoragePage() {
     lastUpdated,
     refresh,
   } = useStorageMetrics();
-  const [memtables, setMemtables] = useState<MemtableItem[]>(INITIAL_MEMTABLES);
-  const [walFiles, setWalFiles] = useState<WalLogFile[]>(INITIAL_WAL_FILES);
-  const [sstables, setSstables] = useState<SSTableItem[]>(INITIAL_SSTABLES);
 
-  // Compute live items dynamically when connected to active cluster
+  // Compute live items dynamically strictly from real backend telemetry
   const displayedMemtables = React.useMemo(() => {
-    if (!isLive || !detailedStats) return memtables;
+    if (!isLive || !detailedStats) return [];
 
     const items: MemtableItem[] = [
       {
-        id: `memtable-active-${detailedStats.node_id}`,
+        id: `memtable-active-${detailedStats.node_id || 'node-a'}`,
         shardId: 0,
         type: 'ACTIVE',
-        entryCount: detailedStats.active_memtable.entry_count,
-        sizeBytes: detailedStats.active_memtable.byte_size || 64,
+        entryCount: detailedStats.active_memtable?.entry_count ?? 0,
+        sizeBytes: detailedStats.active_memtable?.byte_size || 0,
         maxSizeBytes: 67108864,
         flushStatus: 'Accepting concurrent writes',
       },
@@ -215,27 +55,30 @@ export default function StoragePage() {
     }
 
     return items;
-  }, [isLive, detailedStats, memtables]);
+  }, [isLive, detailedStats]);
 
   const displayedWalFiles = React.useMemo(() => {
-    if (!isLive || !detailedStats) return walFiles;
+    if (!isLive || !detailedStats) return [];
 
-    const baseName = detailedStats.wal_path ? detailedStats.wal_path.replace(/\\/g, '/').split('/').pop() : 'wal.log';
+    const baseName = detailedStats.wal_path
+      ? detailedStats.wal_path.replace(/\\/g, '/').split('/').pop()
+      : 'wal.log';
+
     return [
       {
         filename: baseName || 'wal.log',
         shardId: 0,
-        sizeBytes: detailedStats.wal_size_bytes || 128,
-        entryCount: Number(detailedStats.wal_record_count) || 1,
-        lastIndex: Number(detailedStats.wal_record_count) || 1,
+        sizeBytes: detailedStats.wal_size_bytes || 0,
+        entryCount: Number(detailedStats.wal_record_count) || 0,
+        lastIndex: Number(detailedStats.wal_record_count) || 0,
         status: 'ACTIVE_APPEND' as const,
       },
     ];
-  }, [isLive, detailedStats, walFiles]);
+  }, [isLive, detailedStats]);
 
   const displayedSstables = React.useMemo(() => {
-    if (!isLive || !detailedStats || !detailedStats.sstables || detailedStats.sstables.length === 0) {
-      return sstables;
+    if (!isLive || !detailedStats || !detailedStats.sstables) {
+      return [];
     }
 
     return detailedStats.sstables.map((s) => ({
@@ -248,7 +91,7 @@ export default function StoragePage() {
       bloomFilterBits: s.has_bloom_filter ? 10 : 0,
       status: 'ACTIVE' as const,
     }));
-  }, [isLive, detailedStats, sstables]);
+  }, [isLive, detailedStats]);
 
   const handleRefresh = () => {
     refresh();
@@ -293,7 +136,7 @@ export default function StoragePage() {
         <StorageOverviewCards
           activeMemtables={displayedMemtables.filter((m) => m.type === 'ACTIVE').length}
           immutableMemtables={detailedStats?.immutable_count ?? (metrics.immutableMemtablesCount || 0)}
-          walSizeBytes={detailedStats?.wal_size_bytes ?? (metrics.walSizeBytes || 4096)}
+          walSizeBytes={detailedStats?.wal_size_bytes ?? metrics.walSizeBytes}
           sstableCount={detailedStats?.sstables?.length ?? (metrics.sstableCountL0 + metrics.sstableCountL1 + metrics.sstableCountL2)}
           compactionStatus={detailedStats?.compaction?.is_running ? 'COMPACTING (L0 -> L1)' : 'IDLE (Optimal)'}
         />

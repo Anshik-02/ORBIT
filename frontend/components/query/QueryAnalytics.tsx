@@ -16,16 +16,16 @@ interface QueryAnalyticsProps {
 }
 
 export default function QueryAnalytics({
-  totalQueries = 48,
-  successCount = 47,
-  failCount = 1,
-  avgLatencyMs = 1.9,
-  methodCounts = { GET: 30, PUT: 15, DELETE: 3 },
+  totalQueries = 0,
+  successCount = 0,
+  failCount = 0,
+  avgLatencyMs = 0,
+  methodCounts = { GET: 0, PUT: 0, DELETE: 0 },
 }: QueryAnalyticsProps) {
   const successRate = totalQueries > 0 ? ((successCount / totalQueries) * 100).toFixed(1) : '100.0';
-  const getPct = totalQueries > 0 ? Math.round((methodCounts.GET / totalQueries) * 100) : 60;
-  const putPct = totalQueries > 0 ? Math.round((methodCounts.PUT / totalQueries) * 100) : 30;
-  const deletePct = totalQueries > 0 ? Math.max(0, 100 - getPct - putPct) : 10;
+  const getPct = totalQueries > 0 ? Math.round((methodCounts.GET / totalQueries) * 100) : 0;
+  const putPct = totalQueries > 0 ? Math.round((methodCounts.PUT / totalQueries) * 100) : 0;
+  const deletePct = totalQueries > 0 ? Math.max(0, 100 - getPct - putPct) : 0;
 
   return (
     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 font-mono">

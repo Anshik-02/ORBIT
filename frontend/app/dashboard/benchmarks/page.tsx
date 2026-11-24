@@ -10,107 +10,77 @@ import BenchmarkHistory, { BenchmarkRunRecord } from '@/components/benchmarks/Be
 import { executeBenchmarkRun } from '@/lib/api/client';
 import LiveIndicator from '@/components/shared/LiveIndicator';
 
-const INITIAL_METRICS: BenchmarkMetrics = {
-  qps: 18450,
-  avgLatencyMs: 1.84,
-  p50Ms: 1.22,
-  p95Ms: 3.40,
-  p99Ms: 5.82,
-  maxLatencyMs: 12.10,
-  totalRequests: 276750,
+const EMPTY_METRICS: BenchmarkMetrics = {
+  qps: 0,
+  avgLatencyMs: 0,
+  p50Ms: 0,
+  p95Ms: 0,
+  p99Ms: 0,
+  maxLatencyMs: 0,
+  totalRequests: 0,
   errorCount: 0,
 };
 
-const INITIAL_HISTORY: BenchmarkRunRecord[] = [
-  {
-    id: 'run-1',
-    timestamp: 'Today, 14:15:00',
-    config: {
-      workload: 'read_heavy',
-      durationSec: 15,
-      concurrency: 50,
-      keyCount: 25000,
-      payloadSize: '256B',
-    },
-    metrics: {
-      qps: 18450,
-      avgLatencyMs: 1.84,
-      p50Ms: 1.22,
-      p95Ms: 3.40,
-      p99Ms: 5.82,
-      maxLatencyMs: 12.10,
-      totalRequests: 276750,
-      errorCount: 0,
-    },
-  },
-  {
-    id: 'run-2',
-    timestamp: 'Today, 13:50:20',
-    config: {
-      workload: 'write_heavy',
-      durationSec: 30,
-      concurrency: 100,
-      keyCount: 50000,
-      payloadSize: '256B',
-    },
-    metrics: {
-      qps: 12890,
-      avgLatencyMs: 3.12,
-      p50Ms: 2.10,
-      p95Ms: 5.80,
-      p99Ms: 9.40,
-      maxLatencyMs: 18.20,
-      totalRequests: 386700,
-      errorCount: 0,
-    },
-  },
-];
-
 export default function BenchmarksPage() {
-  const [metrics, setMetrics] = useState<BenchmarkMetrics>(INITIAL_METRICS);
-  const [history, setHistory] = useState<BenchmarkRunRecord[]>(INITIAL_HISTORY);
+  const [metrics, setMetrics] = useState<BenchmarkMetrics>(EMPTY_METRICS);
+  const [history, setHistory] = useState<BenchmarkRunRecord[]>([]);
   const [isRunning, setIsRunning] = useState(false);
   const [progressPct, setProgressPct] = useState(0);
   const [elapsedSec, setElapsedSec] = useState(0);
-  const [throughputHistory, setThroughputHistory] = useState<number[]>([
-    14000, 15500, 16800, 17900, 18450, 18200, 18900, 19200, 18450, 18800,
-  ]);
+  const [throughputHistory, setThroughputHistory] = useState<number[]>([]);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+
+  // Load persistent history from localStorage
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem('orbit_benchmark_history');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          setHistory(parsed);
+          setMetrics(parsed[0].metrics);
+          setThroughputHistory(parsed.map((r: BenchmarkRunRecord) => r.metrics.qps).reverse());
+        }
+      }
+    } catch {}
+  }, []);
 
   const handleStartBenchmark = async (config: BenchmarkConfig) => {
+    setErrorMessage(null);
     setIsRunning(true);
     setProgressPct(0);
     setElapsedSec(0);
 
+    abortControllerRef.current = new AbortController();
+
     const totalDuration = config.durationSec;
     let currentElapsed = 0;
 
-    // Background timer for progressive visual feedback
     timerRef.current = setInterval(() => {
       currentElapsed += 1;
       setElapsedSec(currentElapsed);
-      const pct = Math.min(95, Math.round((currentElapsed / totalDuration) * 100));
+      const pct = Math.min(98, Math.round((currentElapsed / totalDuration) * 100));
       setProgressPct(pct);
-
-      const variance = (Math.random() - 0.48) * 1200;
-      const baseQps = config.workload === 'write_heavy' ? 12500 : 18500;
-      const currentQps = Math.round(baseQps + variance);
-
-      setThroughputHistory((prev) => [...prev.slice(1), currentQps]);
     }, 1000);
 
-    // Run real benchmark runner on server
     try {
-      const readRatio = config.workload === 'read_heavy' ? 0.8 : config.workload === 'write_heavy' ? 0.2 : 0.5;
-      const result = await executeBenchmarkRun({
-        target: 'storage',
-        scenario: 'standard',
-        concurrency: config.concurrency,
-        durationSeconds: config.durationSec,
-        numKeys: config.keyCount,
-        valueSize: parseInt(config.payloadSize) || 256,
-        readRatio,
-      });
+      const readRatio =
+        config.workload === 'read_heavy' ? 0.8 : config.workload === 'write_heavy' ? 0.2 : 0.5;
+
+      const result = await executeBenchmarkRun(
+        {
+          target: 'storage',
+          scenario: 'standard',
+          concurrency: config.concurrency,
+          durationSeconds: config.durationSec,
+          numKeys: config.keyCount,
+          valueSize: parseInt(config.payloadSize) || 256,
+          readRatio,
+        },
+        { signal: abortControllerRef.current.signal }
+      );
 
       if (timerRef.current) clearInterval(timerRef.current);
       setProgressPct(100);
@@ -122,28 +92,44 @@ export default function BenchmarksPage() {
         p50Ms: result.latencyP50Ms,
         p95Ms: result.latencyP95Ms,
         p99Ms: result.latencyP99Ms,
-        maxLatencyMs: Math.round(result.latencyP99Ms * 1.8 * 100) / 100,
+        maxLatencyMs: result.latencyMaxMs || result.latencyP99Ms,
         totalRequests: result.totalOperations,
         errorCount: result.failedOperations,
       };
 
       setMetrics(finalMetrics);
-      setHistory((prev) => [
-        {
-          id: `run-${Date.now()}`,
-          timestamp: new Date().toLocaleTimeString(),
-          config,
-          metrics: finalMetrics,
-        },
-        ...prev,
-      ]);
-    } catch {
+      setThroughputHistory((prev) => [...prev, finalMetrics.qps]);
+
+      const newRun: BenchmarkRunRecord = {
+        id: `run-${Date.now()}`,
+        timestamp: new Date().toLocaleTimeString(),
+        config,
+        metrics: finalMetrics,
+      };
+
+      setHistory((prev) => {
+        const updated = [newRun, ...prev];
+        try {
+          localStorage.setItem('orbit_benchmark_history', JSON.stringify(updated));
+        } catch {}
+        return updated;
+      });
+    } catch (err: any) {
       if (timerRef.current) clearInterval(timerRef.current);
       setIsRunning(false);
+      setProgressPct(0);
+      if (err?.name === 'AbortError' || err?.message?.includes('aborted')) {
+        setErrorMessage('Benchmark run cancelled by operator.');
+      } else {
+        setErrorMessage(err?.message || 'Benchmark execution failed.');
+      }
     }
   };
 
   const handleStopBenchmark = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
     if (timerRef.current) clearInterval(timerRef.current);
     setIsRunning(false);
     setProgressPct(0);
@@ -233,6 +219,19 @@ export default function BenchmarksPage() {
           </div>
         </div>
 
+        {/* ERROR / CANCELLATION BANNER */}
+        {errorMessage && (
+          <div className="bg-amber-50 border border-amber-200 rounded-xl p-3.5 flex items-center justify-between text-xs font-mono text-amber-900">
+            <span>{errorMessage}</span>
+            <button
+              onClick={() => setErrorMessage(null)}
+              className="text-amber-600 hover:text-amber-800 font-bold ml-4"
+            >
+              ✕
+            </button>
+          </div>
+        )}
+
         {/* 02. SECTION A & B: BENCHMARK CONFIGURATOR */}
         <BenchmarkConfigurator
           onStart={handleStartBenchmark}
@@ -247,11 +246,11 @@ export default function BenchmarksPage() {
 
         {/* 04. SECTION D: PERFORMANCE CHARTS */}
         <BenchmarkCharts
-          throughputHistory={throughputHistory}
+          throughputHistory={throughputHistory.length > 0 ? throughputHistory : [0]}
           readQps={Math.round(metrics.qps * 0.8)}
           writeQps={Math.round(metrics.qps * 0.2)}
           p50={metrics.p50Ms}
-          p90={2.4}
+          p90={Math.round((metrics.p50Ms * 0.35 + metrics.p95Ms * 0.65) * 100) / 100}
           p95={metrics.p95Ms}
           p99={metrics.p99Ms}
         />

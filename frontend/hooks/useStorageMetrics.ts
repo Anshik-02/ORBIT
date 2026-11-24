@@ -5,23 +5,25 @@ import { fetchStorageMetrics, getActiveNodeEndpoint } from '@/lib/api/client';
 import { StorageService } from '@/lib/services/storage.service';
 import { StorageMetrics, StorageStatsResponse } from '@/lib/api/types';
 
+export const EMPTY_STORAGE_METRICS: StorageMetrics = {
+  activeMemtableBytes: 0,
+  immutableMemtablesBytes: 0,
+  immutableMemtablesCount: 0,
+  walSizeBytes: 0,
+  walRecordCount: 0,
+  sstableCountL0: 0,
+  sstableCountL1: 0,
+  sstableCountL2: 0,
+  sstableTotalBytes: 0,
+  compactionCount: 0,
+  compactionBytesTotal: 0,
+  writeAmplification: 1.0,
+  readAmplification: 1.0,
+  spaceAmplification: 1.0,
+};
+
 export function useStorageMetrics() {
-  const [metrics, setMetrics] = useState<StorageMetrics>({
-    activeMemtableBytes: 1048576,
-    immutableMemtablesBytes: 0,
-    immutableMemtablesCount: 0,
-    walSizeBytes: 4096,
-    walRecordCount: 1,
-    sstableCountL0: 0,
-    sstableCountL1: 0,
-    sstableCountL2: 0,
-    sstableTotalBytes: 0,
-    compactionCount: 0,
-    compactionBytesTotal: 0,
-    writeAmplification: 1.8,
-    readAmplification: 1.2,
-    spaceAmplification: 1.1,
-  });
+  const [metrics, setMetrics] = useState<StorageMetrics>(EMPTY_STORAGE_METRICS);
   const [detailedStats, setDetailedStats] = useState<StorageStatsResponse | null>(null);
   const [isLive, setIsLive] = useState<boolean>(false);
   const [isLoading, setIsLoading] = useState<boolean>(true);
@@ -58,8 +60,14 @@ export function useStorageMetrics() {
         }
       } else {
         setIsLive(false);
+        setDetailedStats(null);
+        setMetrics(EMPTY_STORAGE_METRICS);
       }
       setLastUpdated(new Date());
+    } catch {
+      setIsLive(false);
+      setDetailedStats(null);
+      setMetrics(EMPTY_STORAGE_METRICS);
     } finally {
       setIsLoading(false);
       setIsRefreshing(false);

@@ -28,10 +28,48 @@ NODES = [
     {"id": "node-e", "api_port": 2529, "raft_port": 7004},
 ]
 
-def is_port_in_use(port: int) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(0.2)
-        return s.connect_ex(("127.0.0.1", port)) == 0
+def is_socket_open(port: int, host: str = "127.0.0.1", timeout: float = 0.5) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            return s.connect_ex((host, port)) == 0
+    except Exception:
+        return False
+
+def is_node_healthy(api_port: int, timeout: float = 1.0) -> bool:
+    """Verifies that the node's HTTP server is fully serving requests."""
+    endpoints = [
+        f"http://127.0.0.1:{api_port}/health",
+        f"http://127.0.0.1:{api_port}/cluster/health",
+        f"http://127.0.0.1:{api_port}/cluster/status",
+    ]
+    for url in endpoints:
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception:
+            pass
+    return False
+
+def wait_for_node_readiness(node_info: dict, timeout_sec: float = 8.0) -> bool:
+    """Polls both Raft & HTTP ports and waits for healthy HTTP response."""
+    start_time = time.time()
+    api_port = node_info["api_port"]
+    raft_port = node_info["raft_port"]
+
+    while time.time() - start_time < timeout_sec:
+        # Check if both sockets are accepting connections
+        http_open = is_socket_open(api_port, timeout=0.2)
+        raft_open = is_socket_open(raft_port, timeout=0.2)
+
+        if http_open and raft_open:
+            if is_node_healthy(api_port, timeout=0.5):
+                return True
+        time.sleep(0.2)
+
+    return False
 
 def find_pid_by_port(port: int):
     """Finds the specific PID listening on the given port."""
@@ -79,7 +117,15 @@ def load_pids() -> dict:
     if os.path.exists(PID_FILE):
         try:
             with open(PID_FILE, "r") as f:
-                return json.load(f)
+                data = json.load(f)
+                # Clean stale PIDs
+                cleaned = {}
+                for nid, pid in data.items():
+                    if verify_orbit_process(pid, nid):
+                        cleaned[nid] = pid
+                if len(cleaned) != len(data):
+                    save_pids(cleaned)
+                return cleaned
         except Exception:
             return {}
     return {}
@@ -111,7 +157,7 @@ def get_node_pid(node_id: str, pids: dict, port: int):
 
     return None
 
-def start_node(node_info: dict, pids: dict):
+def start_node(node_info: dict, pids: dict) -> bool:
     nid = node_info["id"]
     cfg = f"configs/{nid}.json"
     cluster_cfg = "configs/cluster.json"
@@ -135,8 +181,17 @@ def start_node(node_info: dict, pids: dict):
         stderr=stderr_f,
         **kwargs
     )
+
+    # Detect immediate crash on launch
+    time.sleep(0.3)
+    poll_res = p.poll()
+    if poll_res is not None:
+        print(f"  [X] FAILED to start {nid}: process exited immediately with code {poll_res}.")
+        return False
+
     pids[nid] = p.pid
-    print(f"  + Started {nid:8s} | PID: {p.pid:<6d} | HTTP: :{node_info['api_port']} | Raft: :{node_info['raft_port']}")
+    print(f"  + Launched {nid:8s} | PID: {p.pid:<6d} | HTTP: :{node_info['api_port']} | Raft: :{node_info['raft_port']}")
+    return True
 
 def start_cluster():
     os.makedirs(LOGS_DIR, exist_ok=True)
@@ -147,7 +202,8 @@ def start_cluster():
     print("=================================================================")
 
     pids = load_pids()
-    started_count = 0
+    launched_nodes = []
+    failed_nodes = []
 
     for node in NODES:
         nid = node["id"]
@@ -157,15 +213,32 @@ def start_cluster():
             print(f"  * {nid:8s} is already running (PID: {pid})")
             continue
 
-        if is_port_in_use(node["api_port"]):
-            print(f"  ! Port {node['api_port']} for {nid} is in use by another process. Skipping.")
+        if is_socket_open(node["api_port"]):
+            print(f"  ! Port {node['api_port']} for {nid} is already in use by another process. Skipping.")
+            failed_nodes.append(nid)
             continue
 
-        start_node(node, pids)
-        started_count += 1
-        time.sleep(0.15)
+        success = start_node(node, pids)
+        if success:
+            launched_nodes.append(node)
+        else:
+            failed_nodes.append(nid)
 
     save_pids(pids)
+
+    # Readiness probe: wait for all newly launched nodes to complete bootstrap & quorum
+    if launched_nodes:
+        print("\nVerifying cluster node readiness (HTTP API & Raft consensus ports)...")
+        for node in launched_nodes:
+            nid = node["id"]
+            ready = wait_for_node_readiness(node, timeout_sec=8.0)
+            if ready:
+                print(f"  [OK] {nid:8s} ready and healthy (HTTP :{node['api_port']}, Raft :{node['raft_port']})")
+            else:
+                print(f"  [WARN] {nid:8s} launched but did not report ready within timeout. Check logs/{nid}.stderr.log")
+
+    if failed_nodes:
+        print(f"\n[ALERT] Partial startup occurred! Failed nodes: {failed_nodes}")
 
     print("\n-----------------------------------------------------------------")
     print("Cluster fleet online! Active REST & Raft endpoints:")
@@ -181,16 +254,30 @@ def stop_node(node_id: str, pids: dict):
 
     if pid and verify_orbit_process(pid, node_id):
         print(f"  - Stopping {node_id} (PID: {pid}, verified)...")
+        # 1. Graceful shutdown attempt first
         if sys.platform == "win32":
-            subprocess.run(["taskkill", "/F", "/PID", str(pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # Attempt graceful taskkill without /F first
+            subprocess.run(["taskkill", "/PID", str(pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # Wait up to 2 seconds for graceful WAL flush and close
+            for _ in range(10):
+                time.sleep(0.2)
+                if not verify_orbit_process(pid, node_id):
+                    break
+            # If still alive, terminate forcefully
+            if verify_orbit_process(pid, node_id):
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             try:
                 os.kill(pid, signal.SIGTERM)
-                time.sleep(0.2)
+                for _ in range(10):
+                    time.sleep(0.2)
+                    if not verify_orbit_process(pid, node_id):
+                        break
                 if verify_orbit_process(pid, node_id):
                     os.kill(pid, signal.SIGKILL)
             except OSError:
                 pass
+
         pids.pop(node_id, None)
     else:
         print(f"  * {node_id} is not running.")

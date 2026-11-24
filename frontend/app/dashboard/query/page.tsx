@@ -10,6 +10,7 @@ import DataExplorer, { StoredKV } from '@/components/query/DataExplorer';
 import QueryAnalytics from '@/components/query/QueryAnalytics';
 import LiveIndicator from '@/components/shared/LiveIndicator';
 import { QueryService } from '@/lib/services/query.service';
+import { ClusterService } from '@/lib/services/cluster.service';
 import {
   executeGetKV,
   executePutKV,
@@ -18,47 +19,21 @@ import {
   getActiveNodeEndpoint,
 } from '@/lib/api/client';
 
-const INITIAL_STORED_KEYS: StoredKV[] = [
-  { key: 'user:1001', value: { name: 'Alice Cooper', tier: 'enterprise', active: true }, shardId: 0, sizeBytes: 68, updatedAt: '14:30:20' },
-  { key: 'user:1002', value: { name: 'Bob Dylan', tier: 'standard', active: true }, shardId: 1, sizeBytes: 64, updatedAt: '14:28:14' },
-  { key: 'session:auth_9918', value: { token: 'jwt_8f91a92', expiresAt: '2026-11-25T00:00:00Z' }, shardId: 2, sizeBytes: 82, updatedAt: '14:26:01' },
-  { key: 'cluster:metrics:qps', value: { currentQps: 1420, p99Ms: 2.1, healthy: true }, shardId: 0, sizeBytes: 56, updatedAt: '14:30:22' },
-];
-
-const INITIAL_HISTORY: HistoryItem[] = [
-  { id: 'h-1', timestamp: '14:30:22', method: 'GET', key: 'cluster:metrics:qps', statusCode: 200, durationMs: 1.6, targetNode: 'node-a' },
-  { id: 'h-2', timestamp: '14:30:20', method: 'PUT', key: 'user:1001', statusCode: 200, durationMs: 2.4, targetNode: 'auto' },
-  { id: 'h-3', timestamp: '14:28:14', method: 'PUT', key: 'user:1002', statusCode: 200, durationMs: 2.1, targetNode: 'node-d' },
-];
-
 export default function QueryConsolePage() {
-  const [storedKeys, setStoredKeys] = useState<StoredKV[]>(INITIAL_STORED_KEYS);
-  const [history, setHistory] = useState<HistoryItem[]>(INITIAL_HISTORY);
+  const [storedKeys, setStoredKeys] = useState<StoredKV[]>([]);
+  const [history, setHistory] = useState<HistoryItem[]>([]);
   const [isExecuting, setIsExecuting] = useState(false);
   const [isLive, setIsLive] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<Date>(new Date());
-  const [currentResponse, setCurrentResponse] = useState<QueryResponse | null>({
-    statusCode: 200,
-    statusText: 'OK',
-    durationMs: 2.4,
-    body: {
-      key: 'user:1001',
-      value: { name: 'Alice Cooper', tier: 'enterprise', active: true },
-      shardId: 0,
-      leader: 'node-a',
-      raftTerm: 3,
-      commitIndex: 14820,
-      linearizable: true,
-    },
-    targetNode: 'node-a',
-    shardId: 0,
-    leaderId: 'node-a',
-    responseBytes: 154,
-    timestamp: '14:30:20',
-  });
+  const [currentResponse, setCurrentResponse] = useState<QueryResponse | null>(null);
   const [loadedQuery, setLoadedQuery] = useState<QueryRequest | undefined>(undefined);
+  const [shardLeaders, setShardLeaders] = useState<Record<number, string>>({
+    0: 'node-a',
+    1: 'node-d',
+    2: 'node-b',
+  });
 
-  // Compute shard from key using 32-bit Murmur3 hash matching ORBIT router
+  // Compute shard from key using 32-bit hash matching ORBIT router
   const getShardForKey = (key: string): number => {
     let hash = 0;
     for (let i = 0; i < key.length; i++) {
@@ -69,43 +44,75 @@ export default function QueryConsolePage() {
   };
 
   const getLeaderForShard = (shardId: number): string => {
-    if (shardId === 0) return 'node-a';
-    if (shardId === 1) return 'node-d';
-    return 'node-b';
+    return shardLeaders[shardId] || (shardId === 0 ? 'node-a' : shardId === 1 ? 'node-d' : 'node-b');
   };
 
-  // Poll scan of live cluster keys on mount
+  // Load persistent query history from localStorage
   useEffect(() => {
-    async function loadLiveKeys() {
-      const endpoint = await getActiveNodeEndpoint();
-      if (endpoint) {
-        setIsLive(true);
-        const scanRes = await executeScanKV({ limit: 50 });
-        if (scanRes && scanRes.items && scanRes.items.length > 0) {
-          const liveItems: StoredKV[] = scanRes.items.map((item) => {
-            let parsedVal: any = item.value;
-            try {
-              parsedVal = JSON.parse(item.value);
-            } catch {
-              // Plain string
-            }
-            const shardId = getShardForKey(item.key);
-            return {
-              key: item.key,
-              value: parsedVal,
-              shardId,
-              sizeBytes: item.value.length,
-              updatedAt: 'Live',
-            };
-          });
-          setStoredKeys(liveItems);
+    try {
+      const saved = localStorage.getItem('orbit_query_history');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) {
+          setHistory(parsed);
         }
-      } else {
-        setIsLive(false);
       }
-      setLastUpdated(new Date());
+    } catch {}
+  }, []);
+
+  // Poll scan of live cluster keys and shard leaders on mount
+  useEffect(() => {
+    async function loadLiveClusterData() {
+      try {
+        const endpoint = await getActiveNodeEndpoint();
+        if (endpoint) {
+          setIsLive(true);
+
+          // 1. Fetch live shard leaders from health telemetry
+          const health = await ClusterService.getHealth({ timeoutMs: 3000 });
+          if (health?.data?.shards) {
+            const leaders: Record<number, string> = {};
+            for (const [sId, sData] of Object.entries(health.data.shards)) {
+              if (sData.current_leader) {
+                leaders[Number(sId)] = sData.current_leader;
+              }
+            }
+            if (Object.keys(leaders).length > 0) {
+              setShardLeaders((prev) => ({ ...prev, ...leaders }));
+            }
+          }
+
+          // 2. Fetch live keys via cluster scan
+          const scanRes = await executeScanKV({ limit: 50 });
+          if (scanRes && scanRes.items && scanRes.items.length > 0) {
+            const liveItems: StoredKV[] = scanRes.items.map((item) => {
+              let parsedVal: any = item.value;
+              try {
+                parsedVal = JSON.parse(item.value);
+              } catch {
+                // Raw string
+              }
+              const sId = getShardForKey(item.key);
+              return {
+                key: item.key,
+                value: parsedVal,
+                shardId: sId,
+                sizeBytes: item.value.length,
+                updatedAt: 'Live',
+              };
+            });
+            setStoredKeys(liveItems);
+          }
+        } else {
+          setIsLive(false);
+        }
+      } catch {
+        setIsLive(false);
+      } finally {
+        setLastUpdated(new Date());
+      }
     }
-    loadLiveKeys();
+    loadLiveClusterData();
   }, []);
 
   // Execution handler
@@ -127,16 +134,6 @@ export default function QueryConsolePage() {
         statusCode = res.status;
         statusText = res.ok ? 'OK' : 'Error';
         bodyData = res.ok ? res.data : { error: res.error, key: req.key };
-
-        if (!res.ok && !isLive) {
-          // Graceful fallback to stored keys for local testing
-          const found = storedKeys.find((k) => k.key === req.key);
-          if (found) {
-            statusCode = 200;
-            statusText = 'OK (Offline Cache)';
-            bodyData = { key: req.key, value: found.value, shardId, leader: leaderNode, cached: true };
-          }
-        }
       } else if (req.method === 'PUT') {
         const res = await executePutKV(req.key, req.value || '');
         durationMs = res.latencyMs;
@@ -144,24 +141,27 @@ export default function QueryConsolePage() {
         statusText = res.ok ? 'Created / Replicated' : 'Error';
         bodyData = res.ok ? res.data : { error: res.error, key: req.key };
 
-        let parsedVal: any = req.value;
-        try {
-          parsedVal = JSON.parse(req.value || '{}');
-        } catch {}
+        // ONLY update explorer when mutation is confirmed successful by the cluster backend
+        if (res.ok) {
+          let parsedVal: any = req.value;
+          try {
+            parsedVal = JSON.parse(req.value || '{}');
+          } catch {}
 
-        setStoredKeys((prev) => {
-          const filtered = prev.filter((k) => k.key !== req.key);
-          return [
-            {
-              key: req.key,
-              value: parsedVal,
-              shardId,
-              sizeBytes: JSON.stringify(parsedVal).length,
-              updatedAt: new Date().toLocaleTimeString(),
-            },
-            ...filtered,
-          ];
-        });
+          setStoredKeys((prev) => {
+            const filtered = prev.filter((k) => k.key !== req.key);
+            return [
+              {
+                key: req.key,
+                value: parsedVal,
+                shardId: res.data?.shard_id ?? shardId,
+                sizeBytes: (req.value || '').length,
+                updatedAt: new Date().toLocaleTimeString(),
+              },
+              ...filtered,
+            ];
+          });
+        }
       } else if (req.method === 'DELETE') {
         const res = await executeDeleteKV(req.key);
         durationMs = res.latencyMs;
@@ -169,14 +169,49 @@ export default function QueryConsolePage() {
         statusText = res.ok ? 'Tombstone Committed' : 'Error';
         bodyData = res.ok ? res.data : { error: res.error, key: req.key };
 
-        setStoredKeys((prev) => prev.filter((k) => k.key !== req.key));
+        // ONLY remove from explorer if backend confirmed deletion
+        if (res.ok) {
+          setStoredKeys((prev) => prev.filter((k) => k.key !== req.key));
+        }
       } else if (req.method === 'SCAN') {
         const start = performance.now();
-        const res = await QueryService.scan({ start: req.key || undefined, limit: 50 });
+        // Support prefix scan if query ends with : or *
+        const isPrefix = req.key && (req.key.endsWith(':') || req.key.endsWith('*'));
+        const cleanPrefix = req.key ? req.key.replace(/\*$/, '') : '';
+
+        const res = isPrefix
+          ? await QueryService.prefixScan(cleanPrefix, 50)
+          : await QueryService.scan({ start: req.key || undefined, limit: 50 });
+
         durationMs = Math.round((performance.now() - start) * 10) / 10;
         statusCode = res ? 200 : 500;
         statusText = res ? `Scan Completed (${res.items?.length || 0} items)` : 'Scan Failed';
         bodyData = res || { error: 'Failed to scan keys' };
+
+        // Sync scanned items into storedKeys
+        if (res && res.items && res.items.length > 0) {
+          const scannedList: StoredKV[] = res.items.map((item) => {
+            let pVal: any = item.value;
+            try {
+              pVal = JSON.parse(item.value);
+            } catch {}
+            return {
+              key: item.key,
+              value: pVal,
+              shardId: getShardForKey(item.key),
+              sizeBytes: item.value.length,
+              updatedAt: new Date().toLocaleTimeString(),
+            };
+          });
+
+          setStoredKeys((prev) => {
+            const keyMap = new Map(prev.map((k) => [k.key, k]));
+            for (const item of scannedList) {
+              keyMap.set(item.key, item);
+            }
+            return Array.from(keyMap.values());
+          });
+        }
       } else if (req.method === 'BATCH') {
         const start = performance.now();
         let ops = [];
@@ -213,19 +248,24 @@ export default function QueryConsolePage() {
       setCurrentResponse(resObj);
       setIsExecuting(false);
 
-      // Append to query history
-      setHistory((prev) => [
-        {
-          id: `h-${Date.now()}`,
-          timestamp: new Date().toLocaleTimeString(),
-          method: req.method,
-          key: req.key,
-          statusCode,
-          durationMs,
-          targetNode: effectiveNode,
-        },
-        ...prev.slice(0, 19),
-      ]);
+      // Append to persistent query history
+      const newHistItem: HistoryItem = {
+        id: `h-${Date.now()}`,
+        timestamp: new Date().toLocaleTimeString(),
+        method: req.method,
+        key: req.key,
+        statusCode,
+        durationMs,
+        targetNode: effectiveNode,
+      };
+
+      setHistory((prev) => {
+        const next = [newHistItem, ...prev.slice(0, 49)];
+        try {
+          localStorage.setItem('orbit_query_history', JSON.stringify(next));
+        } catch {}
+        return next;
+      });
     }
   };
 
@@ -260,6 +300,20 @@ export default function QueryConsolePage() {
     });
   };
 
+  // Query analytics computed strictly from actual history
+  const totalQueries = history.length;
+  const successCount = history.filter((h) => h.statusCode >= 200 && h.statusCode < 300).length;
+  const failCount = history.filter((h) => h.statusCode >= 400).length;
+  const avgLatencyMs =
+    history.length > 0
+      ? Math.round((history.reduce((acc, h) => acc + h.durationMs, 0) / history.length) * 10) / 10
+      : 0;
+  const methodCounts = {
+    GET: history.filter((h) => h.method === 'GET').length,
+    PUT: history.filter((h) => h.method === 'PUT').length,
+    DELETE: history.filter((h) => h.method === 'DELETE').length,
+  };
+
   return (
     <DashboardLayout activeNav="query">
       <div className="space-y-6">
@@ -277,7 +331,7 @@ export default function QueryConsolePage() {
               <LiveIndicator isLive={isLive} lastUpdated={lastUpdated} />
             </div>
             <p className="text-xs sm:text-sm text-[#64748B] mt-1 font-normal font-mono">
-              Execute low-latency GET, PUT and DELETE operations directly across cluster partitions.
+              Execute low-latency GET, PUT, DELETE, SCAN and BATCH operations directly across cluster partitions.
             </p>
           </div>
 
@@ -290,19 +344,11 @@ export default function QueryConsolePage() {
 
         {/* 02. SECTION F: QUERY ANALYTICS */}
         <QueryAnalytics
-          totalQueries={history.length + 45}
-          successCount={history.filter((h) => h.statusCode === 200).length + 44}
-          failCount={history.filter((h) => h.statusCode !== 200).length + 1}
-          avgLatencyMs={
-            history.length > 0
-              ? history.reduce((acc, h) => acc + h.durationMs, 0) / history.length
-              : 1.8
-          }
-          methodCounts={{
-            GET: history.filter((h) => h.method === 'GET').length + 28,
-            PUT: history.filter((h) => h.method === 'PUT').length + 14,
-            DELETE: history.filter((h) => h.method === 'DELETE').length + 3,
-          }}
+          totalQueries={totalQueries}
+          successCount={successCount}
+          failCount={failCount}
+          avgLatencyMs={avgLatencyMs}
+          methodCounts={methodCounts}
         />
 
         {/* 03. SECTION A & C: QUERY EDITOR & RESPONSE INSPECTOR */}
@@ -342,7 +388,12 @@ export default function QueryConsolePage() {
         <QueryHistory
           history={history}
           onRerun={handleRerunHistory}
-          onClear={() => setHistory([])}
+          onClear={() => {
+            setHistory([]);
+            try {
+              localStorage.removeItem('orbit_query_history');
+            } catch {}
+          }}
         />
       </div>
     </DashboardLayout>
