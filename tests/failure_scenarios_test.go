@@ -446,18 +446,24 @@ func TestPhase36_ComprehensiveFailureScenarios(t *testing.T) {
 	t.Log("\n--- Scenarios 3 & 4: Leader dies and old leader rejoins ---")
 	// Find current leader of Shard 1
 	var currentShard1Leader string
-	for time.Now().Before(time.Now().Add(4 * time.Second)) {
-		url := fmt.Sprintf("http://127.0.0.1:%d/cluster/shards", nodePorts["node-d"].apiPort)
-		resp, err := httpClient.Get(url)
-		if err == nil {
-			var shRes api.ClusterShardsResponse
-			_ = json.NewDecoder(resp.Body).Decode(&shRes)
-			resp.Body.Close()
-			for _, sh := range shRes.Shards {
-				if sh.ID == 1 && sh.Leader != "" {
-					currentShard1Leader = sh.Leader
-					break
+	leaderFindDeadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(leaderFindDeadline) {
+		for _, nid := range []string{"node-d", "node-e", "node-a"} {
+			url := fmt.Sprintf("http://127.0.0.1:%d/cluster/shards", nodePorts[nid].apiPort)
+			resp, err := httpClient.Get(url)
+			if err == nil {
+				var shRes api.ClusterShardsResponse
+				_ = json.NewDecoder(resp.Body).Decode(&shRes)
+				resp.Body.Close()
+				for _, sh := range shRes.Shards {
+					if sh.ID == 1 && sh.Leader != "" {
+						currentShard1Leader = sh.Leader
+						break
+					}
 				}
+			}
+			if currentShard1Leader != "" {
+				break
 			}
 		}
 		if currentShard1Leader != "" {
