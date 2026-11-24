@@ -263,6 +263,12 @@ func (f *RequestForwarder) Forward(ctx context.Context, targetNodeID, method, pa
 	if len(extraArgs) > 0 && extraArgs[0] != "" {
 		req.Header.Set(HeaderRequestID, extraArgs[0])
 	}
+	if len(extraArgs) > 2 && extraArgs[2] != "" {
+		req.Header.Set("X-Idempotency-Key", extraArgs[2])
+	}
+	if len(extraArgs) > 3 && extraArgs[3] != "" {
+		req.Header.Set("Authorization", extraArgs[3])
+	}
 
 	resp, err := f.httpClient.Do(req)
 	if err != nil {

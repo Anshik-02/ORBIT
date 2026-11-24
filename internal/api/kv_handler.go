@@ -621,13 +621,14 @@ func (h *KVHandler) handlePut(w http.ResponseWriter, r *http.Request, key, reqID
 	ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
 	defer cancel()
 
-	resp, err := h.forwardWithFailover(ctx, route, candidates, http.MethodPut, r.URL.Path, body, hops, reqID, forwardPath)
+	authHeader := r.Header.Get("Authorization")
+	resp, err := h.forwardWithFailover(ctx, route, candidates, http.MethodPut, r.URL.Path, body, hops, reqID, forwardPath, idempotencyKey, authHeader)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "ambiguous") {
 			writeJSONErrorWithReq(w, http.StatusGatewayTimeout, "forwarded write timed out with ambiguous outcome; check key status before retrying", reqID)
 			return
 		}
-		writeJSONErrorWithReq(w, http.StatusBadGateway, fmt.Sprintf("forwarding failed: %v", err), reqID)
+		writeJSONErrorWithReq(w, http.StatusServiceUnavailable, fmt.Sprintf("no replica currently reachable for shard; election may be in progress: %v", err), reqID)
 		return
 	}
 	defer resp.Body.Close()
@@ -717,9 +718,14 @@ func (h *KVHandler) handleGet(w http.ResponseWriter, r *http.Request, key, reqID
 	ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
 	defer cancel()
 
-	resp, err := h.forwardWithFailover(ctx, route, candidates, http.MethodGet, r.URL.Path, nil, hops, reqID, forwardPath)
+	authHeader := r.Header.Get("Authorization")
+	resp, err := h.forwardWithFailover(ctx, route, candidates, http.MethodGet, r.URL.Path, nil, hops, reqID, forwardPath, "", authHeader)
 	if err != nil {
-		writeJSONErrorWithReq(w, http.StatusBadGateway, fmt.Sprintf("forwarding failed: %v", err), reqID)
+		if errors.Is(err, context.DeadlineExceeded) {
+			writeJSONErrorWithReq(w, http.StatusGatewayTimeout, "forwarded read timed out", reqID)
+			return
+		}
+		writeJSONErrorWithReq(w, http.StatusServiceUnavailable, fmt.Sprintf("no replica currently reachable for shard; election may be in progress: %v", err), reqID)
 		return
 	}
 	defer resp.Body.Close()
@@ -826,13 +832,14 @@ func (h *KVHandler) handleDelete(w http.ResponseWriter, r *http.Request, key, re
 	ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
 	defer cancel()
 
-	resp, err := h.forwardWithFailover(ctx, route, candidates, http.MethodDelete, r.URL.Path, nil, hops, reqID, forwardPath)
+	authHeader := r.Header.Get("Authorization")
+	resp, err := h.forwardWithFailover(ctx, route, candidates, http.MethodDelete, r.URL.Path, nil, hops, reqID, forwardPath, idempotencyKey, authHeader)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "ambiguous") {
 			writeJSONErrorWithReq(w, http.StatusGatewayTimeout, "forwarded write timed out with ambiguous outcome; check key status before retrying", reqID)
 			return
 		}
-		writeJSONErrorWithReq(w, http.StatusBadGateway, fmt.Sprintf("forwarding failed: %v", err), reqID)
+		writeJSONErrorWithReq(w, http.StatusServiceUnavailable, fmt.Sprintf("no replica currently reachable for shard; election may be in progress: %v", err), reqID)
 		return
 	}
 	defer resp.Body.Close()
@@ -848,14 +855,22 @@ func (h *KVHandler) forwardWithFailover(
 	body []byte,
 	hops int,
 	reqID string,
-	forwardPath ...string,
+	extra ...string, // [0] = forwardPath, [1] = idempotencyKey, [2] = authHeader
 ) (*http.Response, error) {
 	var lastResp *http.Response
 	var lastErr error
 
 	fPath := ""
-	if len(forwardPath) > 0 {
-		fPath = forwardPath[0]
+	idempotencyKey := ""
+	authHeader := ""
+	if len(extra) > 0 {
+		fPath = extra[0]
+	}
+	if len(extra) > 1 {
+		idempotencyKey = extra[1]
+	}
+	if len(extra) > 2 {
+		authHeader = extra[2]
 	}
 
 	for _, targetNode := range candidates {
@@ -863,7 +878,7 @@ func (h *KVHandler) forwardWithFailover(
 			break
 		}
 
-		resp, err := h.forwarder.Forward(ctx, targetNode, method, path, body, hops, reqID, fPath)
+		resp, err := h.forwarder.Forward(ctx, targetNode, method, path, body, hops, reqID, fPath, idempotencyKey, authHeader)
 		if err != nil {
 			h.forwarder.Resolver().Tracker().InvalidateLeaderIf(route.GroupID, targetNode)
 			lastErr = err
