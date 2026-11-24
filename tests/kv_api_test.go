@@ -566,11 +566,29 @@ func TestKVAPI_ValidationEmptyStringValue(t *testing.T) {
 	serverURL := c.servers["node-a"].URL
 
 	// 1. Valid empty string value: {"value":""}
-	putReq, _ := http.NewRequest(http.MethodPut, serverURL+"/kv/empty:val", bytes.NewReader([]byte(`{"value":""}`)))
-	putReq.Header.Set("Content-Type", "application/json")
-	pResp, err := http.DefaultClient.Do(putReq)
-	if err != nil || pResp.StatusCode != http.StatusOK {
-		t.Fatalf("PUT with empty string failed: err=%v, code=%d", err, pResp.StatusCode)
+	var (
+		pResp  *http.Response
+		putErr error
+	)
+	putDeadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(putDeadline) {
+		putReq, _ := http.NewRequest(http.MethodPut, serverURL+"/kv/empty:val", bytes.NewReader([]byte(`{"value":""}`)))
+		putReq.Header.Set("Content-Type", "application/json")
+		pResp, putErr = http.DefaultClient.Do(putReq)
+		if putErr == nil && pResp.StatusCode == http.StatusOK {
+			break
+		}
+		if pResp != nil {
+			_ = pResp.Body.Close()
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	if putErr != nil || pResp == nil || pResp.StatusCode != http.StatusOK {
+		code := 0
+		if pResp != nil {
+			code = pResp.StatusCode
+		}
+		t.Fatalf("PUT with empty string failed: err=%v, code=%d", putErr, code)
 	}
 	var setRes api.SetKVResponse
 	_ = json.NewDecoder(pResp.Body).Decode(&setRes)

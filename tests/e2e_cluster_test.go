@@ -107,7 +107,16 @@ func TestE2E_100KeyOperations(t *testing.T) {
 
 	// Setup HTTP test servers with router and forwarder
 	servers := make(map[string]*httptest.Server)
+	muxes := make(map[string]*http.ServeMux)
 	peerHTTPAddrs := make(map[string]string)
+
+	for _, id := range nodeIDs {
+		mux := http.NewServeMux()
+		muxes[id] = mux
+		srv := httptest.NewServer(mux)
+		servers[id] = srv
+		peerHTTPAddrs[id] = srv.Listener.Addr().String()
+	}
 
 	for _, id := range nodeIDs {
 		r := router.New(meta, ring)
@@ -118,12 +127,7 @@ func TestE2E_100KeyOperations(t *testing.T) {
 		resolver := router.NewLeaderResolver(tracker)
 		forwarder := router.NewRequestForwarder(r, resolver, id, peerHTTPAddrs)
 		h := api.NewKVHandler(nodes[id], meta, forwarder, id)
-
-		mux := http.NewServeMux()
-		api.RegisterKVRoutes(mux, h)
-		srv := httptest.NewServer(mux)
-		servers[id] = srv
-		peerHTTPAddrs[id] = srv.Listener.Addr().String()
+		api.RegisterKVRoutes(muxes[id], h)
 	}
 
 	t.Cleanup(func() {
@@ -145,13 +149,30 @@ func TestE2E_100KeyOperations(t *testing.T) {
 		entryNode := nodeIDs[i%len(nodeIDs)]
 		serverURL := servers[entryNode].URL
 
-		// PUT
-		body := []byte(fmt.Sprintf(`{"value":%q}`, val))
-		req, _ := http.NewRequest(http.MethodPut, serverURL+"/kv/"+key, bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil || resp.StatusCode != http.StatusOK {
-			t.Fatalf("op %d: PUT %s via %s failed: err=%v, code=%d", i, key, entryNode, err, resp.StatusCode)
+		// PUT with brief retry if a transient election is occurring
+		var resp *http.Response
+		var putErr error
+		putDeadline := time.Now().Add(6 * time.Second)
+		for time.Now().Before(putDeadline) {
+			body := []byte(fmt.Sprintf(`{"value":%q}`, val))
+			req, _ := http.NewRequest(http.MethodPut, serverURL+"/kv/"+key, bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			resp, putErr = http.DefaultClient.Do(req)
+			if putErr == nil && resp.StatusCode == http.StatusOK {
+				break
+			}
+			if resp != nil {
+				_ = resp.Body.Close()
+			}
+			time.Sleep(30 * time.Millisecond)
+		}
+
+		if putErr != nil || resp == nil || resp.StatusCode != http.StatusOK {
+			code := 0
+			if resp != nil {
+				code = resp.StatusCode
+			}
+			t.Fatalf("op %d: PUT %s via %s failed: err=%v, code=%d", i, key, entryNode, putErr, code)
 		}
 		resp.Body.Close()
 

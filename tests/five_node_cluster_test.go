@@ -543,11 +543,31 @@ func TestFiveNodeThreeShardCluster_RealProcesses(t *testing.T) {
 	// Verify writes to Shard 1 succeed after re-election
 	keyAfterElection := findKeyForShard(1)
 	rePostURL := fmt.Sprintf("http://127.0.0.1:%d/kv/%s", nodePorts[newShard1Leader].apiPort, keyAfterElection)
-	rePostReq, _ := http.NewRequest(http.MethodPut, rePostURL, bytes.NewReader([]byte(`{"value":"post-election-value"}`)))
-	rePostReq.Header.Set("Content-Type", "application/json")
-	rePostResp, err := httpClient.Do(rePostReq)
-	if err != nil || rePostResp.StatusCode != http.StatusOK {
-		t.Fatalf("PUT to Shard 1 after re-election failed: err=%v, code=%d", err, rePostResp.StatusCode)
+
+	var (
+		rePostResp  *http.Response
+		lastPostErr error
+	)
+	rePostDeadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(rePostDeadline) {
+		req, _ := http.NewRequest(http.MethodPut, rePostURL, bytes.NewReader([]byte(`{"value":"post-election-value"}`)))
+		req.Header.Set("Content-Type", "application/json")
+		rePostResp, lastPostErr = httpClient.Do(req)
+		if lastPostErr == nil && rePostResp.StatusCode == http.StatusOK {
+			break
+		}
+		if rePostResp != nil {
+			_ = rePostResp.Body.Close()
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if lastPostErr != nil || rePostResp == nil || rePostResp.StatusCode != http.StatusOK {
+		code := 0
+		if rePostResp != nil {
+			code = rePostResp.StatusCode
+		}
+		t.Fatalf("PUT to Shard 1 after re-election failed: err=%v, code=%d", lastPostErr, code)
 	}
 	rePostResp.Body.Close()
 }

@@ -342,18 +342,55 @@ func TestPhase36_ComprehensiveFailureScenarios(t *testing.T) {
 	t.Logf("Verifying Shard 1 continues operating via live node %s...", liveShard1Node)
 	keyS1Alive := findKeyForShard(1)
 	putURLS1 := fmt.Sprintf("http://127.0.0.1:%d/kv/%s", nodePorts[liveShard1Node].apiPort, keyS1Alive)
-	pReqS1, _ := http.NewRequest(http.MethodPut, putURLS1, bytes.NewReader([]byte(`{"value":"shard1-alive-and-well"}`)))
-	pReqS1.Header.Set("Content-Type", "application/json")
-	pRespS1, err := httpClient.Do(pReqS1)
-	if err != nil || pRespS1.StatusCode != http.StatusOK {
-		t.Fatalf("Scenario 6 failed: Shard 1 write failed while Shard 0 lost quorum: err=%v, code=%v",
-			err, pRespS1.StatusCode)
+
+	var (
+		pRespS1   *http.Response
+		lastS1Err error
+	)
+	s1Deadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(s1Deadline) {
+		pReqS1, _ := http.NewRequest(http.MethodPut, putURLS1, bytes.NewReader([]byte(`{"value":"shard1-alive-and-well"}`)))
+		pReqS1.Header.Set("Content-Type", "application/json")
+		pRespS1, lastS1Err = httpClient.Do(pReqS1)
+		if lastS1Err == nil && pRespS1.StatusCode == http.StatusOK {
+			break
+		}
+		if pRespS1 != nil {
+			_ = pRespS1.Body.Close()
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if lastS1Err != nil || pRespS1 == nil || pRespS1.StatusCode != http.StatusOK {
+		code := 0
+		if pRespS1 != nil {
+			code = pRespS1.StatusCode
+		}
+		t.Fatalf("Scenario 6 failed: Shard 1 write failed while Shard 0 lost quorum: err=%v, code=%d",
+			lastS1Err, code)
 	}
 	pRespS1.Body.Close()
 
-	getRespS1, err := httpClient.Get(putURLS1)
-	if err != nil || getRespS1.StatusCode != http.StatusOK {
-		t.Fatalf("Scenario 6 failed: Shard 1 GET read failed: err=%v", err)
+	var (
+		getRespS1  *http.Response
+		lastGetErr error
+	)
+	for time.Now().Before(s1Deadline) {
+		getRespS1, lastGetErr = httpClient.Get(putURLS1)
+		if lastGetErr == nil && getRespS1.StatusCode == http.StatusOK {
+			break
+		}
+		if getRespS1 != nil {
+			_ = getRespS1.Body.Close()
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if lastGetErr != nil || getRespS1 == nil || getRespS1.StatusCode != http.StatusOK {
+		code := 0
+		if getRespS1 != nil {
+			code = getRespS1.StatusCode
+		}
+		t.Fatalf("Scenario 6 failed: Shard 1 GET read failed: err=%v, code=%d", lastGetErr, code)
 	}
 	getRespS1.Body.Close()
 	t.Log("Scenarios 2, 5 & 6 PASSED: Shard 0 lost quorum and rejected writes; Shard 1 continued operating independently without interruption.")

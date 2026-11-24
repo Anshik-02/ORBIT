@@ -873,44 +873,72 @@ func (h *KVHandler) forwardWithFailover(
 		authHeader = extra[2]
 	}
 
-	for _, targetNode := range candidates {
-		if ctx.Err() != nil {
-			break
-		}
+	maxAttempts := 1
+	if method == http.MethodGet || idempotencyKey != "" {
+		maxAttempts = 3
+	} else {
+		maxAttempts = 2
+	}
 
-		resp, err := h.forwarder.Forward(ctx, targetNode, method, path, body, hops, reqID, fPath, idempotencyKey, authHeader)
-		if err != nil {
-			h.forwarder.Resolver().Tracker().InvalidateLeaderIf(route.GroupID, targetNode)
-			lastErr = err
-
-			// If the error was a context deadline / timeout after dispatching a mutating write,
-			// the write is ambiguous: the remote node may have received and committed it.
-			// Do not blindly retry mutating operations across multiple nodes!
-			if method != http.MethodGet && (errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded)) {
-				return nil, fmt.Errorf("forwarded %s to %s timed out with ambiguous outcome: %w", method, targetNode, err)
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				break
+			case <-time.After(50 * time.Millisecond):
 			}
-			continue
+			if ctx.Err() != nil {
+				break
+			}
+			// Refresh candidates with any newly learned leader from tracker
+			if cached, ok := h.forwarder.Resolver().Tracker().GetLeader(route.GroupID); ok && cached != "" {
+				candidates = append([]string{cached}, candidates...)
+			}
 		}
 
-		// If remote node responded with 503, 502 or 508, invalidate and try next replica
-		if resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusLoopDetected {
-			h.forwarder.Resolver().Tracker().InvalidateLeaderIf(route.GroupID, targetNode)
+		for _, targetNode := range candidates {
+			if ctx.Err() != nil {
+				break
+			}
+
+			resp, err := h.forwarder.Forward(ctx, targetNode, method, path, body, hops, reqID, fPath, idempotencyKey, authHeader)
+			if err != nil {
+				h.forwarder.Resolver().Tracker().InvalidateLeaderIf(route.GroupID, targetNode)
+				lastErr = err
+
+				// If the error was a context deadline / timeout after dispatching a mutating write,
+				// the write is ambiguous: the remote node may have received and committed it.
+				// Do not blindly retry mutating operations across multiple nodes!
+				if method != http.MethodGet && (errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded)) {
+					return nil, fmt.Errorf("forwarded %s to %s timed out with ambiguous outcome: %w", method, targetNode, err)
+				}
+				continue
+			}
+
+			// If remote node responded with 503, 502 or 508, invalidate and try next replica
+			if resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusLoopDetected {
+				h.forwarder.Resolver().Tracker().InvalidateLeaderIf(route.GroupID, targetNode)
+				if lastResp != nil {
+					_ = lastResp.Body.Close()
+				}
+				lastResp = resp
+				continue
+			}
+
+			// If remote node succeeded (200 OK or 404 Not Found), update cached leader
+			if resp.StatusCode == http.StatusOK {
+				h.forwarder.Resolver().Tracker().SetLeader(route.GroupID, targetNode)
+			}
+
 			if lastResp != nil {
 				_ = lastResp.Body.Close()
 			}
-			lastResp = resp
-			continue
+			return resp, nil
 		}
 
-		// If remote node succeeded (200 OK or 404 Not Found), update cached leader
-		if resp.StatusCode == http.StatusOK {
-			h.forwarder.Resolver().Tracker().SetLeader(route.GroupID, targetNode)
+		if lastResp != nil && lastResp.StatusCode == http.StatusOK {
+			return lastResp, nil
 		}
-
-		if lastResp != nil {
-			_ = lastResp.Body.Close()
-		}
-		return resp, nil
 	}
 
 	if lastResp != nil {
