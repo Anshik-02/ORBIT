@@ -602,7 +602,17 @@ func (h *KVHandler) handlePut(w http.ResponseWriter, r *http.Request, key, reqID
 	}
 
 	// 2. Otherwise forward to target leader or candidate replicas with failover
-	candidates := route.Candidates(h.localNodeID)
+	forwardPath := r.Header.Get(router.HeaderForwardPath)
+	var visited []string
+	if forwardPath != "" {
+		for _, p := range strings.Split(forwardPath, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				visited = append(visited, p)
+			}
+		}
+	}
+	excluded := append([]string{h.localNodeID}, visited...)
+	candidates := route.CandidatesWithExcluded(excluded...)
 	if len(candidates) == 0 {
 		writeJSONErrorWithReq(w, http.StatusServiceUnavailable, "no leader or replica currently available for shard", reqID)
 		return
@@ -611,7 +621,7 @@ func (h *KVHandler) handlePut(w http.ResponseWriter, r *http.Request, key, reqID
 	ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
 	defer cancel()
 
-	resp, err := h.forwardWithFailover(ctx, route, candidates, http.MethodPut, r.URL.Path, body, hops, reqID)
+	resp, err := h.forwardWithFailover(ctx, route, candidates, http.MethodPut, r.URL.Path, body, hops, reqID, forwardPath)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "ambiguous") {
 			writeJSONErrorWithReq(w, http.StatusGatewayTimeout, "forwarded write timed out with ambiguous outcome; check key status before retrying", reqID)
@@ -688,7 +698,17 @@ func (h *KVHandler) handleGet(w http.ResponseWriter, r *http.Request, key, reqID
 	}
 
 	// Forward GET to leader or candidate replica with failover
-	candidates := route.Candidates(h.localNodeID)
+	forwardPath := r.Header.Get(router.HeaderForwardPath)
+	var visited []string
+	if forwardPath != "" {
+		for _, p := range strings.Split(forwardPath, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				visited = append(visited, p)
+			}
+		}
+	}
+	excluded := append([]string{h.localNodeID}, visited...)
+	candidates := route.CandidatesWithExcluded(excluded...)
 	if len(candidates) == 0 {
 		writeJSONErrorWithReq(w, http.StatusServiceUnavailable, "no leader or replica currently available for shard", reqID)
 		return
@@ -697,7 +717,7 @@ func (h *KVHandler) handleGet(w http.ResponseWriter, r *http.Request, key, reqID
 	ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
 	defer cancel()
 
-	resp, err := h.forwardWithFailover(ctx, route, candidates, http.MethodGet, r.URL.Path, nil, hops, reqID)
+	resp, err := h.forwardWithFailover(ctx, route, candidates, http.MethodGet, r.URL.Path, nil, hops, reqID, forwardPath)
 	if err != nil {
 		writeJSONErrorWithReq(w, http.StatusBadGateway, fmt.Sprintf("forwarding failed: %v", err), reqID)
 		return
@@ -787,7 +807,17 @@ func (h *KVHandler) handleDelete(w http.ResponseWriter, r *http.Request, key, re
 		return
 	}
 
-	candidates := route.Candidates(h.localNodeID)
+	forwardPath := r.Header.Get(router.HeaderForwardPath)
+	var visited []string
+	if forwardPath != "" {
+		for _, p := range strings.Split(forwardPath, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				visited = append(visited, p)
+			}
+		}
+	}
+	excluded := append([]string{h.localNodeID}, visited...)
+	candidates := route.CandidatesWithExcluded(excluded...)
 	if len(candidates) == 0 {
 		writeJSONErrorWithReq(w, http.StatusServiceUnavailable, "no leader or replica currently available for shard", reqID)
 		return
@@ -796,7 +826,7 @@ func (h *KVHandler) handleDelete(w http.ResponseWriter, r *http.Request, key, re
 	ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
 	defer cancel()
 
-	resp, err := h.forwardWithFailover(ctx, route, candidates, http.MethodDelete, r.URL.Path, nil, hops, reqID)
+	resp, err := h.forwardWithFailover(ctx, route, candidates, http.MethodDelete, r.URL.Path, nil, hops, reqID, forwardPath)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "ambiguous") {
 			writeJSONErrorWithReq(w, http.StatusGatewayTimeout, "forwarded write timed out with ambiguous outcome; check key status before retrying", reqID)
@@ -818,16 +848,22 @@ func (h *KVHandler) forwardWithFailover(
 	body []byte,
 	hops int,
 	reqID string,
+	forwardPath ...string,
 ) (*http.Response, error) {
 	var lastResp *http.Response
 	var lastErr error
+
+	fPath := ""
+	if len(forwardPath) > 0 {
+		fPath = forwardPath[0]
+	}
 
 	for _, targetNode := range candidates {
 		if ctx.Err() != nil {
 			break
 		}
 
-		resp, err := h.forwarder.Forward(ctx, targetNode, method, path, body, hops, reqID)
+		resp, err := h.forwarder.Forward(ctx, targetNode, method, path, body, hops, reqID, fPath)
 		if err != nil {
 			h.forwarder.Resolver().Tracker().InvalidateLeaderIf(route.GroupID, targetNode)
 			lastErr = err
@@ -841,8 +877,8 @@ func (h *KVHandler) forwardWithFailover(
 			continue
 		}
 
-		// If remote node responded with 503 (e.g. not leader or stopped), invalidate and try next replica
-		if resp.StatusCode == http.StatusServiceUnavailable {
+		// If remote node responded with 503, 502 or 508, invalidate and try next replica
+		if resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusLoopDetected {
 			h.forwarder.Resolver().Tracker().InvalidateLeaderIf(route.GroupID, targetNode)
 			if lastResp != nil {
 				_ = lastResp.Body.Close()
@@ -910,10 +946,21 @@ func (h *KVHandler) handleClusterShards(w http.ResponseWriter, r *http.Request) 
 	}
 
 	var shards []ShardDetail
+	localShards := h.provider.ShardInstances()
 	for sid := sharding.ShardID(0); sid < sharding.ShardID(h.metadata.ShardCount); sid++ {
 		info, err := h.metadata.GetShard(sid)
 		if err == nil {
-			leader, _ := h.forwarder.Resolver().Tracker().GetLeader(raft.GroupID(sid.GroupID()))
+			var leader string
+			if inst, ok := localShards[sid]; ok && inst != nil && inst.Raft() != nil {
+				if inst.Raft().Role() == raft.Leader {
+					leader = h.localNodeID
+				} else {
+					leader = inst.Raft().LeaderID()
+				}
+			}
+			if leader == "" {
+				leader, _ = h.forwarder.Resolver().Tracker().GetLeader(raft.GroupID(sid.GroupID()))
+			}
 			shards = append(shards, ShardDetail{
 				ID:       sid,
 				Replicas: info.Replicas,

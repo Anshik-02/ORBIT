@@ -36,6 +36,9 @@ const (
 	// HeaderForwardedFrom is the HTTP header identifying the origin node that forwarded the request.
 	HeaderForwardedFrom = "X-Orbit-Forwarded-From"
 
+	// HeaderForwardPath is the HTTP header identifying the complete sequence of nodes that forwarded the request.
+	HeaderForwardPath = "X-Orbit-Forward-Path"
+
 	// HeaderRequestID is the HTTP header carrying end-to-end tracing and idempotency request IDs.
 	HeaderRequestID = "X-Request-ID"
 )
@@ -64,19 +67,32 @@ func (r *RouteResult) TargetNode() string {
 // The known leader (if any) is placed first, followed by remaining shard replicas.
 // Any node matching excludeNodeID (usually the local node) is omitted.
 func (r *RouteResult) Candidates(excludeNodeID string) []string {
+	return r.CandidatesWithExcluded(excludeNodeID)
+}
+
+// CandidatesWithExcluded returns candidate target node IDs to attempt forwarding to,
+// omitting any node in the excluded list (such as the local node and visited forward path nodes).
+// The visited path check guarantees acyclic forwarding across shard replicas.
+func (r *RouteResult) CandidatesWithExcluded(excluded ...string) []string {
 	seen := make(map[string]bool)
+	for _, ex := range excluded {
+		if ex != "" {
+			seen[ex] = true
+		}
+	}
 	var result []string
 
-	if r.LeaderID != "" && r.LeaderID != excludeNodeID {
+	if r.LeaderID != "" && !seen[r.LeaderID] {
 		result = append(result, r.LeaderID)
 		seen[r.LeaderID] = true
 	}
-	if r.CandidateReplica != "" && r.CandidateReplica != excludeNodeID && !seen[r.CandidateReplica] {
+
+	if r.CandidateReplica != "" && !seen[r.CandidateReplica] {
 		result = append(result, r.CandidateReplica)
 		seen[r.CandidateReplica] = true
 	}
 	for _, rep := range r.CandidateReplicas {
-		if rep != excludeNodeID && !seen[rep] {
+		if !seen[rep] {
 			result = append(result, rep)
 			seen[rep] = true
 		}
@@ -174,43 +190,28 @@ func (f *RequestForwarder) Route(key string, localShards map[sharding.ShardID]Sh
 			res.Forward = true
 			return res, nil
 		}
-	}
 
-	// Consult LeaderTracker for cached leader
-	if cachedLeader, ok := f.resolver.Tracker().GetLeader(groupID); ok && cachedLeader != "" {
-		res.LeaderID = cachedLeader
-		if cachedLeader == f.localNodeID && isLocal {
-			res.IsLocal = true
-		} else {
-			res.Forward = true
-		}
+		// Local replica hosts this shard but is NOT leader and DOES NOT know who the leader is.
+		// Ground truth: leader is currently unknown (election in progress or leader stepped down).
+		// Invalidate any stale cached leader in Tracker so followers never ping-pong writes.
+		f.resolver.Tracker().Invalidate(groupID)
+		res.IsLocal = false
+		res.Forward = false
+		res.LeaderID = ""
+		res.CandidateReplica = ""
 		return res, nil
 	}
 
-	// If hosted locally but leader is currently not established, allow local handler
-	// to return ErrNotLeader or forward to a candidate replica in the shard
-	if isLocal && replica != nil {
-		res.IsLocal = (replica.Raft().Role() == raft.Leader)
-		res.Forward = !res.IsLocal
-		if res.Forward {
-			if shardInfo, err := f.router.GetShardInfo(key); err == nil {
-				for _, rep := range shardInfo.Replicas {
-					if rep != f.localNodeID {
-						res.CandidateReplica = rep
-						break
-					}
-				}
-				if res.CandidateReplica == "" && len(shardInfo.Replicas) > 0 {
-					res.CandidateReplica = shardInfo.Replicas[0]
-				}
-			}
-		}
+	// Shard is not hosted locally: consult LeaderTracker for cached leader
+	if cachedLeader, ok := f.resolver.Tracker().GetLeader(groupID); ok && cachedLeader != "" {
+		res.LeaderID = cachedLeader
+		res.Forward = true
 		return res, nil
 	}
 
 	// Shard is not hosted locally and leader is unknown:
-	// Set CandidateReplica to first configured replica so caller can query it
-	// without falsely claiming it is the Raft leader.
+	// Set CandidateReplica to first configured replica so external caller can query it
+	// to discover the active leader.
 	shardInfo, err = f.router.GetShardInfo(key)
 	if err == nil && len(shardInfo.Replicas) > 0 {
 		res.CandidateReplica = shardInfo.Replicas[0]
@@ -222,7 +223,8 @@ func (f *RequestForwarder) Route(key string, localShards map[sharding.ShardID]Sh
 }
 
 // Forward sends an HTTP request to the designated target node with loop detection.
-func (f *RequestForwarder) Forward(ctx context.Context, targetNodeID, method, path string, body []byte, hops int, reqID ...string) (*http.Response, error) {
+// Optional extraArgs: [0] = reqID, [1] = forwardPath (comma-separated list of visited node IDs).
+func (f *RequestForwarder) Forward(ctx context.Context, targetNodeID, method, path string, body []byte, hops int, extraArgs ...string) (*http.Response, error) {
 	if hops >= MaxForwardHops {
 		return nil, fmt.Errorf("%w: exceeded %d hops", ErrForwardingLoop, MaxForwardHops)
 	}
@@ -251,8 +253,15 @@ func (f *RequestForwarder) Forward(ctx context.Context, targetNodeID, method, pa
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(HeaderForwardedFrom, f.localNodeID)
 	req.Header.Set(HeaderForwardHops, strconv.Itoa(hops+1))
-	if len(reqID) > 0 && reqID[0] != "" {
-		req.Header.Set(HeaderRequestID, reqID[0])
+
+	newPath := f.localNodeID
+	if len(extraArgs) > 1 && extraArgs[1] != "" {
+		newPath = extraArgs[1] + "," + f.localNodeID
+	}
+	req.Header.Set(HeaderForwardPath, newPath)
+
+	if len(extraArgs) > 0 && extraArgs[0] != "" {
+		req.Header.Set(HeaderRequestID, extraArgs[0])
 	}
 
 	resp, err := f.httpClient.Do(req)

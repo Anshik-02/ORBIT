@@ -548,9 +548,9 @@ func (r *Raft) StorageErr() error {
 // hasCommittedInCurrentTermLocked verifies whether the leader has committed at least
 // one entry from its current term (Raft §5.4.2 & §6.4 Leader Completeness Property).
 func (r *Raft) hasCommittedInCurrentTermLocked() bool {
-	if r.commitIndex == 0 {
-		lastIdx, _ := r.storage.LastLogInfo()
-		return lastIdx == 0
+	lastIdx, _ := r.storage.LastLogInfo()
+	if r.commitIndex >= lastIdx {
+		return true // All log entries are committed; state machine is up to date
 	}
 	entry, ok := r.storage.GetEntry(r.commitIndex)
 	if !ok {
@@ -1341,7 +1341,7 @@ func (r *Raft) HandleAppendEntries(ctx context.Context, req *AppendEntriesReques
 	// 3. Log consistency check: Reply false if log doesn't contain an entry at
 	// prevLogIndex matching prevLogTerm (Section 5.3)
 	firstLogIndex := r.storage.FirstIndex()
-	if req.PrevLogIndex < firstLogIndex {
+	if len(req.Entries) > 0 && req.PrevLogIndex < firstLogIndex {
 		return &AppendEntriesResponse{
 			Term:          r.currentTerm,
 			Success:       false,
