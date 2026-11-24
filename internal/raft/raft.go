@@ -442,6 +442,56 @@ func (r *Raft) LastApplied() uint64 {
 	return r.lastApplied
 }
 
+// RaftLogEntryInfo represents an inspectable log entry for dashboard visualization.
+type RaftLogEntryInfo struct {
+	Index     uint64 `json:"index"`
+	Term      uint64 `json:"term"`
+	Type      string `json:"type"`
+	Committed bool   `json:"committed"`
+	Applied   bool   `json:"applied"`
+}
+
+// RecentLogEntries extracts up to limit recent log entries from the underlying storage.
+func (r *Raft) RecentLogEntries(limit int) []RaftLogEntryInfo {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	lastIdx, _ := r.storage.LastLogInfo()
+	if lastIdx == 0 {
+		return nil
+	}
+
+	start := uint64(1)
+	if lastIdx > uint64(limit) {
+		start = lastIdx - uint64(limit) + 1
+	}
+
+	var entries []RaftLogEntryInfo
+	for i := lastIdx; i >= start && i > 0; i-- {
+		entry, ok := r.storage.GetEntry(i)
+		if !ok {
+			continue
+		}
+
+		entryType := "KV_PUT"
+		if entry.Operation == "DELETE" {
+			entryType = "KV_DELETE"
+		} else if entry.Operation == "" {
+			entryType = "NO_OP"
+		}
+
+		entries = append(entries, RaftLogEntryInfo{
+			Index:     entry.Index,
+			Term:      entry.Term,
+			Type:      entryType,
+			Committed: entry.Index <= r.commitIndex,
+			Applied:   entry.Index <= r.lastApplied,
+		})
+	}
+
+	return entries
+}
+
 // WaitForCommit blocks until the given log index has been committed (commitIndex >= index)
 // or the context is canceled. Used by HTTP handlers to wait for a proposed entry to reach quorum.
 func (r *Raft) WaitForCommit(ctx context.Context, index uint64) error {

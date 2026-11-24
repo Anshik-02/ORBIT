@@ -6,97 +6,116 @@ import { promisify } from 'util';
 
 const execFileAsync = promisify(execFile);
 
+function resolveBenchmarkBinary(): string | null {
+  const isWindows = process.platform === 'win32';
+  const binName = isWindows ? 'orbit-bench.exe' : 'orbit-bench';
+
+  const candidates = [
+    path.resolve(process.cwd(), '..', 'bin', binName),
+    path.resolve(process.cwd(), '..', binName),
+    path.resolve(process.cwd(), 'bin', binName),
+  ];
+
+  for (const c of candidates) {
+    if (fs.existsSync(c)) {
+      return c;
+    }
+  }
+  return null;
+}
+
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const concurrency = Number(body.concurrency) || 4;
-    const durationSeconds = Number(body.durationSeconds) || 3;
-    const numKeys = Number(body.numKeys) || 5000;
-    const readRatio = Number(body.readRatio) ?? 0.5;
+    const concurrency = Math.max(1, Math.min(64, Number(body.concurrency) || 4));
+    const durationSeconds = Math.max(1, Math.min(60, Number(body.durationSeconds) || 3));
+    const numKeys = Math.max(10, Math.min(100000, Number(body.numKeys) || 5000));
+    const readRatio = Math.max(0.0, Math.min(1.0, Number(body.readRatio) ?? 0.5));
     const target = body.target || 'storage';
     const scenario = body.scenario || 'standard';
+    const baseURL = body.url || 'http://127.0.0.1:2525';
 
-    // Locate orbit-bench.exe
-    const rootDir = path.resolve(process.cwd(), '..');
-    const binPath = path.join(rootDir, 'bin', 'orbit-bench.exe');
-    const fallbackBinPath = path.join(rootDir, 'orbit-bench.exe');
-
-    const executable = fs.existsSync(binPath)
-      ? binPath
-      : fs.existsSync(fallbackBinPath)
-      ? fallbackBinPath
-      : null;
-
-    if (executable) {
-      const tempOut = path.join(rootDir, 'bin', `bench-${Date.now()}.json`);
-      const args = [
-        `-target=${target}`,
-        `-scenario=${scenario}`,
-        `-concurrency=${concurrency}`,
-        `-duration=${durationSeconds}s`,
-        `-keys=${numKeys}`,
-        `-read-ratio=${readRatio}`,
-        `-output=${tempOut}`,
-      ];
-
-      try {
-        await execFileAsync(executable, args, { timeout: (durationSeconds + 10) * 1000 });
-        if (fs.existsSync(tempOut)) {
-          const raw = fs.readFileSync(tempOut, 'utf-8');
-          fs.unlinkSync(tempOut);
-          const parsed = JSON.parse(raw);
-          return NextResponse.json({
-            name: parsed.name || `${target}-${scenario}`,
-            target: parsed.target || target,
-            scenario: parsed.scenario || scenario,
-            concurrency: parsed.concurrency || concurrency,
-            durationSeconds: parsed.duration || durationSeconds,
-            totalOperations: parsed.total_ops || Math.round(18500 * durationSeconds * (concurrency / 4)),
-            successfulOperations: parsed.success_ops || Math.round(18490 * durationSeconds * (concurrency / 4)),
-            failedOperations: parsed.failed_ops || 0,
-            throughputOpsPerSec: parsed.throughput_ops_per_sec || Math.round(18500 * (concurrency / 4)),
-            readThroughputOpsPerSec: Math.round(18500 * readRatio * (concurrency / 4)),
-            writeThroughputOpsPerSec: Math.round(18500 * (1 - readRatio) * (concurrency / 4)),
-            latencyAvgMs: parsed.latency_avg_ms || 0.42,
-            latencyP50Ms: parsed.latency_p50_ms || 0.38,
-            latencyP95Ms: parsed.latency_p95_ms || 0.85,
-            latencyP99Ms: parsed.latency_p99_ms || 1.45,
-            timestamp: new Date().toISOString(),
-          });
-        }
-      } catch (execErr) {
-        console.warn('orbit-bench execution notice:', execErr);
-      }
+    // Locate actual binary
+    const executable = resolveBenchmarkBinary();
+    if (!executable) {
+      return NextResponse.json(
+        {
+          error:
+            'Benchmark runner binary (orbit-bench) not found in bin/. Please compile with: go build -o bin/orbit-bench.exe ./cmd/orbit-bench',
+        },
+        { status: 500 }
+      );
     }
 
-    // High-fidelity fallback calculation matching ORBIT LSM engine characteristics
-    const baseThroughput = target === 'storage' ? 24500 : target === 'database' ? 19200 : 15800;
-    const workerFactor = Math.pow(concurrency, 0.85);
-    const throughput = Math.round(baseThroughput * (workerFactor / 3.2));
-    const totalOps = Math.round(throughput * durationSeconds);
-    const p50 = Math.round((0.35 + (concurrency * 0.05)) * 100) / 100;
-    const p95 = Math.round((p50 * 2.2) * 100) / 100;
-    const p99 = Math.round((p50 * 3.8) * 100) / 100;
+    const rootDir = path.resolve(process.cwd(), '..');
+    const tempOut = path.join(rootDir, 'bin', `bench-run-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`);
 
-    return NextResponse.json({
-      name: `${target}-${scenario}-${concurrency}w`,
-      target,
-      scenario,
-      concurrency,
-      durationSeconds,
-      totalOperations: totalOps,
-      successfulOperations: totalOps,
-      failedOperations: 0,
-      throughputOpsPerSec: throughput,
-      readThroughputOpsPerSec: Math.round(throughput * readRatio),
-      writeThroughputOpsPerSec: Math.round(throughput * (1 - readRatio)),
-      latencyAvgMs: Math.round((p50 * 1.15) * 100) / 100,
-      latencyP50Ms: p50,
-      latencyP95Ms: p95,
-      latencyP99Ms: p99,
-      timestamp: new Date().toISOString(),
-    });
+    const args = [
+      `-target=${target}`,
+      `-scenario=${scenario}`,
+      `-concurrency=${concurrency}`,
+      `-duration=${durationSeconds}s`,
+      `-keys=${numKeys}`,
+      `-read-ratio=${readRatio}`,
+      `-url=${baseURL}`,
+      `-output=${tempOut}`,
+    ];
+
+    try {
+      await execFileAsync(executable, args, {
+        cwd: rootDir,
+        timeout: (durationSeconds + 15) * 1000,
+      });
+
+      if (!fs.existsSync(tempOut)) {
+        return NextResponse.json(
+          { error: 'Benchmark execution completed but no output report was generated' },
+          { status: 500 }
+        );
+      }
+
+      const raw = fs.readFileSync(tempOut, 'utf-8');
+      try {
+        fs.unlinkSync(tempOut);
+      } catch {}
+
+      const parsed = JSON.parse(raw);
+      const latency = parsed.latency_ms || {};
+
+      return NextResponse.json({
+        id: `bench-${Date.now()}`,
+        name: parsed.config?.name || `${target}-${scenario}-${concurrency}w`,
+        target: parsed.config?.target || target,
+        scenario: parsed.config?.scenario || scenario,
+        concurrency: parsed.config?.concurrency || concurrency,
+        durationSeconds: parsed.duration_seconds || durationSeconds,
+        totalOperations: parsed.total_ops || 0,
+        successfulOperations: Math.max(0, (parsed.total_ops || 0) - (parsed.error_ops || 0)),
+        failedOperations: parsed.error_ops || 0,
+        throughputOpsPerSec: Math.round((parsed.ops_per_sec || 0) * 10) / 10,
+        readThroughputOpsPerSec: Math.round((parsed.read_ops_per_sec || 0) * 10) / 10,
+        writeThroughputOpsPerSec: Math.round((parsed.write_ops_per_sec || 0) * 10) / 10,
+        latencyAvgMs: Math.round((latency.mean || parsed.latency_avg_ms || 0) * 100) / 100,
+        latencyP50Ms: Math.round((latency.p50 || 0) * 100) / 100,
+        latencyP95Ms: Math.round((latency.p95 || 0) * 100) / 100,
+        latencyP99Ms: Math.round((latency.p99 || 0) * 100) / 100,
+        latencyMaxMs: Math.round((parsed.max_latency_ms || latency.p999 || 0) * 100) / 100,
+        timestamp: parsed.timestamp || new Date().toISOString(),
+      });
+    } catch (execErr: any) {
+      if (fs.existsSync(tempOut)) {
+        try {
+          fs.unlinkSync(tempOut);
+        } catch {}
+      }
+      return NextResponse.json(
+        {
+          error: `Benchmark binary execution failed: ${execErr.stderr || execErr.message || 'Process error'}`,
+        },
+        { status: 500 }
+      );
+    }
   } catch (error: any) {
-    return NextResponse.json({ error: error.message || 'Benchmark failed' }, { status: 500 });
+    return NextResponse.json({ error: error.message || 'Benchmark request failed' }, { status: 500 });
   }
 }

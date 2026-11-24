@@ -173,6 +173,7 @@ const INITIAL_SSTABLES: SSTableItem[] = [
 export default function StoragePage() {
   const {
     metrics,
+    detailedStats,
     isLive,
     isLoading,
     isRefreshing,
@@ -182,6 +183,72 @@ export default function StoragePage() {
   const [memtables, setMemtables] = useState<MemtableItem[]>(INITIAL_MEMTABLES);
   const [walFiles, setWalFiles] = useState<WalLogFile[]>(INITIAL_WAL_FILES);
   const [sstables, setSstables] = useState<SSTableItem[]>(INITIAL_SSTABLES);
+
+  // Compute live items dynamically when connected to active cluster
+  const displayedMemtables = React.useMemo(() => {
+    if (!isLive || !detailedStats) return memtables;
+
+    const items: MemtableItem[] = [
+      {
+        id: `memtable-active-${detailedStats.node_id}`,
+        shardId: 0,
+        type: 'ACTIVE',
+        entryCount: detailedStats.active_memtable.entry_count,
+        sizeBytes: detailedStats.active_memtable.byte_size || 64,
+        maxSizeBytes: 67108864,
+        flushStatus: 'Accepting concurrent writes',
+      },
+    ];
+
+    if (detailedStats.immutable_memtables && detailedStats.immutable_memtables.length > 0) {
+      detailedStats.immutable_memtables.forEach((imm, idx) => {
+        items.push({
+          id: `memtable-frozen-imm${idx + 1}`,
+          shardId: 0,
+          type: 'IMMUTABLE',
+          entryCount: imm.entry_count ?? 0,
+          sizeBytes: imm.byte_size ?? 0,
+          maxSizeBytes: 67108864,
+          flushStatus: 'Queued for L0 SSTable flush',
+        });
+      });
+    }
+
+    return items;
+  }, [isLive, detailedStats, memtables]);
+
+  const displayedWalFiles = React.useMemo(() => {
+    if (!isLive || !detailedStats) return walFiles;
+
+    const baseName = detailedStats.wal_path ? detailedStats.wal_path.replace(/\\/g, '/').split('/').pop() : 'wal.log';
+    return [
+      {
+        filename: baseName || 'wal.log',
+        shardId: 0,
+        sizeBytes: detailedStats.wal_size_bytes || 128,
+        entryCount: Number(detailedStats.wal_record_count) || 1,
+        lastIndex: Number(detailedStats.wal_record_count) || 1,
+        status: 'ACTIVE_APPEND' as const,
+      },
+    ];
+  }, [isLive, detailedStats, walFiles]);
+
+  const displayedSstables = React.useMemo(() => {
+    if (!isLive || !detailedStats || !detailedStats.sstables || detailedStats.sstables.length === 0) {
+      return sstables;
+    }
+
+    return detailedStats.sstables.map((s) => ({
+      filename: s.file_name,
+      level: `L${s.level}` as 'L0' | 'L1' | 'L2',
+      shardId: 0,
+      sizeBytes: s.file_size,
+      keyCount: s.record_count,
+      keyRange: s.min_key && s.max_key ? `${s.min_key} .. ${s.max_key}` : 'empty',
+      bloomFilterBits: s.has_bloom_filter ? 10 : 0,
+      status: 'ACTIVE' as const,
+    }));
+  }, [isLive, detailedStats, sstables]);
 
   const handleRefresh = () => {
     refresh();
@@ -224,24 +291,24 @@ export default function StoragePage() {
 
         {/* 02. SECTION A: STORAGE OVERVIEW METRICS */}
         <StorageOverviewCards
-          activeMemtables={3}
-          immutableMemtables={metrics.immutableMemtablesCount || 1}
-          walSizeBytes={metrics.walSizeBytes || 31457280}
-          sstableCount={metrics.sstableCountL0 + metrics.sstableCountL1 + metrics.sstableCountL2 || sstables.length}
-          compactionStatus="IDLE (Optimal)"
+          activeMemtables={displayedMemtables.filter((m) => m.type === 'ACTIVE').length}
+          immutableMemtables={detailedStats?.immutable_count ?? (metrics.immutableMemtablesCount || 0)}
+          walSizeBytes={detailedStats?.wal_size_bytes ?? (metrics.walSizeBytes || 4096)}
+          sstableCount={detailedStats?.sstables?.length ?? (metrics.sstableCountL0 + metrics.sstableCountL1 + metrics.sstableCountL2)}
+          compactionStatus={detailedStats?.compaction?.is_running ? 'COMPACTING (L0 -> L1)' : 'IDLE (Optimal)'}
         />
 
         {/* 03. SECTION B: LSM ARCHITECTURE VISUALIZATION */}
         <LsmArchitectureVisualizer />
 
         {/* 04. SECTION C: MEMTABLE INSPECTOR */}
-        <MemtableInspector memtables={memtables} />
+        <MemtableInspector memtables={displayedMemtables} />
 
         {/* 05. SECTION D: WAL EXPLORER */}
-        <WalExplorer files={walFiles} />
+        <WalExplorer files={displayedWalFiles} />
 
         {/* 06. SECTION E: SSTABLE LEVEL EXPLORER */}
-        <SSTableExplorer sstables={sstables} />
+        <SSTableExplorer sstables={displayedSstables} />
 
         {/* 07. SECTION F: COMPACTION MONITOR */}
         <CompactionMonitor />

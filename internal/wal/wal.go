@@ -96,6 +96,30 @@ func (l *Log) Sequence() uint64 {
 	return l.sequence
 }
 
+// SizeBytes returns the current physical byte size of the WAL file on disk.
+func (l *Log) SizeBytes() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.file == nil {
+		return 0
+	}
+	fi, err := l.file.Stat()
+	if err != nil {
+		return 0
+	}
+	return fi.Size()
+}
+
+// Path returns the path of the open WAL file.
+func (l *Log) Path() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.file == nil {
+		return ""
+	}
+	return l.file.Name()
+}
+
 // SetSequence sets the sequence counter baseline (e.g. from restored manifest watermark).
 func (l *Log) SetSequence(seq uint64) {
 	l.mu.Lock()

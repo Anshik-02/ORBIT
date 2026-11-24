@@ -1,7 +1,8 @@
 'use client';
 
 import React, { useState } from 'react';
-import { Crown, Server, Layers, Zap, Info, ShieldCheck } from 'lucide-react';
+import Link from 'next/link';
+import { Crown, Server, Layers, Zap, Info, ShieldCheck, ArrowRight } from 'lucide-react';
 
 interface NodeData {
   id: string;
@@ -28,8 +29,8 @@ export default function ClusterTopologyPreview() {
     {
       id: 'node-a',
       name: 'Node A',
-      port: 8000,
-      ip: '127.0.0.1:8000',
+      port: 2525,
+      ip: '127.0.0.1:2525',
       x: 300,
       y: 90,
       shards: [
@@ -44,8 +45,8 @@ export default function ClusterTopologyPreview() {
     {
       id: 'node-b',
       name: 'Node B',
-      port: 8001,
-      ip: '127.0.0.1:8001',
+      port: 2526,
+      ip: '127.0.0.1:2526',
       x: 480,
       y: 200,
       shards: [
@@ -60,8 +61,8 @@ export default function ClusterTopologyPreview() {
     {
       id: 'node-c',
       name: 'Node C',
-      port: 8002,
-      ip: '127.0.0.1:8002',
+      port: 2527,
+      ip: '127.0.0.1:2527',
       x: 410,
       y: 380,
       shards: [
@@ -76,8 +77,8 @@ export default function ClusterTopologyPreview() {
     {
       id: 'node-d',
       name: 'Node D',
-      port: 8003,
-      ip: '127.0.0.1:8003',
+      port: 2528,
+      ip: '127.0.0.1:2528',
       x: 190,
       y: 380,
       shards: [
@@ -92,8 +93,8 @@ export default function ClusterTopologyPreview() {
     {
       id: 'node-e',
       name: 'Node E',
-      port: 8004,
-      ip: '127.0.0.1:8004',
+      port: 2529,
+      ip: '127.0.0.1:2529',
       x: 120,
       y: 200,
       shards: [
@@ -156,38 +157,48 @@ export default function ClusterTopologyPreview() {
           </p>
         </div>
 
-        {/* Shard Filter Tabs */}
-        <div className="flex items-center gap-1.5 p-1 rounded-xl bg-[#F4F7FC] border border-[#DCE5F0] self-start sm:self-auto font-mono text-xs">
-          <button
-            onClick={() => setSelectedShard('all')}
-            className={`px-3 py-1 rounded-lg transition-colors font-semibold ${
-              selectedShard === 'all'
-                ? 'bg-white text-[#0891D5] border border-[#DCE5F0] shadow-sm'
-                : 'text-[#64748B] hover:text-[#17243A]'
-            }`}
+        <div className="flex items-center gap-2 self-start sm:self-auto">
+          {/* Shard Filter Tabs */}
+          <div className="flex items-center gap-1.5 p-1 rounded-xl bg-[#F4F7FC] border border-[#DCE5F0] font-mono text-xs">
+            <button
+              onClick={() => setSelectedShard('all')}
+              className={`px-3 py-1 rounded-lg transition-colors font-semibold cursor-pointer ${
+                selectedShard === 'all'
+                  ? 'bg-white text-[#0891D5] border border-[#DCE5F0] shadow-xs'
+                  : 'text-[#64748B] hover:text-[#17243A]'
+              }`}
+            >
+              All Shards
+            </button>
+            {shardConfigs.map((shard) => {
+              const isSelected = selectedShard === shard.id;
+              return (
+                <button
+                  key={shard.id}
+                  onClick={() => setSelectedShard(shard.id)}
+                  className={`flex items-center gap-1.5 px-3 py-1 rounded-lg transition-colors font-semibold cursor-pointer ${
+                    isSelected
+                      ? 'bg-white text-[#17243A] border border-[#DCE5F0] shadow-xs'
+                      : 'text-[#64748B] hover:text-[#17243A]'
+                  }`}
+                >
+                  <span
+                    className="w-2 h-2 rounded-full"
+                    style={{ backgroundColor: shard.color }}
+                  />
+                  Shard {shard.id}
+                </button>
+              );
+            })}
+          </div>
+
+          <Link
+            href="/dashboard/topology"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-[#0891D5]/10 hover:bg-[#0891D5]/20 text-[#0891D5] border border-[#0891D5]/30 text-xs font-mono font-semibold transition-colors"
           >
-            All Shards
-          </button>
-          {shardConfigs.map((shard) => {
-            const isSelected = selectedShard === shard.id;
-            return (
-              <button
-                key={shard.id}
-                onClick={() => setSelectedShard(shard.id)}
-                className={`flex items-center gap-1.5 px-3 py-1 rounded-lg transition-colors font-semibold ${
-                  isSelected
-                    ? 'bg-white text-[#17243A] border border-[#DCE5F0] shadow-sm'
-                    : 'text-[#64748B] hover:text-[#17243A]'
-                }`}
-              >
-                <span
-                  className="w-2 h-2 rounded-full"
-                  style={{ backgroundColor: shard.color }}
-                />
-                Shard {shard.id}
-              </button>
-            );
-          })}
+            <span>3D Explorer</span>
+            <ArrowRight className="w-3.5 h-3.5" />
+          </Link>
         </div>
       </div>
 

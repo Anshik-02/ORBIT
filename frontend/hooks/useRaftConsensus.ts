@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import { fetchClusterHealth, fetchClusterEvents } from '@/lib/api/client';
+import { RaftService } from '@/lib/services/raft.service';
 import { RaftGroupInfo } from '@/components/raft/RaftGroupSelector';
 import { ElectionEvent } from '@/components/raft/ElectionTimeline';
 import { RaftLogEntry } from '@/components/raft/RaftLogInspector';
@@ -115,6 +116,27 @@ export function useRaftConsensus() {
           });
         });
         setFollowersByShard(followerMap);
+
+        // Fetch real Raft logs from leader node
+        const activeLeader = health.data.shards[selectedShardId]?.current_leader || 'node-a';
+        try {
+          const liveLogs = await RaftService.getLogs(activeLeader, 20);
+          if (liveLogs && liveLogs.length > 0) {
+            setLogEntries(
+              liveLogs.map((l) => ({
+                index: l.index,
+                term: l.term,
+                type: l.type === 'KV_DELETE' ? 'KV_DELETE' : l.type === 'CONF_CHANGE' ? 'CONF_CHANGE' : l.type === 'NO_OP' ? 'NO_OP' : 'KV_PUT',
+                payloadSummary: l.key ? `${l.type} ${l.key}` : `Log entry index=${l.index}`,
+                committed: l.committed ?? true,
+                applied: l.applied ?? true,
+                timestamp: l.timestamp ? new Date(l.timestamp).toLocaleTimeString() : 'Recent',
+              }))
+            );
+          }
+        } catch {
+          // Keep current log entries
+        }
 
         // Derive election events from real cluster events
         if (events && Array.isArray(events.events)) {

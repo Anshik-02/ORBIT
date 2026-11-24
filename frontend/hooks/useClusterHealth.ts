@@ -36,7 +36,20 @@ export function useClusterHealth(pollIntervalMs: number = 3000) {
   useEffect(() => {
     refresh();
     const interval = setInterval(refresh, pollIntervalMs);
-    return () => clearInterval(interval);
+
+    const handleClusterUpdate = () => {
+      refresh();
+    };
+    if (typeof window !== 'undefined') {
+      window.addEventListener('orbit:cluster_update', handleClusterUpdate);
+    }
+
+    return () => {
+      clearInterval(interval);
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('orbit:cluster_update', handleClusterUpdate);
+      }
+    };
   }, [refresh, pollIntervalMs]);
 
   return {

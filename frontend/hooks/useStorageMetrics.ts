@@ -2,25 +2,27 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import { fetchStorageMetrics, getActiveNodeEndpoint } from '@/lib/api/client';
-import { StorageMetrics } from '@/lib/api/types';
+import { StorageService } from '@/lib/services/storage.service';
+import { StorageMetrics, StorageStatsResponse } from '@/lib/api/types';
 
 export function useStorageMetrics() {
   const [metrics, setMetrics] = useState<StorageMetrics>({
-    activeMemtableBytes: 18432000,
-    immutableMemtablesBytes: 67108864,
-    immutableMemtablesCount: 1,
-    walSizeBytes: 31457280,
-    walRecordCount: 44460,
-    sstableCountL0: 3,
-    sstableCountL1: 5,
-    sstableCountL2: 12,
-    sstableTotalBytes: 34603008,
-    compactionCount: 19,
-    compactionBytesTotal: 48234496,
-    writeAmplification: 2.3,
-    readAmplification: 1.8,
-    spaceAmplification: 1.15,
+    activeMemtableBytes: 1048576,
+    immutableMemtablesBytes: 0,
+    immutableMemtablesCount: 0,
+    walSizeBytes: 4096,
+    walRecordCount: 1,
+    sstableCountL0: 0,
+    sstableCountL1: 0,
+    sstableCountL2: 0,
+    sstableTotalBytes: 0,
+    compactionCount: 0,
+    compactionBytesTotal: 0,
+    writeAmplification: 1.8,
+    readAmplification: 1.2,
+    spaceAmplification: 1.1,
   });
+  const [detailedStats, setDetailedStats] = useState<StorageStatsResponse | null>(null);
   const [isLive, setIsLive] = useState<boolean>(false);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
@@ -32,9 +34,15 @@ export function useStorageMetrics() {
       const endpoint = await getActiveNodeEndpoint();
       if (endpoint) {
         setIsLive(true);
-        const data = await fetchStorageMetrics();
-        if (data) {
-          setMetrics(data);
+        const [metricData, detailed] = await Promise.all([
+          fetchStorageMetrics(),
+          StorageService.getDetailedStats(),
+        ]);
+        if (metricData) {
+          setMetrics(metricData);
+        }
+        if (detailed) {
+          setDetailedStats(detailed);
         }
       } else {
         setIsLive(false);
@@ -48,12 +56,13 @@ export function useStorageMetrics() {
 
   useEffect(() => {
     refresh();
-    const interval = setInterval(refresh, 4000);
+    const interval = setInterval(refresh, 3000);
     return () => clearInterval(interval);
   }, [refresh]);
 
   return {
     metrics,
+    detailedStats,
     isLive,
     isLoading,
     isRefreshing,

@@ -1,8 +1,13 @@
 # ORBIT — Distributed Multi-Raft Key-Value Database & Storage Engine
 
-ORBIT is a high-performance, crash-resilient, distributed, sharded Key-Value database written in **pure Go** using standard library primitives exclusively.
+[![Go Version](https://img.shields.io/badge/go-1.22+-blue.svg)](https://golang.org)
+[![Next.js](https://img.shields.io/badge/next.js-14.2-black.svg)](https://nextjs.org)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Dependencies](https://img.shields.io/badge/dependencies-zero%20external%20(Go)-brightgreen.svg)](go.mod)
 
-It integrates an LSM-Tree storage engine (with Write-Ahead Logging, Memtable rotation, SSTables, Bloom filters, leveled compaction, and MANIFEST durability), independent **Multi-Raft consensus** groups, consistent hash ring sharding, dynamic topology membership and rebalancing, real-time RFC 6455 WebSocket cluster observability, a built-in **Benchmark CLI runner**, and a **Chaos Lab fault injection framework**.
+**ORBIT** is a high-performance, crash-resilient, distributed, sharded Key-Value database written in **pure Go** using standard library primitives exclusively.
+
+It integrates an LSM-Tree storage engine (with Write-Ahead Logging, Memtable rotation, sparse SSTables, Bloom filters, leveled compaction, and persistent MANIFEST durability), independent **Multi-Raft consensus** groups, consistent hash ring sharding, dynamic topology membership and rebalancing, real-time RFC 6455 WebSocket cluster observability, a built-in **Benchmark CLI runner**, a **Chaos Lab fault injection framework**, and a **Next.js 14 Web Command Center** built with Switzer typography and a modern light infrastructure aesthetic (`#F4F7FC` / `#FFFFFF` / `#0891D5` / `#7965E8`).
 
 ---
 
@@ -56,86 +61,86 @@ graph TD
 ### 2. Multi-Raft Consensus
 - **Autonomous Consensus Groups**: Independent terms, logs, commit indices, and randomized election timers (150ms-300ms) per shard.
 - **Batch Replication & Lag**: Configurable batching limits (`MaxBatchEntries`) and follower lag measurement (`ReplicationLag`).
+- **Linearizable ReadIndex**: Serves linearizable reads from leaders without state-machine write overhead.
 - **State-Machine Snapshots**: Atomic state capture, sentinel log truncation, chunked streaming `InstallSnapshot` RPC, and apply-loop synchronization.
 
 ### 3. Sharding, Dynamic Membership & Migration
-- **Consistent Hash Ring**: Deterministic mapping of UTF-8 keys to shards with minimal key movement on topology changes.
+- **Consistent Hash Ring**: Deterministic mapping of UTF-8 keys to shards using Murmur3 virtual nodes with minimal key movement on topology changes.
 - **Dynamic Membership**: Monotonically increasing `Epoch` tracking with atomic persistence to `cluster_metadata.json` and conflict prevention.
 - **Migration Coordinator**: Multi-phase replica migration (`TRANSFERRING_SNAPSHOT` $\to$ `CATCHING_UP` $\to$ `COMMITTING_PLACEMENT` $\to$ `COMPLETED`).
 - **Automatic Rebalancing**: Minimizes replica moves to maintain $\max(\text{load}) - \min(\text{load}) \le 1$.
 
-### 4. Distributed API & Client Routing
-- **REST Endpoints**: Versioned under `/` and `/api/v1/` for `GET`, `PUT`, `DELETE`.
-- **Batch Operations**: `POST /api/v1/kv/batch` for multi-key transactional write and read operations.
-- **Range Scans & Pagination**: `GET /api/v1/kv/scan` and `GET /api/v1/kv/prefix` supporting sorted cross-tier scans with `has_more` and `next_cursor`.
-- **Idempotency Keys**: `X-Idempotency-Key` caching for network retry replay deduplication.
-- **Transparent Forwarding**: Automatically forwards requests from follower replicas to active shard leaders.
+### 4. Distributed Control Plane & Web UI
+- Built with **Next.js 14**, **Tailwind CSS**, and **Three.js**.
+- Designed with **Switzer typography** and light infrastructure surfaces (`#F4F7FC` background, `#FFFFFF` cards, `#0891D5` cyan and `#7965E8` purple accents).
+- Dedicated 11-page multi-page control center:
+  - `/`: Modern landing hero with interactive 3D cluster visualization.
+  - `/dashboard`: Cluster overview with real-time health cards, sparklines, and environment progress bars.
+  - `/dashboard/topology`: Interactive 3D server building canvas, Bézier packet flow, and deep node inspector.
+  - `/dashboard/shards`: Replica placement matrix (RF=3) and shard balance pipeline.
+  - `/dashboard/raft`: Leader/follower consensus state, election timeline, and live log inspector.
+  - `/dashboard/query`: Interactive KV console (GET, PUT, DELETE, Scan, Prefix scan, Batch).
+  - `/dashboard/events`: Real-time WebSocket audit log with reconnection backoff and sequence deduplication.
+  - `/dashboard/storage`: Real-time LSM telemetry, Memtable queue, WAL file paths, and SSTable levels.
+  - `/dashboard/benchmarks`: Real workload benchmarking against the running cluster.
+  - `/dashboard/chaos`: Fault injection lab with timeline tracking.
+  - `/dashboard/settings`: Cluster parameter management with JSON validation and confirm modal.
 
-### 5. Observability, Metrics & Events
-- **Rolling Metrics Collector**: Tracks real-time RPS, reads/sec, writes/sec, latency percentiles (`p50`, `p95`, `p99`, `avg` in ms), error rates, and memory allocations via `GET /metrics` and `GET /api/v1/metrics`.
-- **Monotonic Event Sequencing**: Sequence numbers and `EventsSince(seq)` buffer allowing reconnecting WebSocket clients to catch up on missed events.
-- **Structured JSON Logging**: Correlated log records with correlation IDs, timestamps, and subsystem identifiers.
+---
 
-### 6. Security & Hardening
-- **TLS & mTLS**: Production-ready server and client TLS configurations enforcing TLS 1.2/1.3 and mutual client certificate authentication.
-- **Role-Based Access Control (RBAC)**: Enforces `admin`, `writer`, and `reader` privilege tiers.
-- **Rate Limiting**: Token-bucket rate limiter per client IP address.
-- **Request Size Limits & Origin Validation**: Enforces maximum payload body size and CORS/Origin verification.
+## Cluster Orchestration Suite
 
-### 7. Benchmarks (`orbit-bench`)
-Configurable performance benchmarking CLI for storage engines, databases, and multi-node clusters:
+A unified Python manager manages cluster lifecycle:
+
 ```bash
-go run ./cmd/orbit-bench -target storage -concurrency 8 -duration 10s -read-ratio 0.8
-go run ./cmd/orbit-bench -target storage -scenario during_compaction -concurrency 4
-go run ./cmd/orbit-bench -target cluster -url http://localhost:2525 -compare baseline.json
-```
+# Check cluster fleet status and replicas
+python scripts/run_cluster.py status
 
-### 8. Chaos Lab (`orbit-chaos`)
-Distributed fault injection framework testing real-world failures:
-- Node failure, kill leader, kill followers, partition leader from majority.
-- Network delay, packet loss, RPC timeout, and dynamic partition healing via `ChaosTransport`.
-- Storage crashes during WAL append, memtable flush, compaction, SSTable corruption, and snapshot recovery.
-```bash
-go run ./cmd/orbit-chaos -action run -fault wal-crash -target data/node-a/wal.log
+# Start all 5 physical nodes
+python scripts/run_cluster.py start
+
+# Restart a specific node with zero quorum loss
+python scripts/run_cluster.py restart node-a
+
+# Tail real-time node logs
+python scripts/run_cluster.py logs node-a 30
+
+# Stop all nodes cleanly
+python scripts/run_cluster.py stop
 ```
 
 ---
 
-## Quickstart
+## API Reference
 
-### Running with Docker Compose (5 Nodes, 3 Shards)
-```bash
-docker compose up -d
-```
-Verify cluster health:
-```bash
-curl http://localhost:2525/live
-curl http://localhost:2525/ready
-curl http://localhost:2525/cluster/status
-curl http://localhost:2525/metrics
-```
+All endpoints support both `/` and `/api/v1/` prefixes:
 
-### Running Locally from Source
-```bash
-# Start physical node A
-go run ./cmd/orbit -config configs/node-a.json -cluster configs/cluster.json
-
-# Perform a distributed write
-curl -X PUT http://localhost:2525/api/v1/kv/user:100 \
-     -H "Content-Type: application/json" \
-     -d '{"value":"Alice"}'
-
-# Read back from any physical node (e.g. node B on port 2526)
-curl http://localhost:2526/api/v1/kv/user:100
-```
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/kv/{key}` | Retrieve key value with linearizable ReadIndex |
+| `PUT` | `/kv/{key}` | Store key value (`{"value": "..."}`) with quorum commit |
+| `DELETE` | `/kv/{key}` | Commit tombstone deletion across shard quorum |
+| `POST` | `/api/v1/kv/batch` | Atomic multi-operation batch mutation |
+| `GET` | `/api/v1/kv/scan` | Range scan with cursor pagination |
+| `GET` | `/api/v1/kv/prefix` | Prefix scan across key namespaces |
+| `GET` | `/cluster/status` | Cluster topology overview and node list |
+| `GET` | `/cluster/health` | Comprehensive shard quorums and replica health |
+| `GET` | `/cluster/shards` | Configured partitions and hash ranges |
+| `GET` | `/cluster/nodes` | List of all physical nodes |
+| `GET` | `/cluster/nodes/{id}` | Detailed telemetry for an individual node |
+| `GET` | `/cluster/raft` | Multi-Raft group summary across shards |
+| `GET` | `/cluster/raft/{id}/logs` | Recent Raft log entries for consensus group |
+| `GET` | `/cluster/storage` | Live LSM storage stats (Memtables, WAL, SSTables) |
+| `GET` | `/cluster/storage/compaction`| Current compaction status and stats |
+| `WS` | `/ws/events` | RFC 6455 WebSocket stream with monotonic sequencing |
 
 ---
 
 ## Testing & Quality Verification
 
-Run the full test suite with the Go race detector:
+Run the test suite across internal modules with the Go race detector:
 ```bash
-go test -v -race ./...
+go test -v -race ./internal/...
 ```
 
 Run static analysis:
@@ -143,17 +148,17 @@ Run static analysis:
 go vet ./...
 ```
 
-Run fuzz testing:
+Run TypeScript build check:
 ```bash
-go test -v ./tests/ -run Fuzz
+cd frontend && npm run build
 ```
 
-Build all project executables:
+Build all project binaries:
 ```bash
-go build ./cmd/orbit
-go build ./cmd/orbit-bench
-go build ./cmd/orbit-chaos
-go build ./cmd/orbit-admin
+go build -o bin/orbit.exe ./cmd/orbit
+go build -o bin/orbit-bench.exe ./cmd/orbit-bench
+go build -o bin/orbit-chaos.exe ./cmd/orbit-chaos
+go build -o bin/orbit-admin.exe ./cmd/orbit-admin
 ```
 
 ---

@@ -5,18 +5,8 @@ import { getActiveNodeEndpoint, fetchClusterEvents } from '@/lib/api/client';
 import { ClusterEventItem } from '@/components/events/EventStreamTable';
 import { EventCategory, EventSeverity } from '@/components/events/EventFilterBar';
 
-const INITIAL_EVENTS: ClusterEventItem[] = [
-  { id: 'evt-101', timestamp: '14:30:21', category: 'CLUSTER', severity: 'INFO', nodeId: 'node-a', description: 'Node A heartbeat acknowledged by all cluster peers.', metadata: { rttAvgMs: 0.8, ackCount: 4 } },
-  { id: 'evt-102', timestamp: '14:30:19', category: 'RAFT', severity: 'INFO', nodeId: 'node-d', shardId: 1, description: 'Shard 1 committed log entry #14818 via majority quorum.', metadata: { commitIndex: 14818, term: 2, entriesCount: 1 } },
-  { id: 'evt-103', timestamp: '14:30:16', category: 'RAFT', severity: 'INFO', nodeId: 'node-a', shardId: 0, description: 'Leader elected: Node A won majority quorum (2/3) for Shard 0.', metadata: { term: 3, votesReceived: ['node-a', 'node-b'] } },
-  { id: 'evt-104', timestamp: '14:30:12', category: 'REPLICATION', severity: 'INFO', nodeId: 'node-b', shardId: 0, description: 'Replica synchronization completed: MatchIndex caught up to CommitIndex.', metadata: { matchIndex: 14820, lag: 0 } },
-  { id: 'evt-105', timestamp: '14:30:08', category: 'CLUSTER', severity: 'INFO', nodeId: 'node-c', description: 'Node C established Raft transport peering with all active nodes.', metadata: { remoteAddr: '127.0.0.1:3527', transport: 'TCP' } },
-  { id: 'evt-106', timestamp: '14:28:44', category: 'STORAGE', severity: 'INFO', nodeId: 'node-a', shardId: 0, description: 'LSM Memtable flushed to L0 SSTable file sst_001.sst (42.1 KB).', metadata: { sstableId: 'sst_001', sizeBytes: 43110, level: 0 } },
-  { id: 'evt-107', timestamp: '14:25:30', category: 'NETWORK', severity: 'WARN', nodeId: 'node-e', shardId: 1, description: 'Transient latency spike detected on Raft heartbeat (34ms). Restored to baseline.', metadata: { peakLatencyMs: 34.2, normalMs: 1.1 } },
-];
-
 export function useEventStream() {
-  const [events, setEvents] = useState<ClusterEventItem[]>(INITIAL_EVENTS);
+  const [events, setEvents] = useState<ClusterEventItem[]>([]);
   const [isPaused, setIsPaused] = useState<boolean>(false);
   const [isConnected, setIsConnected] = useState<boolean>(false);
   const [lastSeq, setLastSeq] = useState<number>(0);
@@ -25,6 +15,9 @@ export function useEventStream() {
   const wsRef = useRef<WebSocket | null>(null);
   const isPausedRef = useRef<boolean>(isPaused);
   isPausedRef.current = isPaused;
+  const lastSeqRef = useRef<number>(0);
+  lastSeqRef.current = lastSeq;
+  const seenIdsRef = useRef<Set<string>>(new Set());
 
   // Map backend event type to UI Category & Severity
   const mapBackendEvent = (e: any): ClusterEventItem => {
@@ -48,15 +41,20 @@ export function useEventStream() {
       severity = 'WARN';
     }
 
-    const desc = e.data?.message ||
-      (t === 'ENTRY_COMMITTED' ? `Entry committed on key "${e.data?.key || 'unknown'}" (Index #${e.data?.index || 0})` :
-      t === 'LEADER_CHANGED' ? `Leader changed: Node ${e.node_id} elected for Shard ${e.shard_id ?? 0}` :
-      t === 'NODE_JOINED' ? `Node ${e.node_id} joined active cluster topology` :
-      t === 'NODE_FAILED' ? `Node ${e.node_id} heartbeat lost; marked offline` :
-      `${e.type} observed on ${e.node_id}`);
+    const desc =
+      e.data?.message ||
+      (t === 'ENTRY_COMMITTED'
+        ? `Entry committed on key "${e.data?.key || 'unknown'}" (Index #${e.data?.index || 0})`
+        : t === 'LEADER_CHANGED'
+        ? `Leader changed: Node ${e.node_id} elected for Shard ${e.shard_id ?? 0}`
+        : t === 'NODE_JOINED'
+        ? `Node ${e.node_id} joined active cluster topology`
+        : t === 'NODE_FAILED'
+        ? `Node ${e.node_id} heartbeat lost; marked offline`
+        : `${e.type} observed on ${e.node_id}`);
 
     return {
-      id: e.event_id || `evt-${Date.now()}-${Math.random()}`,
+      id: e.event_id || `evt-${e.sequence || Date.now()}-${Math.random()}`,
       timestamp: e.timestamp ? new Date(e.timestamp).toLocaleTimeString() : new Date().toLocaleTimeString(),
       category,
       severity,
@@ -67,10 +65,12 @@ export function useEventStream() {
     };
   };
 
-  // Connect WebSocket & Polling
+  // Connect WebSocket & Polling with Exponential Backoff
   useEffect(() => {
     let cancelled = false;
     let pollTimer: any = null;
+    let reconnectTimeout: any = null;
+    let reconnectAttempts = 0;
 
     async function initConnection() {
       const endpoint = await getActiveNodeEndpoint();
@@ -79,19 +79,31 @@ export function useEventStream() {
 
       if (!endpoint) {
         setIsConnected(false);
+        // Retry discovery in 3 seconds
+        reconnectTimeout = setTimeout(initConnection, 3000);
         return;
       }
 
-      // 1. Fetch initial historical events
+      // 1. Fetch initial historical events using sequence tracking
       try {
-        const hist = await fetchClusterEvents(0);
+        const hist = await fetchClusterEvents(lastSeqRef.current);
         if (hist && Array.isArray(hist.events) && hist.events.length > 0) {
-          const mapped = hist.events.map(mapBackendEvent);
-          setEvents((prev) => {
-            const existingIds = new Set(prev.map((x) => x.id));
-            const fresh = mapped.filter((x) => !existingIds.has(x.id));
-            return [...fresh, ...prev].slice(0, 100);
-          });
+          const freshItems: ClusterEventItem[] = [];
+          for (const ev of hist.events) {
+            const evId = ev.event_id || `seq-${ev.sequence}`;
+            if (!seenIdsRef.current.has(evId)) {
+              seenIdsRef.current.add(evId);
+              freshItems.push(mapBackendEvent(ev));
+              if (ev.sequence && ev.sequence > lastSeqRef.current) {
+                lastSeqRef.current = ev.sequence;
+                setLastSeq(ev.sequence);
+              }
+            }
+          }
+
+          if (freshItems.length > 0) {
+            setEvents((prev) => [...freshItems, ...prev].slice(0, 200));
+          }
         }
       } catch (err) {
         console.warn('Initial events fetch error:', err);
@@ -104,15 +116,35 @@ export function useEventStream() {
         wsRef.current = ws;
 
         ws.onopen = () => {
-          if (!cancelled) setIsConnected(true);
+          if (!cancelled) {
+            setIsConnected(true);
+            reconnectAttempts = 0;
+          }
         };
 
         ws.onmessage = (event) => {
           if (isPausedRef.current) return;
           try {
             const raw = JSON.parse(event.data);
+            const evId = raw.event_id || `seq-${raw.sequence || Date.now()}`;
+            if (seenIdsRef.current.has(evId)) return;
+            seenIdsRef.current.add(evId);
+
+            if (raw.sequence && raw.sequence > lastSeqRef.current) {
+              lastSeqRef.current = raw.sequence;
+              setLastSeq(raw.sequence);
+            }
+
             const item = mapBackendEvent(raw);
-            setEvents((prev) => [item, ...prev].slice(0, 150));
+            setEvents((prev) => [item, ...prev].slice(0, 200));
+
+            // Cross-page sync trigger for significant cluster topology/raft changes
+            if (typeof window !== 'undefined') {
+              const t = (raw.type || '').toUpperCase();
+              if (t.includes('LEADER') || t.includes('FAIL') || t.includes('JOIN') || t.includes('TERM')) {
+                window.dispatchEvent(new CustomEvent('orbit:cluster_update', { detail: raw }));
+              }
+            }
           } catch {}
         };
 
@@ -121,28 +153,43 @@ export function useEventStream() {
         };
 
         ws.onclose = () => {
-          if (!cancelled) setIsConnected(false);
+          if (!cancelled) {
+            setIsConnected(false);
+            const backoffMs = Math.min(1000 * Math.pow(1.5, reconnectAttempts), 10000);
+            reconnectAttempts++;
+            reconnectTimeout = setTimeout(initConnection, backoffMs);
+          }
         };
       } catch {
         setIsConnected(false);
+        reconnectTimeout = setTimeout(initConnection, 4000);
       }
 
-      // 3. Keep fallback polling in case WS misses packets or is blocked
+      // 3. Fallback polling for missed events
       pollTimer = setInterval(async () => {
         if (isPausedRef.current || cancelled) return;
         try {
-          const fresh = await fetchClusterEvents(0);
+          const fresh = await fetchClusterEvents(lastSeqRef.current);
           if (fresh && Array.isArray(fresh.events) && fresh.events.length > 0) {
-            const mapped = fresh.events.map(mapBackendEvent);
-            setEvents((prev) => {
-              const existingIds = new Set(prev.map((x) => x.id));
-              const newItems = mapped.filter((x) => !existingIds.has(x.id));
-              if (newItems.length === 0) return prev;
-              return [...newItems, ...prev].slice(0, 150);
-            });
+            const freshItems: ClusterEventItem[] = [];
+            for (const ev of fresh.events) {
+              const evId = ev.event_id || `seq-${ev.sequence}`;
+              if (!seenIdsRef.current.has(evId)) {
+                seenIdsRef.current.add(evId);
+                freshItems.push(mapBackendEvent(ev));
+                if (ev.sequence && ev.sequence > lastSeqRef.current) {
+                  lastSeqRef.current = ev.sequence;
+                  setLastSeq(ev.sequence);
+                }
+              }
+            }
+
+            if (freshItems.length > 0) {
+              setEvents((prev) => [...freshItems, ...prev].slice(0, 200));
+            }
           }
         } catch {}
-      }, 4000);
+      }, 3500);
     }
 
     initConnection();
@@ -153,6 +200,7 @@ export function useEventStream() {
         wsRef.current.close();
       }
       if (pollTimer) clearInterval(pollTimer);
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
     };
   }, []);
 
@@ -196,6 +244,9 @@ export function useEventStream() {
     activeEndpoint,
     exportJSON,
     exportCSV,
-    clearEvents: () => setEvents([]),
+    clearEvents: () => {
+      seenIdsRef.current.clear();
+      setEvents([]);
+    },
   };
 }

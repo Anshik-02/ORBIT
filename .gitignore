@@ -3,6 +3,7 @@ data/
 logs/
 
 # Go build artifacts
+bin/
 *.exe
 *.test
 *.out

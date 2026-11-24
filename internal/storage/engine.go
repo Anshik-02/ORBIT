@@ -920,6 +920,120 @@ func (e *Engine) Health() error {
 	return e.wal.Health()
 }
 
+// MemtableStat summarizes an active or immutable in-memory memtable.
+type MemtableStat struct {
+	ID          int   `json:"id"`
+	ByteSize    int64 `json:"byte_size"`
+	EntryCount  int   `json:"entry_count"`
+	IsImmutable bool  `json:"is_immutable"`
+}
+
+// SSTableStat describes an on-disk Sorted String Table.
+type SSTableStat struct {
+	ID             uint64 `json:"id"`
+	Level          int    `json:"level"`
+	FileName       string `json:"file_name"`
+	FileSize       int64  `json:"file_size"`
+	RecordCount    int    `json:"record_count"`
+	MinKey         string `json:"min_key"`
+	MaxKey         string `json:"max_key"`
+	HasBloomFilter bool   `json:"has_bloom_filter"`
+}
+
+// EngineStats exposes structured LSM-Tree and WAL telemetry for observability endpoints.
+type EngineStats struct {
+	ActiveMemtable     MemtableStat   `json:"active_memtable"`
+	ImmutableMemtables []MemtableStat `json:"immutable_memtables"`
+	ImmutableCount     int            `json:"immutable_count"`
+	WALSizeBytes       int64          `json:"wal_size_bytes"`
+	WALRecordCount     int64          `json:"wal_record_count"`
+	WALPath            string         `json:"wal_path"`
+	SSTables           []SSTableStat  `json:"sstables"`
+	SSTablesByLevel    map[int]int    `json:"sstables_by_level"`
+	TotalSSTableBytes  int64          `json:"total_sstable_bytes"`
+	Compaction         CompactionStat `json:"compaction"`
+}
+
+// Stats returns a thread-safe snapshot of active storage metrics.
+func (e *Engine) Stats() EngineStats {
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+
+	active := MemtableStat{
+		ID:          0,
+		ByteSize:    0,
+		EntryCount:  0,
+		IsImmutable: false,
+	}
+	if e.memtable != nil {
+		active.ByteSize = e.memtable.SizeBytes()
+		active.EntryCount = e.memtable.Len()
+	}
+
+	var immutables []MemtableStat
+	for i, imm := range e.immutable {
+		if imm != nil {
+			immutables = append(immutables, MemtableStat{
+				ID:          i + 1,
+				ByteSize:    imm.SizeBytes(),
+				EntryCount:  imm.Len(),
+				IsImmutable: true,
+			})
+		}
+	}
+
+	var sstables []SSTableStat
+	byLevel := make(map[int]int)
+	var totalSSTableBytes int64
+
+	for _, reader := range e.sstables {
+		if reader == nil {
+			continue
+		}
+		meta := reader.Metadata()
+		hasBloom := reader.bloomFilter != nil
+		sstables = append(sstables, SSTableStat{
+			ID:             meta.ID,
+			Level:          int(meta.Level),
+			FileName:       meta.Filename,
+			FileSize:       meta.SizeBytes,
+			RecordCount:    int(meta.NumEntries),
+			MinKey:         meta.MinKey,
+			MaxKey:         meta.MaxKey,
+			HasBloomFilter: hasBloom,
+		})
+		byLevel[int(meta.Level)]++
+		totalSSTableBytes += meta.SizeBytes
+	}
+
+	var walSize int64
+	var walRecords int64
+	var walPath string
+	if e.wal != nil {
+		walSize = e.wal.SizeBytes()
+		walRecords = int64(e.wal.Sequence())
+		walPath = e.wal.Path()
+	}
+
+	compaction := CompactionStat{}
+	if e.compactor != nil {
+		compaction = e.compactor.Stats()
+	}
+
+	return EngineStats{
+		ActiveMemtable:     active,
+		ImmutableMemtables: immutables,
+		ImmutableCount:     len(immutables),
+		WALSizeBytes:       walSize,
+		WALRecordCount:     walRecords,
+		WALPath:            walPath,
+		SSTables:           sstables,
+		SSTablesByLevel:    byLevel,
+		TotalSSTableBytes:  totalSSTableBytes,
+		Compaction:         compaction,
+	}
+}
+
 // atomicWriteFileWithDirSync safely writes data using a deterministic .tmp file,
 // fsync, atomic rename, and directory sync.
 func atomicWriteFileWithDirSync(path string, data []byte, perm os.FileMode) error {

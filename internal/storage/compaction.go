@@ -26,14 +26,44 @@ type CompactionResult struct {
 	Duration     time.Duration     `json:"duration"`
 }
 
+// CompactionStat summarizes compaction engine activity for observability.
+type CompactionStat struct {
+	IsRunning           bool   `json:"is_running"`
+	CompactionCount     int64  `json:"compaction_count"`
+	TotalBytesCompacted int64  `json:"total_bytes_compacted"`
+	LastCompactionTime  string `json:"last_compaction_time,omitempty"`
+}
+
 // Compactor coordinates Level-based and Major compactions across SSTables.
 type Compactor struct {
-	mu            sync.Mutex
-	engine        *Engine
-	manifest      *Manifest
-	sstDir        string
-	l0Threshold   int
-	targetSSTSize int64
+	mu                  sync.Mutex
+	engine              *Engine
+	manifest            *Manifest
+	sstDir              string
+	l0Threshold         int
+	targetSSTSize       int64
+	compactionsCount    int64
+	compactedBytesTotal int64
+	isRunning           bool
+	lastCompactionTime  time.Time
+}
+
+// Stats returns a snapshot of compaction activity.
+func (c *Compactor) Stats() CompactionStat {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	lastTime := ""
+	if !c.lastCompactionTime.IsZero() {
+		lastTime = c.lastCompactionTime.Format(time.RFC3339)
+	}
+
+	return CompactionStat{
+		IsRunning:           c.isRunning,
+		CompactionCount:     c.compactionsCount,
+		TotalBytesCompacted: c.compactedBytesTotal,
+		LastCompactionTime:  lastTime,
+	}
 }
 
 // NewCompactor creates a Compactor instance attached to engine and manifest.

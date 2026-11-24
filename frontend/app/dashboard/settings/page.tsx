@@ -3,6 +3,8 @@
 import React, { useState, useEffect } from 'react';
 import DashboardLayout from '@/components/dashboard/DashboardLayout';
 import { fetchClusterSettings, saveClusterSettings } from '@/lib/api/client';
+import { SettingsService } from '@/lib/services/settings.service';
+import ConfirmDialog from '@/components/shared/ConfirmDialog';
 import LiveIndicator from '@/components/shared/LiveIndicator';
 import {
   Settings,
@@ -33,6 +35,8 @@ export default function SettingsPage() {
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [restartMessage, setRestartMessage] = useState<string | null>(null);
+  const [validationErrors, setValidationErrors] = useState<string[]>([]);
+  const [showConfirm, setShowConfirm] = useState(false);
 
   // Settings State matching configs/cluster.json
   const [clusterId, setClusterId] = useState('orbit-cluster-01');
@@ -93,7 +97,31 @@ export default function SettingsPage() {
     loadConfig();
   }, []);
 
-  const handleSave = async () => {
+  const handleInitiateSave = () => {
+    setValidationErrors([]);
+    const errors = SettingsService.validate({
+      clusterConfig: {
+        cluster_id: clusterId,
+        shard_count: shardCount,
+        replication_factor: replicationFactor,
+      },
+      nodeConfig: {
+        heartbeat_interval: `${heartbeatIntervalMs}ms`,
+        election_timeout_min: `${electionTimeoutMinMs}ms`,
+        election_timeout_max: `${electionTimeoutMaxMs}ms`,
+      },
+    });
+
+    if (errors.length > 0) {
+      setValidationErrors(errors);
+      return;
+    }
+
+    setShowConfirm(true);
+  };
+
+  const handleConfirmSave = async () => {
+    setShowConfirm(false);
     setIsSaving(true);
     setSaveSuccess(false);
     setRestartMessage(null);
@@ -144,15 +172,29 @@ export default function SettingsPage() {
 
           <div className="flex items-center gap-2">
             <button
-              onClick={handleSave}
+              onClick={handleInitiateSave}
               disabled={isSaving}
-              className="px-5 py-2.5 rounded-xl bg-[#0891D5] hover:bg-[#0284C7] disabled:opacity-50 text-white font-bold flex items-center gap-2 transition-all shadow-xs"
+              className="px-5 py-2.5 rounded-xl bg-[#0891D5] hover:bg-[#0284C7] disabled:opacity-50 text-white font-bold flex items-center gap-2 transition-all shadow-xs cursor-pointer"
             >
               <Save className="w-3.5 h-3.5" />
               <span>{isSaving ? 'Validating & Saving...' : 'Save Changes'}</span>
             </button>
           </div>
         </div>
+
+        {validationErrors.length > 0 && (
+          <div className="p-3.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-800 space-y-1 animate-fadeIn">
+            <div className="flex items-center gap-2 font-bold text-rose-900">
+              <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+              <span>Configuration Validation Errors:</span>
+            </div>
+            <ul className="list-disc list-inside text-[11px] pl-1 space-y-0.5">
+              {validationErrors.map((err, i) => (
+                <li key={i}>{err}</li>
+              ))}
+            </ul>
+          </div>
+        )}
 
         {saveSuccess && (
           <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 flex items-center gap-2 animate-fadeIn">
@@ -607,6 +649,17 @@ export default function SettingsPage() {
           )}
         </div>
       </div>
+
+      <ConfirmDialog
+        isOpen={showConfirm}
+        title="Apply Cluster Configuration Changes?"
+        message="Updating cluster settings will modify configs/cluster.json and node configuration. Any changes to Raft consensus timers, partition counts, or replication factor will require a cluster rolling restart to take effect."
+        confirmLabel="Confirm & Save"
+        cancelLabel="Cancel"
+        variant="primary"
+        onConfirm={handleConfirmSave}
+        onCancel={() => setShowConfirm(false)}
+      />
     </DashboardLayout>
   );
 }
