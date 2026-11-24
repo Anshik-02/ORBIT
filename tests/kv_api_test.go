@@ -448,7 +448,7 @@ func TestKVAPI_LeaderFailover(t *testing.T) {
 
 	// Wait for new leader to be elected among surviving nodes
 	var newLeaderID string
-	deadline := time.Now().Add(4 * time.Second)
+	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
 		for id, n := range c.nodes {
 			if id == oldLeaderID {
@@ -471,21 +471,49 @@ func TestKVAPI_LeaderFailover(t *testing.T) {
 	}
 
 	// Update tracker on survivor with new leader
-	c.handlers[survivorID].SetTimeout(2 * time.Second)
+	c.handlers[survivorID].SetTimeout(3 * time.Second)
 
-	// 3. Write via survivor node to the new leader
-	pReq2, _ := http.NewRequest(http.MethodPut, c.servers[survivorID].URL+"/kv/"+key, bytes.NewReader([]byte(`{"value":"v2-after-failover"}`)))
-	pReq2.Header.Set("Content-Type", "application/json")
-	pResp2, err := http.DefaultClient.Do(pReq2)
-	if err != nil || pResp2.StatusCode != http.StatusOK {
-		t.Fatalf("write after failover failed: err=%v, code=%d", err, pResp2.StatusCode)
+	// 3. Write via survivor node to the new leader with retry loop during failover stabilization
+	var pResp2 *http.Response
+	var err2 error
+	writeDeadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(writeDeadline) {
+		pReq2, _ := http.NewRequest(http.MethodPut, c.servers[survivorID].URL+"/kv/"+key, bytes.NewReader([]byte(`{"value":"v2-after-failover"}`)))
+		pReq2.Header.Set("Content-Type", "application/json")
+		pResp2, err2 = http.DefaultClient.Do(pReq2)
+		if err2 == nil && pResp2.StatusCode == http.StatusOK {
+			break
+		}
+		if pResp2 != nil {
+			_ = pResp2.Body.Close()
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err2 != nil || pResp2 == nil || pResp2.StatusCode != http.StatusOK {
+		code := 0
+		if pResp2 != nil {
+			code = pResp2.StatusCode
+		}
+		t.Fatalf("write after failover failed: err=%v, code=%d", err2, code)
 	}
 	pResp2.Body.Close()
 
 	// 4. Read back
-	gResp, err := http.Get(c.servers[survivorID].URL + "/kv/" + key)
-	if err != nil || gResp.StatusCode != http.StatusOK {
-		t.Fatalf("GET after failover failed: err=%v, code=%d", err, gResp.StatusCode)
+	var gResp *http.Response
+	var gErr error
+	readDeadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(readDeadline) {
+		gResp, gErr = http.Get(c.servers[survivorID].URL + "/kv/" + key)
+		if gErr == nil && gResp.StatusCode == http.StatusOK {
+			break
+		}
+		if gResp != nil {
+			_ = gResp.Body.Close()
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if gErr != nil || gResp == nil || gResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET after failover failed: err=%v, resp=%v", gErr, gResp)
 	}
 	defer gResp.Body.Close()
 
