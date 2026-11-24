@@ -60,9 +60,10 @@ type SSTableWriter struct {
 
 	entriesWritten uint64
 	currentOffset  uint64
-	minKey         string
-	maxKey         string
-	lastWrittenKey string
+	minKey            string
+	maxKey            string
+	lastWrittenKey    string
+	lastWrittenOffset uint64
 
 	sparseIndex []IndexEntry
 	bloomKeys   []string
@@ -127,6 +128,7 @@ func (w *SSTableWriter) Append(entry MemtableEntry) error {
 	}
 
 	entryOffset := w.currentOffset
+	w.lastWrittenOffset = entryOffset
 
 	// Check if this key should be indexed in the sparse index
 	if w.entriesWritten%uint64(w.sparseInterval) == 0 {
@@ -190,6 +192,14 @@ func (w *SSTableWriter) Finish() (*SSTableMetadata, error) {
 	dataLength := w.currentOffset - dataOffset
 
 	// 1. Serialize Sparse Index
+	// Ensure the sparse index always indexes the final entry so [minKey, maxKey] is fully covered
+	if w.entriesWritten > 0 && (len(w.sparseIndex) == 0 || w.sparseIndex[len(w.sparseIndex)-1].Key != w.lastWrittenKey) {
+		w.sparseIndex = append(w.sparseIndex, IndexEntry{
+			Key:    w.lastWrittenKey,
+			Offset: w.lastWrittenOffset,
+		})
+	}
+
 	indexOffset := w.currentOffset
 	var indexBuf bytes.Buffer
 	var countBuf [4]byte
