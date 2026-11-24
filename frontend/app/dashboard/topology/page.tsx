@@ -1,10 +1,10 @@
 'use client';
 
-import React from 'react';
+import React, { useState } from 'react';
 import DashboardLayout from '@/components/dashboard/DashboardLayout';
 import TopologyHeader from '@/components/topology/TopologyHeader';
 import TopologySummary from '@/components/topology/TopologySummary';
-import TopologyControls from '@/components/topology/TopologyControls';
+import TopologyControls, { CameraPreset } from '@/components/topology/TopologyControls';
 import ClusterScene from '@/components/topology/ClusterScene';
 import NodeInspector from '@/components/topology/NodeInspector';
 import NodeInventory from '@/components/topology/NodeInventory';
@@ -26,6 +26,8 @@ export default function TopologyPage() {
     viewMode,
     networkMode,
     isLiveUpdates,
+    isLiveBackend,
+    isSimulationMode,
     connectionState,
     setSelectedNodeId,
     setHoveredLinkId,
@@ -36,7 +38,17 @@ export default function TopologyPage() {
     setIsLiveUpdates,
     refreshSnapshot,
     toggleNodeOffline,
+    toggleSimulationMode,
   } = useClusterTopology();
+
+  const [cameraPreset, setCameraPreset] = useState<CameraPreset | null>(null);
+
+  const handleCameraPreset = (preset: CameraPreset) => {
+    setCameraPreset(preset);
+    if (preset === 'reset') {
+      setSelectedNodeId(null);
+    }
+  };
 
   return (
     <DashboardLayout activeNav="topology" onRefresh={refreshSnapshot}>
@@ -58,13 +70,16 @@ export default function TopologyPage() {
 
         {/* 03. INTERACTIVE 3D/2D CLUSTER EXPLORER & NODE INSPECTOR */}
         <div className="space-y-3">
-          {/* Controls Bar */}
+          {/* Controls Bar with Camera Presets and Live/Demo Mode Switcher */}
           <TopologyControls
             viewMode={viewMode}
             networkMode={networkMode}
+            isLiveBackend={isLiveBackend}
+            isSimulationMode={isSimulationMode}
             onViewModeChange={setViewMode}
             onNetworkModeChange={setNetworkMode}
-            onResetView={() => setSelectedNodeId(null)}
+            onCameraPreset={handleCameraPreset}
+            onToggleSimulationMode={toggleSimulationMode}
           />
 
           {/* 3D Visualizer Canvas & Node Inspector */}
@@ -77,6 +92,7 @@ export default function TopologyPage() {
                 networkMode={networkMode}
                 selectedNodeId={selectedNodeId}
                 selectedShardId={shardFilter === 'all' ? 'all' : parseInt(shardFilter, 10)}
+                cameraPreset={cameraPreset}
                 onSelectNode={setSelectedNodeId}
                 hoveredLinkId={hoveredLinkId}
                 onHoverLink={setHoveredLinkId}

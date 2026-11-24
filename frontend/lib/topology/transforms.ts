@@ -14,6 +14,96 @@ import {
   PHYSICAL_NETWORK_PEERS,
 } from './layout';
 
+// Helper to format ISO timestamp into human relative string without inventing fake metrics
+export function formatRelativeTime(isoString?: string): string {
+  if (!isoString) return 'Active';
+  try {
+    const d = new Date(isoString);
+    const now = Date.now();
+    const diffMs = now - d.getTime();
+    if (diffMs < 0 || diffMs < 1000) return 'Just now';
+    if (diffMs < 60000) return `${Math.floor(diffMs / 1000)}s ago`;
+    if (diffMs < 3600000) return `${Math.floor(diffMs / 60000)}m ago`;
+    return d.toLocaleTimeString('en-US', { hour12: false });
+  } catch {
+    return 'Active';
+  }
+}
+
+// Transform real live Go backend /cluster/health response into PhysicalNode[]
+export function transformLiveBackendToNodes(
+  health: any,
+  shardsData?: any,
+  nodesData?: any
+): PhysicalNode[] {
+  const nodeIds =
+    nodesData?.nodes ||
+    (health?.nodes ? Object.keys(health.nodes) : ['node-a', 'node-b', 'node-c', 'node-d', 'node-e']);
+
+  const shardsList = shardsData?.shards || [];
+  const shardsMap = health?.shards || {};
+
+  return nodeIds.map((id: string) => {
+    const cfg = NODE_NETWORK_CONFIG[id];
+    const backendNode = health?.nodes ? health.nodes[id] : null;
+
+    const isOnline = backendNode ? backendNode.online : true;
+    const hostedShardIds: number[] = backendNode?.hosted_shard_ids || [];
+
+    // Map hosted shards
+    const hostedShards: HostedShardInfo[] = [];
+
+    // If backend gave hosted_shard_ids, use them; otherwise check shardsList or SHARD_CONFIG
+    const targetShardIds =
+      hostedShardIds.length > 0
+        ? hostedShardIds
+        : SHARD_CONFIG.filter((s) => s.replicas.includes(id)).map((s) => s.shardId);
+
+    targetShardIds.forEach((sid: number) => {
+      const defaultCfg = SHARD_CONFIG.find((s) => s.shardId === sid);
+      const shardDetail = shardsList.find((s: any) => s.id === sid);
+      const liveShardStatus = shardsMap[sid];
+
+      // Determine real leader
+      let leaderId = liveShardStatus?.current_leader || shardDetail?.leader || defaultCfg?.defaultLeader || '';
+      const isLeader = isOnline && leaderId === id;
+
+      hostedShards.push({
+        shardId: sid,
+        shardName: defaultCfg?.name || `Shard ${sid}`,
+        role: isLeader ? 'Leader' : 'Follower',
+        term: liveShardStatus?.current_term || defaultCfg?.term || 1,
+        commitIndex: liveShardStatus?.commit_index || defaultCfg?.commitIndex || 0,
+        appliedIndex: liveShardStatus?.last_applied_index || defaultCfg?.commitIndex || 0,
+        color: defaultCfg?.color || '#0891D5',
+      });
+    });
+
+    const leaderGroups = hostedShards.filter((s) => s.role === 'Leader').length;
+    const followerGroups = hostedShards.filter((s) => s.role === 'Follower').length;
+
+    return {
+      id,
+      name: cfg?.name || id,
+      status: isOnline ? 'online' : 'offline',
+      online: isOnline,
+      httpAddress: `127.0.0.1:${cfg?.httpPort || 2525}`,
+      raftAddress: `127.0.0.1:${cfg?.raftPort || 3525}`,
+      hostedShards,
+      raftGroupCount: hostedShards.length,
+      leaderGroupCount: leaderGroups,
+      followerGroupCount: followerGroups,
+      lastObservedActivity: isOnline
+        ? formatRelativeTime(backendNode?.last_observed_activity)
+        : 'Heartbeat lost (Offline)',
+      lastHeartbeatMs: 0,
+      position3D: DETERMINISTIC_3D_POSITIONS[id] || [0, 0, 0],
+      position2D: DETERMINISTIC_2D_POSITIONS[id] || { x: 50, y: 50 },
+    };
+  });
+}
+
+// Build node objects for local simulation mode
 export function buildNodesData(
   offlineNodeIds: Set<string> = new Set()
 ): PhysicalNode[] {
@@ -57,14 +147,14 @@ export function buildNodesData(
       name: cfg?.name || id,
       status: isOnline ? 'online' : 'offline',
       online: isOnline,
-      httpAddress: `127.0.0.1:${cfg?.httpPort || 8000}`,
-      raftAddress: `127.0.0.1:${cfg?.raftPort || 9000}`,
+      httpAddress: `127.0.0.1:${cfg?.httpPort || 2525}`,
+      raftAddress: `127.0.0.1:${cfg?.raftPort || 3525}`,
       hostedShards,
       raftGroupCount: hostedShards.length,
       leaderGroupCount: leaderGroups,
       followerGroupCount: followerGroups,
-      lastObservedActivity: isOnline ? '42 ms ago' : 'Disconnected',
-      lastHeartbeatMs: isOnline ? 42 : 15000,
+      lastObservedActivity: isOnline ? 'Active (Demo)' : 'Disconnected',
+      lastHeartbeatMs: 0,
       position3D: DETERMINISTIC_3D_POSITIONS[id] || [0, 0, 0],
       position2D: DETERMINISTIC_2D_POSITIONS[id] || { x: 50, y: 50 },
     };
@@ -79,7 +169,7 @@ export function buildNetworkLinks(
   const nodeMap = new Map(nodes.map((n) => [n.id, n]));
 
   if (networkMode === 'physical') {
-    return PHYSICAL_NETWORK_PEERS.map((peer, idx) => {
+    return PHYSICAL_NETWORK_PEERS.map((peer) => {
       const srcNode = nodeMap.get(peer.source);
       const dstNode = nodeMap.get(peer.destination);
       const bothOnline = srcNode?.online && dstNode?.online;
@@ -91,8 +181,7 @@ export function buildNetworkLinks(
         destination: peer.destination,
         type: 'physical',
         status: bothOnline ? 'healthy' : oneOffline ? 'disconnected' : 'idle',
-        latencyMs: bothOnline ? peer.latencyMs : undefined,
-        lastContact: bothOnline ? `${Math.round(peer.latencyMs * 15)} ms ago` : 'Disconnected',
+        lastContact: bothOnline ? 'Connected' : 'Connection unreachable',
         activeTraffic: bothOnline ? true : false,
       };
     });
@@ -105,15 +194,14 @@ export function buildNetworkLinks(
       return;
     }
 
-    // Determine current leader
+    // Determine current leader from node hosted shard definitions
     let currentLeader = sh.defaultLeader;
-    const leaderNode = nodeMap.get(currentLeader);
-    if (!leaderNode?.online) {
-      const survivor = sh.replicas.find((r) => nodeMap.get(r)?.online);
-      if (survivor) {
-        currentLeader = survivor;
+    nodes.forEach((n) => {
+      const matching = n.hostedShards.find((s) => s.shardId === sh.shardId);
+      if (matching && matching.role === 'Leader' && n.online) {
+        currentLeader = n.id;
       }
-    }
+    });
 
     const liveLeader = nodeMap.get(currentLeader);
 
@@ -129,8 +217,7 @@ export function buildNetworkLinks(
         type: 'raft',
         shardId: sh.shardId,
         status: healthy ? 'healthy' : 'disconnected',
-        latencyMs: healthy ? 1.4 : undefined,
-        lastContact: healthy ? '18 ms ago (AppendEntries heartbeat)' : 'Heartbeat lost',
+        lastContact: healthy ? 'Active AppendEntries stream' : 'Heartbeat lost',
         activeTraffic: healthy ? true : false,
       });
     });
@@ -144,7 +231,6 @@ export function calculateClusterSummary(nodes: PhysicalNode[]): ClusterSummaryDa
   const availableNodes = nodes.filter((n) => n.online).length;
   const offlineNodes = totalNodes - availableNodes;
 
-  // Shard health: each shard has RF=3, needs >=2 alive replicas for majority quorum
   let healthyShards = 0;
   let leaderlessShards = 0;
 
@@ -182,47 +268,47 @@ export function calculateClusterSummary(nodes: PhysicalNode[]): ClusterSummaryDa
 export const INITIAL_TOPOLOGY_EVENTS: TopologyEvent[] = [
   {
     id: 'evt-1',
-    timestamp: '07:30:21',
+    timestamp: '14:30:21',
     nodeId: 'node-a',
     type: 'HEARTBEAT_ACK',
     category: 'NETWORK',
-    description: 'Heartbeat ack received from Node B and Node C over TCP/HTTP mesh',
+    description: 'Heartbeat ack received across TCP peer transport mesh',
     level: 'info',
   },
   {
     id: 'evt-2',
-    timestamp: '07:30:19',
+    timestamp: '14:30:19',
     nodeId: 'node-d',
     type: 'ENTRY_COMMITTED',
     category: 'RAFT',
-    description: 'Shard 1 committed log index 12450 across majority quorum (RF=3)',
+    description: 'Shard 1 committed log index across majority quorum (RF=3)',
     level: 'success',
   },
   {
     id: 'evt-3',
-    timestamp: '07:30:16',
+    timestamp: '14:30:16',
     nodeId: 'node-b',
     type: 'LEADER_ELECTED',
     category: 'RAFT',
-    description: 'Shard 2 leader heartbeat confirmed for Term 5',
+    description: 'Shard 2 leader election confirmed',
     level: 'info',
   },
   {
     id: 'evt-4',
-    timestamp: '07:30:12',
+    timestamp: '14:30:12',
     nodeId: 'node-e',
     type: 'REPLICA_CATCHUP_COMPLETED',
     category: 'STORAGE',
-    description: 'Node E catch-up stream synchronized 4 entries from leader Node D',
+    description: 'Node E catch-up stream synchronized from leader Node D',
     level: 'success',
   },
   {
     id: 'evt-5',
-    timestamp: '07:30:08',
+    timestamp: '14:30:08',
     nodeId: 'node-c',
     type: 'NODE_JOINED',
     category: 'CLUSTER',
-    description: 'Physical node Node C membership verified on consistent hash ring',
+    description: 'Physical node Node C membership confirmed on hash ring',
     level: 'info',
   },
 ];

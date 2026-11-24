@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useMemo, useCallback } from 'react';
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   PhysicalNode,
   NetworkLink,
@@ -14,14 +14,29 @@ import {
 } from '../lib/topology/types';
 import {
   buildNodesData,
+  transformLiveBackendToNodes,
   buildNetworkLinks,
   calculateClusterSummary,
   INITIAL_TOPOLOGY_EVENTS,
 } from '../lib/topology/transforms';
-import { subscribeToClusterEvents, fetchClusterHealth } from '../lib/topology/api';
+import { subscribeToClusterEvents, fetchLiveClusterData } from '../lib/topology/api';
 
 export function useClusterTopology() {
-  const [offlineNodeIds, setOfflineNodeIds] = useState<Set<string>>(new Set());
+  // Mode: Real Go Backend vs Interactive Demo Simulation
+  const [isLiveBackend, setIsLiveBackend] = useState<boolean>(false);
+  const [isSimulationMode, setIsSimulationMode] = useState<boolean>(false);
+
+  // Real backend payload state
+  const [liveBackendData, setLiveBackendData] = useState<{
+    health: any | null;
+    shards: any | null;
+    nodes: any | null;
+  }>({ health: null, shards: null, nodes: null });
+
+  // Simulation mode overrides
+  const [simulationOfflineNodeIds, setSimulationOfflineNodeIds] = useState<Set<string>>(new Set());
+
+  // Selection & UI state
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [hoveredLinkId, setHoveredLinkId] = useState<string | null>(null);
 
@@ -37,10 +52,17 @@ export function useClusterTopology() {
   const [events, setEvents] = useState<TopologyEvent[]>(INITIAL_TOPOLOGY_EVENTS);
   const [lastRefreshed, setLastRefreshed] = useState<Date>(new Date());
 
-  // Derive Nodes
+  // Derive Nodes: from live backend if available & not in forced simulation mode, else local model
   const nodes = useMemo(() => {
-    return buildNodesData(offlineNodeIds);
-  }, [offlineNodeIds]);
+    if (isLiveBackend && !isSimulationMode && liveBackendData.health) {
+      return transformLiveBackendToNodes(
+        liveBackendData.health,
+        liveBackendData.shards,
+        liveBackendData.nodes
+      );
+    }
+    return buildNodesData(simulationOfflineNodeIds);
+  }, [isLiveBackend, isSimulationMode, liveBackendData, simulationOfflineNodeIds]);
 
   // Derive Links
   const links = useMemo(() => {
@@ -85,32 +107,44 @@ export function useClusterTopology() {
     return links.find((l) => l.id === hoveredLinkId) || null;
   }, [links, hoveredLinkId]);
 
-  // Refresh Snapshot Handler
+  // Refresh Snapshot from Real Backend
   const refreshSnapshot = useCallback(async () => {
     setLastRefreshed(new Date());
-    const data = await fetchClusterHealth();
-    if (data && data.nodes) {
-      setConnectionState('connected');
-      const offIds = new Set<string>();
-      Object.keys(data.nodes).forEach((k) => {
-        if (!data.nodes[k].online) {
-          offIds.add(k);
-        }
-      });
-      setOfflineNodeIds(offIds);
-    }
-  }, []);
+    const data = await fetchLiveClusterData();
 
-  // Toggle Live Node Offline / Online (Chaos Simulation)
+    if (data.isLive && data.health) {
+      setIsLiveBackend(true);
+      setConnectionState('connected');
+      setLiveBackendData({
+        health: data.health,
+        shards: data.shards,
+        nodes: data.nodes,
+      });
+      if (data.events && data.events.length > 0) {
+        setEvents((prev) => {
+          const existingIds = new Set(prev.map((e) => e.id));
+          const newUnique = data.events!.filter((e) => !existingIds.has(e.id));
+          return [...newUnique, ...prev].slice(0, 30);
+        });
+      }
+    } else {
+      // Real backend not reachable
+      if (!isSimulationMode) {
+        setIsLiveBackend(false);
+      }
+    }
+  }, [isSimulationMode]);
+
+  // Toggle Live Node Offline / Online (Simulation Mode)
   const toggleNodeOffline = useCallback((nodeId: string) => {
-    setOfflineNodeIds((prev) => {
+    setIsSimulationMode(true);
+    setSimulationOfflineNodeIds((prev) => {
       const next = new Set(prev);
       const isCurrentlyOffline = next.has(nodeId);
       const nowStr = new Date().toLocaleTimeString('en-US', { hour12: false });
 
       if (isCurrentlyOffline) {
         next.delete(nodeId);
-        // Add Recovery Event
         setEvents((evts) => [
           {
             id: `chaos-rec-${Date.now()}`,
@@ -121,11 +155,10 @@ export function useClusterTopology() {
             description: `Physical node ${nodeId} reconnected and rejoined peer mesh.`,
             level: 'success',
           },
-          ...evts.slice(0, 19),
+          ...evts.slice(0, 24),
         ]);
       } else {
         next.add(nodeId);
-        // Add Disconnect Event
         setEvents((evts) => [
           {
             id: `chaos-disc-${Date.now()}`,
@@ -136,31 +169,49 @@ export function useClusterTopology() {
             description: `Heartbeat lost: physical node ${nodeId} transitioned to OFFLINE.`,
             level: 'error',
           },
-          ...evts.slice(0, 19),
+          ...evts.slice(0, 24),
         ]);
       }
       return next;
     });
   }, []);
 
+  const toggleSimulationMode = useCallback(() => {
+    setIsSimulationMode((prev) => {
+      const next = !prev;
+      if (!next) {
+        setSimulationOfflineNodeIds(new Set());
+        refreshSnapshot();
+      }
+      return next;
+    });
+  }, [refreshSnapshot]);
+
   // WebSocket Subscription & periodic poll
   useEffect(() => {
     if (!isLiveUpdates) return;
 
+    refreshSnapshot();
+
     const unsubscribe = subscribeToClusterEvents(
       (newEvt) => {
-        setEvents((prev) => [newEvt, ...prev.slice(0, 19)]);
+        setEvents((prev) => [newEvt, ...prev.slice(0, 24)]);
+        // When a cluster event arrives, refresh health snapshot
+        refreshSnapshot();
       },
       (state) => {
         setConnectionState(state);
       }
     );
 
-    // Initial check
-    refreshSnapshot();
+    // Periodic poll every 2.5s for live status
+    const pollInterval = setInterval(() => {
+      refreshSnapshot();
+    }, 2500);
 
     return () => {
       unsubscribe();
+      clearInterval(pollInterval);
     };
   }, [isLiveUpdates, refreshSnapshot]);
 
@@ -179,6 +230,8 @@ export function useClusterTopology() {
     viewMode,
     networkMode,
     isLiveUpdates,
+    isLiveBackend,
+    isSimulationMode,
     connectionState,
     lastRefreshed,
     setSelectedNodeId,
@@ -190,5 +243,6 @@ export function useClusterTopology() {
     setIsLiveUpdates,
     refreshSnapshot,
     toggleNodeOffline,
+    toggleSimulationMode,
   };
 }

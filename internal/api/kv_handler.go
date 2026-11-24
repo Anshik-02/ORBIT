@@ -372,8 +372,27 @@ func RegisterKVRoutes(mux *http.ServeMux, h *KVHandler) {
 
 	if h.wsHub != nil {
 		h.wsHub.RegisterRoutes(mux, "/ws/events")
-		h.wsHub.RegisterRoutes(mux, "/cluster/events")
 		h.wsHub.RegisterRoutes(mux, "/api/v1/ws/events")
+		// Support both WebSocket and standard HTTP GET on /cluster/events
+		mux.HandleFunc("/cluster/events", func(w http.ResponseWriter, r *http.Request) {
+			if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+				h.wsHub.HandleWebSocket(w, r)
+				return
+			}
+			if r.Method != http.MethodGet {
+				w.Header().Set("Allow", "GET")
+				writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+				return
+			}
+			var evts []observability.ClusterEvent
+			if h.eventHub != nil {
+				evts = h.eventHub.EventsSince(0)
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"events": evts,
+				"total":  len(evts),
+			})
+		})
 	}
 
 	if h.eventBus != nil {

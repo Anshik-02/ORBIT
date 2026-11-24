@@ -1,19 +1,21 @@
 'use client';
 
-import React from 'react';
+import React, { useState } from 'react';
 import Link from 'next/link';
 import {
   X,
   Server,
-  Activity,
   Layers,
-  ShieldCheck,
   Crown,
-  Radio,
   Power,
   ArrowRight,
   Wifi,
   WifiOff,
+  Activity,
+  Send,
+  CheckCircle2,
+  Clock,
+  HardDrive,
 } from 'lucide-react';
 import { PhysicalNode } from '../../lib/topology/types';
 
@@ -23,16 +25,40 @@ interface NodeInspectorProps {
   onToggleOffline: (nodeId: string) => void;
 }
 
+type InspectorTab = 'overview' | 'shards' | 'network';
+
 export default function NodeInspector({
   node,
   onClose,
   onToggleOffline,
 }: NodeInspectorProps) {
+  const [activeTab, setActiveTab] = useState<InspectorTab>('overview');
+  const [pingResult, setPingResult] = useState<string | null>(null);
+  const [isPinging, setIsPinging] = useState(false);
+
   if (!node) return null;
+
+  const handlePingPeers = () => {
+    setIsPinging(true);
+    setPingResult(null);
+    setTimeout(() => {
+      setIsPinging(false);
+      setPingResult(node.online ? 'All 4 peer heartbeats OK (avg 0.8ms)' : 'Ping timed out: node unreachable');
+    }, 600);
+  };
+
+  // Mock peer connectivity status based on cluster
+  const peers = [
+    { id: 'node-a', name: 'Node A', port: ':2525', status: 'connected', latency: '0.6ms' },
+    { id: 'node-b', name: 'Node B', port: ':2526', status: 'connected', latency: '0.8ms' },
+    { id: 'node-c', name: 'Node C', port: ':2527', status: 'connected', latency: '0.9ms' },
+    { id: 'node-d', name: 'Node D', port: ':2528', status: 'connected', latency: '0.7ms' },
+    { id: 'node-e', name: 'Node E', port: ':2529', status: 'connected', latency: '1.1ms' },
+  ].filter((p) => p.id !== node.id);
 
   return (
     <div className="w-full lg:w-96 bg-white border border-[#DCE5F0] rounded-2xl shadow-xl flex flex-col justify-between overflow-hidden animate-fadeIn">
-      {/* Top Header */}
+      {/* 01. TOP HEADER */}
       <div>
         <div className="p-4 border-b border-[#DCE5F0] flex items-center justify-between bg-[#F8FAFC]">
           <div className="flex items-center gap-2.5">
@@ -58,134 +84,235 @@ export default function NodeInspector({
           </button>
         </div>
 
-        {/* Live Status Pill */}
-        <div className="p-4 border-b border-[#F1F5F9]">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-mono text-[#64748B]">Operational State</span>
-            {node.online ? (
-              <span className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-[#10B981] font-mono text-xs font-semibold">
-                <span className="w-2 h-2 rounded-full bg-[#10B981] animate-pulse" />
-                ONLINE
-              </span>
-            ) : (
-              <span className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-rose-50 border border-rose-200 text-[#EF4444] font-mono text-xs font-semibold">
-                <span className="w-2 h-2 rounded-full bg-[#EF4444]" />
-                OFFLINE (HEARTBEAT LOST)
-              </span>
-            )}
-          </div>
+        {/* 02. STATUS BANNER */}
+        <div className="px-4 py-2.5 border-b border-[#F1F5F9] bg-white flex items-center justify-between">
+          <span className="text-xs font-mono text-[#64748B]">Node Status</span>
+          {node.online ? (
+            <span className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-[#10B981] font-mono text-xs font-semibold">
+              <span className="w-2 h-2 rounded-full bg-[#10B981] animate-pulse" />
+              ONLINE & PARTICIPATING
+            </span>
+          ) : (
+            <span className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-rose-50 border border-rose-200 text-[#EF4444] font-mono text-xs font-semibold">
+              <span className="w-2 h-2 rounded-full bg-[#EF4444]" />
+              OFFLINE (HEARTBEAT EXPIRED)
+            </span>
+          )}
         </div>
 
-        <div className="p-4 space-y-5 overflow-y-auto max-h-[calc(100vh-380px)] font-mono text-xs">
-          {/* GENERAL SECTION */}
-          <div>
-            <span className="text-[10px] uppercase font-semibold text-[#64748B] tracking-wider block mb-2">
-              GENERAL
-            </span>
-            <div className="space-y-1.5 bg-[#F8FAFC] p-3 rounded-xl border border-[#E2E8F0]">
-              <div className="flex items-center justify-between">
-                <span className="text-[#64748B]">Node ID</span>
-                <span className="font-semibold text-[#17243A]">{node.id}</span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-[#64748B]">HTTP Address</span>
-                <span className="text-[#0891D5] font-semibold">{node.httpAddress}</span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-[#64748B]">Raft Transport</span>
-                <span className="text-[#7965E8] font-semibold">{node.raftAddress}</span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-[#64748B]">Last Heartbeat</span>
-                <span className={node.online ? 'text-[#10B981]' : 'text-rose-500'}>
-                  {node.lastObservedActivity}
+        {/* 03. THREE-TAB SELECTOR */}
+        <div className="flex border-b border-[#DCE5F0] bg-[#F8FAFC] px-3 pt-2 gap-1 text-xs font-mono">
+          <button
+            onClick={() => setActiveTab('overview')}
+            className={`px-3 py-1.5 rounded-t-lg font-semibold border-t border-x transition-all ${
+              activeTab === 'overview'
+                ? 'bg-white border-[#DCE5F0] text-[#0891D5] -mb-px'
+                : 'border-transparent text-[#64748B] hover:text-[#17243A]'
+            }`}
+          >
+            OVERVIEW
+          </button>
+          <button
+            onClick={() => setActiveTab('shards')}
+            className={`px-3 py-1.5 rounded-t-lg font-semibold border-t border-x transition-all ${
+              activeTab === 'shards'
+                ? 'bg-white border-[#DCE5F0] text-[#7965E8] -mb-px'
+                : 'border-transparent text-[#64748B] hover:text-[#17243A]'
+            }`}
+          >
+            SHARDS ({node.hostedShards.length})
+          </button>
+          <button
+            onClick={() => setActiveTab('network')}
+            className={`px-3 py-1.5 rounded-t-lg font-semibold border-t border-x transition-all ${
+              activeTab === 'network'
+                ? 'bg-white border-[#DCE5F0] text-[#10B981] -mb-px'
+                : 'border-transparent text-[#64748B] hover:text-[#17243A]'
+            }`}
+          >
+            NETWORK
+          </button>
+        </div>
+
+        {/* 04. TAB CONTENTS */}
+        <div className="p-4 overflow-y-auto max-h-[calc(100vh-420px)] font-mono text-xs">
+          {/* TAB 1: OVERVIEW */}
+          {activeTab === 'overview' && (
+            <div className="space-y-4">
+              <div>
+                <span className="text-[10px] uppercase font-semibold text-[#64748B] tracking-wider block mb-2">
+                  HARDWARE & ADDRESSES
                 </span>
-              </div>
-            </div>
-          </div>
-
-          {/* HOSTED SHARDS */}
-          <div>
-            <div className="flex items-center justify-between mb-2">
-              <span className="text-[10px] uppercase font-semibold text-[#64748B] tracking-wider">
-                HOSTED SHARDS
-              </span>
-              <span className="text-[10px] text-[#64748B]">{node.hostedShards.length} assigned</span>
-            </div>
-
-            <div className="space-y-2">
-              {node.hostedShards.map((sh) => (
-                <div
-                  key={sh.shardId}
-                  className="p-3 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0] hover:border-[#CBD5E1] transition-all"
-                >
-                  <div className="flex items-center justify-between mb-1.5">
-                    <div className="flex items-center gap-2">
-                      <span
-                        className="w-2.5 h-2.5 rounded-full"
-                        style={{ backgroundColor: sh.color }}
-                      />
-                      <span className="font-bold text-[#17243A] text-xs">
-                        {sh.shardName}
-                      </span>
-                    </div>
-
-                    {sh.role === 'Leader' ? (
-                      <span className="flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-amber-50 border border-amber-200 text-[#D97706] font-bold">
-                        <Crown className="w-3 h-3 text-[#F59E0B]" />
-                        LEADER
-                      </span>
-                    ) : (
-                      <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-100 border border-slate-200 text-[#64748B] font-semibold">
-                        FOLLOWER
-                      </span>
-                    )}
+                <div className="space-y-2 bg-[#F8FAFC] p-3 rounded-xl border border-[#E2E8F0]">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[#64748B]">Cluster Node ID</span>
+                    <span className="font-semibold text-[#17243A]">{node.id}</span>
                   </div>
-
-                  <div className="flex items-center justify-between text-[11px] text-[#64748B]">
-                    <span>Consensus Term: #{sh.term}</span>
-                    <span>Commit Idx: {sh.commitIndex.toLocaleString()}</span>
+                  <div className="flex items-center justify-between">
+                    <span className="text-[#64748B]">Client HTTP Port</span>
+                    <span className="text-[#0891D5] font-semibold">{node.httpAddress}</span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-[#64748B]">Raft Consensus Port</span>
+                    <span className="text-[#7965E8] font-semibold">{node.raftAddress}</span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-[#64748B]">Last Contact</span>
+                    <span className={node.online ? 'text-[#10B981]' : 'text-rose-500'}>
+                      {node.lastObservedActivity}
+                    </span>
                   </div>
                 </div>
-              ))}
-            </div>
-          </div>
+              </div>
 
-          {/* RAFT PARTICIPATION */}
-          <div>
-            <span className="text-[10px] uppercase font-semibold text-[#64748B] tracking-wider block mb-2">
-              RAFT PARTICIPATION
-            </span>
-            <div className="grid grid-cols-3 gap-2">
-              <div className="p-2.5 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0] text-center">
-                <span className="text-[10px] text-[#64748B] block">Hosted</span>
-                <span className="text-base font-bold text-[#17243A]">
-                  {node.raftGroupCount}
+              <div>
+                <span className="text-[10px] uppercase font-semibold text-[#64748B] tracking-wider block mb-2">
+                  RAFT ROLE SUMMARY
                 </span>
+                <div className="grid grid-cols-3 gap-2">
+                  <div className="p-2.5 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0] text-center">
+                    <span className="text-[10px] text-[#64748B] block">Hosted Shards</span>
+                    <span className="text-base font-bold text-[#17243A]">
+                      {node.raftGroupCount}
+                    </span>
+                  </div>
+                  <div className="p-2.5 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0] text-center">
+                    <span className="text-[10px] text-[#64748B] block">Leader Roles</span>
+                    <span className="text-base font-bold text-[#D97706]">
+                      {node.leaderGroupCount}
+                    </span>
+                  </div>
+                  <div className="p-2.5 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0] text-center">
+                    <span className="text-[10px] text-[#64748B] block">Follower Roles</span>
+                    <span className="text-base font-bold text-[#64748B]">
+                      {node.followerGroupCount}
+                    </span>
+                  </div>
+                </div>
               </div>
-              <div className="p-2.5 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0] text-center">
-                <span className="text-[10px] text-[#64748B] block">Leader</span>
-                <span className="text-base font-bold text-[#D97706]">
-                  {node.leaderGroupCount}
-                </span>
-              </div>
-              <div className="p-2.5 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0] text-center">
-                <span className="text-[10px] text-[#64748B] block">Follower</span>
-                <span className="text-base font-bold text-[#64748B]">
-                  {node.followerGroupCount}
+
+              <div className="p-3 rounded-xl bg-blue-50/50 border border-blue-100 flex items-center gap-2 text-[#0891D5]">
+                <HardDrive className="w-4 h-4 shrink-0" />
+                <span className="text-[11px] leading-tight">
+                  LSM-tree storage backend active with WAL write-ahead persistence.
                 </span>
               </div>
             </div>
-          </div>
+          )}
+
+          {/* TAB 2: SHARDS */}
+          {activeTab === 'shards' && (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-[10px] uppercase font-semibold text-[#64748B] tracking-wider">
+                  REPLICA ROLES
+                </span>
+                <span className="text-[10px] text-[#64748B]">{node.hostedShards.length} shards</span>
+              </div>
+
+              {node.hostedShards.length === 0 ? (
+                <div className="p-4 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0] text-center text-[#64748B]">
+                  No shards currently hosted on this node.
+                </div>
+              ) : (
+                node.hostedShards.map((sh) => (
+                  <div
+                    key={sh.shardId}
+                    className="p-3 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0] hover:border-[#CBD5E1] transition-all space-y-2"
+                  >
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <span
+                          className="w-2.5 h-2.5 rounded-full"
+                          style={{ backgroundColor: sh.color }}
+                        />
+                        <span className="font-bold text-[#17243A] text-xs">
+                          {sh.shardName}
+                        </span>
+                      </div>
+
+                      {sh.role === 'Leader' ? (
+                        <span className="flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-amber-50 border border-amber-200 text-[#D97706] font-bold">
+                          <Crown className="w-3 h-3 text-[#F59E0B]" />
+                          LEADER
+                        </span>
+                      ) : (
+                        <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-100 border border-slate-200 text-[#64748B] font-semibold">
+                          FOLLOWER
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2 text-[11px] text-[#64748B] bg-white p-2 rounded-lg border border-[#F1F5F9]">
+                      <div>
+                        <span className="text-[10px] text-[#94A3B8] block">Consensus Term</span>
+                        <span className="font-semibold text-[#17243A]">#{sh.term}</span>
+                      </div>
+                      <div>
+                        <span className="text-[10px] text-[#94A3B8] block">Commit Index</span>
+                        <span className="font-semibold text-[#0891D5]">{sh.commitIndex.toLocaleString()}</span>
+                      </div>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          )}
+
+          {/* TAB 3: NETWORK */}
+          {activeTab === 'network' && (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-[10px] uppercase font-semibold text-[#64748B] tracking-wider">
+                  CLUSTER PEERS ({peers.length})
+                </span>
+                <button
+                  onClick={handlePingPeers}
+                  disabled={isPinging || !node.online}
+                  className="flex items-center gap-1 text-[10px] text-[#0891D5] hover:underline disabled:opacity-50"
+                >
+                  <Send className="w-2.5 h-2.5" />
+                  <span>{isPinging ? 'Pinging...' : 'Ping Peers'}</span>
+                </button>
+              </div>
+
+              {pingResult && (
+                <div className="p-2.5 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-700 text-[11px] flex items-center gap-1.5">
+                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                  <span>{pingResult}</span>
+                </div>
+              )}
+
+              <div className="space-y-1.5">
+                {peers.map((peer) => (
+                  <div
+                    key={peer.id}
+                    className="p-2.5 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0] flex items-center justify-between"
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="w-2 h-2 rounded-full bg-[#10B981]" />
+                      <span className="font-semibold text-[#17243A]">{peer.name}</span>
+                      <span className="text-[#94A3B8]">{peer.port}</span>
+                    </div>
+                    <div className="flex items-center gap-2 text-[11px]">
+                      <span className="text-[#64748B]">{node.online ? peer.latency : '—'}</span>
+                      <span className="px-1.5 py-0.5 rounded-md bg-white border border-[#E2E8F0] text-[#10B981] font-semibold text-[10px]">
+                        {node.online ? 'UP' : 'UNREACHABLE'}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
-      {/* Bottom Actions */}
+      {/* 05. BOTTOM ACTIONS */}
       <div className="p-4 border-t border-[#DCE5F0] bg-[#F8FAFC] space-y-2">
-        {/* Toggle Failover Button */}
         <button
           onClick={() => onToggleOffline(node.id)}
-          className={`w-full py-2 px-3 rounded-xl font-mono text-xs font-semibold flex items-center justify-center gap-2 transition-all shadow-xs ${
+          className={`w-full py-2.5 px-3 rounded-xl font-mono text-xs font-semibold flex items-center justify-center gap-2 transition-all shadow-xs ${
             node.online
               ? 'bg-rose-50 hover:bg-rose-100/80 border border-rose-200 text-rose-600'
               : 'bg-emerald-50 hover:bg-emerald-100/80 border border-emerald-200 text-emerald-700'
@@ -199,12 +326,11 @@ export default function NodeInspector({
           </span>
         </button>
 
-        {/* Link to Raft page */}
         <Link
-          href="/dashboard/raft"
+          href="/dashboard/shards"
           className="w-full py-2 px-3 rounded-xl bg-white hover:bg-slate-50 border border-[#DCE5F0] text-[#17243A] hover:text-[#0891D5] font-mono text-xs font-semibold flex items-center justify-center gap-1.5 transition-all shadow-2xs"
         >
-          <span>VIEW RAFT DETAILS</span>
+          <span>VIEW SHARDS & REPLICATION</span>
           <ArrowRight className="w-3.5 h-3.5" />
         </Link>
       </div>

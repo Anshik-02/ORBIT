@@ -20,11 +20,11 @@ export const NODE_NETWORK_CONFIG: Record<
   string,
   { name: string; httpPort: number; raftPort: number }
 > = {
-  'node-a': { name: 'Node A', httpPort: 8001, raftPort: 9001 },
-  'node-b': { name: 'Node B', httpPort: 8002, raftPort: 9002 },
-  'node-c': { name: 'Node C', httpPort: 8003, raftPort: 9003 },
-  'node-d': { name: 'Node D', httpPort: 8004, raftPort: 9004 },
-  'node-e': { name: 'Node E', httpPort: 8005, raftPort: 9005 },
+  'node-a': { name: 'Node A', httpPort: 2525, raftPort: 3525 },
+  'node-b': { name: 'Node B', httpPort: 2526, raftPort: 3526 },
+  'node-c': { name: 'Node C', httpPort: 2527, raftPort: 3527 },
+  'node-d': { name: 'Node D', httpPort: 2528, raftPort: 3528 },
+  'node-e': { name: 'Node E', httpPort: 2529, raftPort: 3529 },
 };
 
 export const SHARD_CONFIG = [

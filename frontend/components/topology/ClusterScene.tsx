@@ -8,6 +8,7 @@ import {
   ViewMode,
   NetworkMode,
 } from '../../lib/topology/types';
+import { CameraPreset } from './TopologyControls';
 
 interface ClusterSceneProps {
   nodes: PhysicalNode[];
@@ -16,6 +17,7 @@ interface ClusterSceneProps {
   networkMode: NetworkMode;
   selectedNodeId: string | null;
   selectedShardId?: number | 'all';
+  cameraPreset?: CameraPreset | null;
   onSelectNode: (nodeId: string | null) => void;
   hoveredLinkId: string | null;
   onHoverLink: (linkId: string | null) => void;
@@ -29,6 +31,7 @@ export default function ClusterScene({
   networkMode,
   selectedNodeId,
   selectedShardId = 'all',
+  cameraPreset,
   onSelectNode,
   hoveredLinkId,
   onHoverLink,
@@ -42,6 +45,7 @@ export default function ClusterScene({
   const packetParticlesRef = useRef<
     Array<{ mesh: THREE.Mesh; curve: THREE.QuadraticBezierCurve3; progress: number; speed: number }>
   >([]);
+  const leaderRingsRef = useRef<THREE.Mesh[]>([]);
   const animFrameIdRef = useRef<number | null>(null);
 
   // Orbit controls state
@@ -49,8 +53,8 @@ export default function ClusterScene({
   const previousMousePositionRef = useRef({ x: 0, y: 0 });
   const cameraAngleRef = useRef({ theta: Math.PI / 4, phi: Math.PI / 3, radius: 16 });
 
-  // Tooltip state for link hover
-  const [hoveredLinkInfo, setHoveredLinkInfo] = useState<{
+  // Tooltip state for link hover in 3D/2D
+  const [hoveredLinkTooltip, setHoveredLinkTooltip] = useState<{
     link: NetworkLink;
     x: number;
     y: number;
@@ -64,8 +68,8 @@ export default function ClusterScene({
     const ctx = canvas.getContext('2d');
     if (!ctx) return new THREE.CanvasTexture(canvas);
 
-    // Background pill
-    ctx.fillStyle = isOnline ? 'rgba(255, 255, 255, 0.95)' : 'rgba(241, 245, 249, 0.95)';
+    // Background rounded pill
+    ctx.fillStyle = isOnline ? 'rgba(255, 255, 255, 0.96)' : 'rgba(241, 245, 249, 0.96)';
     ctx.strokeStyle = isLeader ? '#F59E0B' : isOnline ? '#0891D5' : '#EF4444';
     ctx.lineWidth = 4;
     ctx.beginPath();
@@ -90,7 +94,7 @@ export default function ClusterScene({
   };
 
   // Build a Stylized 3D Server Building
-  const createServerBuilding = (node: PhysicalNode) => {
+  const createServerBuilding = (node: PhysicalNode, isSelected: boolean) => {
     const group = new THREE.Group();
     group.name = node.id;
     group.position.set(node.position3D[0], node.position3D[1], node.position3D[2]);
@@ -111,14 +115,25 @@ export default function ClusterScene({
     plinth.position.y = 0.15;
     group.add(plinth);
 
-    // Leader Ring (amber/gold if node is leader)
+    // Cyan Outline / Glow Ring when Selected
+    if (isSelected) {
+      const selectHaloGeo = new THREE.TorusGeometry(1.9, 0.08, 16, 64);
+      const selectHaloMat = new THREE.MeshBasicMaterial({ color: 0x0891d5 });
+      const selectHalo = new THREE.Mesh(selectHaloGeo, selectHaloMat);
+      selectHalo.rotation.x = Math.PI / 2;
+      selectHalo.position.y = 0.05;
+      group.add(selectHalo);
+    }
+
+    // Leader Dual Amber Rings & Plinth Crown
     if (isLeader && isOnline) {
-      const ringGeo = new THREE.TorusGeometry(1.7, 0.08, 16, 64);
+      const ringGeo = new THREE.TorusGeometry(1.7, 0.06, 16, 64);
       const ringMat = new THREE.MeshBasicMaterial({ color: 0xf59e0b });
       const ring = new THREE.Mesh(ringGeo, ringMat);
       ring.rotation.x = Math.PI / 2;
-      ring.position.y = 0.1;
+      ring.position.y = 0.12;
       group.add(ring);
+      leaderRingsRef.current.push(ring);
     }
 
     // 2. Main Server Tower Chassis
@@ -127,7 +142,7 @@ export default function ClusterScene({
     const towerDepth = 1.3;
     const towerGeo = new THREE.BoxGeometry(towerWidth, towerHeight, towerDepth);
     const towerMat = new THREE.MeshStandardMaterial({
-      color: isOnline ? 0x1e293b : 0x475569,
+      color: isOnline ? (isSelected ? 0x0f172a : 0x1e293b) : 0x475569,
       metalness: 0.8,
       roughness: 0.25,
     });
@@ -135,7 +150,7 @@ export default function ClusterScene({
     tower.position.y = towerHeight / 2 + 0.3;
     group.add(tower);
 
-    // 3. Multi-Tiered Server Blades (horizontal rack shelves)
+    // 3. Multi-Tiered Server Blades with Shard Indicators
     const bladeCount = 5;
     for (let i = 0; i < bladeCount; i++) {
       const yOffset = 0.6 + i * 0.42;
@@ -149,7 +164,7 @@ export default function ClusterScene({
       blade.position.y = yOffset;
       group.add(blade);
 
-      // Status LED dots on front panel of each blade
+      // Status LED dots on front panel
       const ledColor = isOnline
         ? i === 0 && isLeader
           ? 0xf59e0b
@@ -166,6 +181,18 @@ export default function ClusterScene({
       const led2 = new THREE.Mesh(ledGeo, ledMat);
       led2.position.set(-0.32, yOffset, towerDepth / 2 + 0.02);
       group.add(led2);
+
+      // Shard-colored indicator strip on the side of each blade
+      if (node.hostedShards[i]) {
+        const sh = node.hostedShards[i];
+        const shardColor =
+          sh.shardId === 0 ? 0x0891d5 : sh.shardId === 1 ? 0x7965e8 : 0x10b981;
+        const stripGeo = new THREE.BoxGeometry(0.02, 0.16, 0.6);
+        const stripMat = new THREE.MeshBasicMaterial({ color: shardColor });
+        const strip = new THREE.Mesh(stripGeo, stripMat);
+        strip.position.set(towerWidth / 2 + 0.02, yOffset, 0);
+        group.add(strip);
+      }
     }
 
     // 4. Roof Ventilation / Antenna Beacon
@@ -191,15 +218,41 @@ export default function ClusterScene({
     group.add(sprite);
 
     // Invisible Hit Box for Raycasting
-    const hitBoxGeo = new THREE.BoxGeometry(2.2, 4.0, 2.2);
+    const hitBoxGeo = new THREE.BoxGeometry(2.4, 4.2, 2.4);
     const hitBoxMat = new THREE.MeshBasicMaterial({ visible: false });
     const hitBox = new THREE.Mesh(hitBoxGeo, hitBoxMat);
-    hitBox.position.y = 2.0;
+    hitBox.position.y = 2.1;
     hitBox.userData = { nodeId: node.id };
     group.add(hitBox);
 
     return group;
   };
+
+  // Camera preset handler
+  const applyCameraPreset = useCallback((preset: CameraPreset) => {
+    if (!cameraRef.current) return;
+    if (preset === 'isometric') {
+      cameraAngleRef.current = { theta: Math.PI / 4, phi: Math.PI / 3, radius: 16 };
+    } else if (preset === 'top') {
+      cameraAngleRef.current = { theta: 0.001, phi: 0.1, radius: 20 };
+    } else if (preset === 'front') {
+      cameraAngleRef.current = { theta: 0, phi: Math.PI / 2.3, radius: 14 };
+    } else if (preset === 'reset') {
+      cameraAngleRef.current = { theta: Math.PI / 4, phi: Math.PI / 3, radius: 16 };
+    }
+
+    const { theta, phi, radius } = cameraAngleRef.current;
+    cameraRef.current.position.x = radius * Math.sin(phi) * Math.sin(theta);
+    cameraRef.current.position.y = radius * Math.cos(phi);
+    cameraRef.current.position.z = radius * Math.sin(phi) * Math.cos(theta);
+    cameraRef.current.lookAt(0, 0.5, 0);
+  }, []);
+
+  useEffect(() => {
+    if (cameraPreset) {
+      applyCameraPreset(cameraPreset);
+    }
+  }, [cameraPreset, applyCameraPreset]);
 
   // Initialize Three.js Scene
   useEffect(() => {
@@ -275,7 +328,7 @@ export default function ClusterScene({
 
       cameraAngleRef.current.theta -= deltaX * 0.008;
       cameraAngleRef.current.phi = Math.max(
-        0.2,
+        0.05,
         Math.min(Math.PI / 2 - 0.05, cameraAngleRef.current.phi - deltaY * 0.008)
       );
 
@@ -333,11 +386,16 @@ export default function ClusterScene({
       animFrameIdRef.current = requestAnimationFrame(animate);
       const delta = clock.getDelta();
 
-      // Animate packet particles
+      // Animate packet particles along bezier curves
       packetParticlesRef.current.forEach((p) => {
         p.progress = (p.progress + delta * p.speed) % 1;
         const pt = p.curve.getPoint(p.progress);
         p.mesh.position.set(pt.x, pt.y, pt.z);
+      });
+
+      // Slowly rotate leader rings
+      leaderRingsRef.current.forEach((r) => {
+        r.rotation.z += delta * 0.8;
       });
 
       renderer.render(scene, camera);
@@ -363,6 +421,19 @@ export default function ClusterScene({
       dom.removeEventListener('wheel', onWheel);
       dom.removeEventListener('click', onClick);
       window.removeEventListener('resize', handleResize);
+
+      // Deep GPU Resource Disposal to prevent WebGL memory leak
+      scene.traverse((obj) => {
+        if (obj instanceof THREE.Mesh || obj instanceof THREE.Line || obj instanceof THREE.Sprite) {
+          if (obj.geometry) obj.geometry.dispose();
+          if (Array.isArray(obj.material)) {
+            obj.material.forEach((m) => m.dispose());
+          } else if (obj.material) {
+            obj.material.dispose();
+          }
+        }
+      });
+
       if (renderer.domElement.parentNode) {
         renderer.domElement.parentNode.removeChild(renderer.domElement);
       }
@@ -375,16 +446,16 @@ export default function ClusterScene({
     const scene = sceneRef.current;
     if (!scene || viewMode !== '3d') return;
 
-    // Clear old building groups
+    leaderRingsRef.current = [];
     buildingMeshesRef.current.forEach((grp) => scene.remove(grp));
     buildingMeshesRef.current.clear();
 
     nodes.forEach((node) => {
-      const building = createServerBuilding(node);
+      const isSelected = selectedNodeId === node.id;
+      const building = createServerBuilding(node, isSelected);
 
-      // Node selection highlight / dimming
       if (selectedNodeId) {
-        if (selectedNodeId === node.id) {
+        if (isSelected) {
           building.scale.set(1.15, 1.15, 1.15);
         } else {
           building.scale.set(0.9, 0.9, 0.9);
@@ -403,7 +474,6 @@ export default function ClusterScene({
     const scene = sceneRef.current;
     if (!scene || viewMode !== '3d') return;
 
-    // Clear old lines & particles
     linkLinesRef.current.forEach(({ line }) => scene.remove(line));
     linkLinesRef.current.clear();
 
@@ -463,7 +533,7 @@ export default function ClusterScene({
       scene.add(line);
       linkLinesRef.current.set(link.id, { line, curve });
 
-      // Add animated packet particle if active
+      // Add animated packet photon particle if active
       if (link.activeTraffic && link.status === 'healthy') {
         const particleGeo = new THREE.SphereGeometry(0.12, 12, 12);
         const particleMat = new THREE.MeshBasicMaterial({ color: linkColor });
@@ -488,7 +558,6 @@ export default function ClusterScene({
         /* 2D Flat Graph View */
         <div className="w-full h-full p-6 flex flex-col justify-between select-none relative bg-white">
           <svg className="w-full h-full">
-            {/* Background grid */}
             <defs>
               <pattern id="grid2d" width="40" height="40" patternUnits="userSpaceOnUse">
                 <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#E2E8F0" strokeWidth="0.8" />
@@ -512,7 +581,17 @@ export default function ClusterScene({
               if (link.status === 'disconnected') strokeColor = '#EF4444';
 
               return (
-                <g key={link.id} onMouseEnter={() => onHoverLink(link.id)} onMouseLeave={() => onHoverLink(null)}>
+                <g
+                  key={link.id}
+                  onMouseEnter={(e) => {
+                    onHoverLink(link.id);
+                    setHoveredLinkTooltip({ link, x: e.clientX, y: e.clientY });
+                  }}
+                  onMouseLeave={() => {
+                    onHoverLink(null);
+                    setHoveredLinkTooltip(null);
+                  }}
+                >
                   <line
                     x1={`${src.position2D.x}%`}
                     y1={`${src.position2D.y}%`}
@@ -536,7 +615,6 @@ export default function ClusterScene({
               return (
                 <g
                   key={node.id}
-                  transform={`translate(0, 0)`}
                   onClick={() => onSelectNode(isSelected ? null : node.id)}
                   className="cursor-pointer group"
                 >
