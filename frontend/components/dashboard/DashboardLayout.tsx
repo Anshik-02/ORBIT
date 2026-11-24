@@ -33,15 +33,15 @@ interface DashboardLayoutProps {
 
 const NAV_ITEMS = [
   { id: "overview", label: "OVERVIEW", href: "/dashboard", icon: LayoutDashboard },
-  { id: "topology", label: "TOPOLOGY", href: "/dashboard#topology", icon: Share2 },
-  { id: "shards", label: "SHARDS", href: "/dashboard#shards", icon: Layers },
-  { id: "raft", label: "RAFT", href: "/dashboard#raft", icon: ShieldCheck },
-  { id: "query", label: "QUERY", href: "/dashboard#query", icon: Terminal },
-  { id: "events", label: "EVENTS", href: "/dashboard#events", icon: Activity },
-  { id: "storage", label: "STORAGE", href: "/dashboard#storage", icon: HardDrive },
-  { id: "benchmarks", label: "BENCHMARKS", href: "/dashboard#benchmarks", icon: Zap },
-  { id: "chaos", label: "CHAOS LAB", href: "/dashboard#chaos", icon: Flame },
-  { id: "settings", label: "SETTINGS", href: "/dashboard#settings", icon: Settings },
+  { id: "topology", label: "TOPOLOGY", href: "/dashboard/topology", icon: Share2 },
+  { id: "shards", label: "SHARDS", href: "/dashboard/shards", icon: Layers },
+  { id: "raft", label: "RAFT", href: "/dashboard/raft", icon: ShieldCheck },
+  { id: "query", label: "QUERY", href: "/dashboard/query", icon: Terminal },
+  { id: "events", label: "EVENTS", href: "/dashboard/events", icon: Activity },
+  { id: "storage", label: "STORAGE", href: "/dashboard/storage", icon: HardDrive },
+  { id: "benchmarks", label: "BENCHMARKS", href: "/dashboard/benchmarks", icon: Zap },
+  { id: "chaos", label: "CHAOS LAB", href: "/dashboard/chaos", icon: Flame },
+  { id: "settings", label: "SETTINGS", href: "/dashboard/settings", icon: Settings },
 ];
 
 export default function DashboardLayout({
@@ -89,10 +89,10 @@ export default function DashboardLayout({
               </span>
             </Link>
 
-            <div className="hidden sm:flex items-center text-xs font-mono text-[#64748B] border-l border-[#DCE5F0] pl-4 space-x-1.5">
+            <div className="hidden sm:flex items-center text-xs font-mono text-[#64748B] border-l border-[#DCE5F0] pl-4 space-x-1.5 capitalize">
               <span>Cluster</span>
               <ChevronRight className="w-3.5 h-3.5 text-slate-400" />
-              <span className="text-[#0891D5] font-semibold">Overview</span>
+              <span className="text-[#0891D5] font-semibold">{activeNav}</span>
             </div>
           </div>
 
