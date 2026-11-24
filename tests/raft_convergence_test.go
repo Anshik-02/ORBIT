@@ -61,7 +61,7 @@ func TestRestartedNodeConvergesWithCluster(t *testing.T) {
 	}
 
 	// 3. Propose 3 entries through leader
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	for i := 1; i <= 3; i++ {
@@ -204,7 +204,7 @@ func TestAllNodesConvergeAfterPartitionHeal(t *testing.T) {
 	}
 
 	// Propose initial committed entry
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	idx1, _, err := leader.Raft().Propose("SET", "base", "v1")

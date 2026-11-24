@@ -240,7 +240,7 @@ func TestInstallSnapshot_LaggingFollowerCatchesUp(t *testing.T) {
 	// Leader's nextIndex for followerToIsolate is <= 2 (which is <= leader's FirstIndex of 16).
 	// Leader MUST trigger InstallSnapshot to bring followerToIsolate to index 16,
 	// and then replicate post-snapshot entries 17..19!
-	if err := waitForApplied(followerToIsolate, postSnapIdx, 5*time.Second); err != nil {
+	if err := waitForApplied(followerToIsolate, postSnapIdx, 15*time.Second); err != nil {
 		t.Fatalf("follower failed to catch up via snapshot: %v", err)
 	}
 

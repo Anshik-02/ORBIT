@@ -34,9 +34,18 @@ jobs:
           go build -v ./cmd/orbit-chaos
           go build -v ./cmd/orbit-admin
 
-      - name: Run Test Suite (Race Detector Enabled)
+      - name: Run Test Suite (Windows)
+        if: matrix.os == 'windows-latest'
         run: go test -v ./... -race -count=1 -timeout 300s
 
-      - name: Code Coverage
+      - name: Run Test Suite with Coverage (Ubuntu)
         if: matrix.os == 'ubuntu-latest'
-        run: go test -coverprofile=coverage.out ./...
+        run: go test -v ./... -race -count=1 -timeout 300s -coverprofile=coverage.out
+
+      - name: Upload Coverage Artifact
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.out
+          retention-days: 14
