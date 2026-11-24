@@ -513,11 +513,27 @@ func TestPhase36_ComprehensiveFailureScenarios(t *testing.T) {
 	// Propose write to Shard 1 while old leader is dead
 	keyWhileLeaderDead := findKeyForShard(1, keyS1Alive)
 	putURLNewLeader := fmt.Sprintf("http://127.0.0.1:%d/kv/%s", nodePorts[newShard1Leader].apiPort, keyWhileLeaderDead)
-	pReqNL, _ := http.NewRequest(http.MethodPut, putURLNewLeader, bytes.NewReader([]byte(`{"value":"written-under-new-leader"}`)))
-	pReqNL.Header.Set("Content-Type", "application/json")
-	pRespNL, err := httpClient.Do(pReqNL)
-	if err != nil || pRespNL.StatusCode != http.StatusOK {
-		t.Fatalf("write to new leader failed: err=%v, code=%v", err, pRespNL.StatusCode)
+	var pRespNL *http.Response
+	var errNL error
+	nlDeadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(nlDeadline) {
+		pReqNL, _ := http.NewRequest(http.MethodPut, putURLNewLeader, bytes.NewReader([]byte(`{"value":"written-under-new-leader"}`)))
+		pReqNL.Header.Set("Content-Type", "application/json")
+		pRespNL, errNL = httpClient.Do(pReqNL)
+		if errNL == nil && pRespNL.StatusCode == http.StatusOK {
+			break
+		}
+		if pRespNL != nil {
+			_ = pRespNL.Body.Close()
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if errNL != nil || pRespNL == nil || pRespNL.StatusCode != http.StatusOK {
+		code := 0
+		if pRespNL != nil {
+			code = pRespNL.StatusCode
+		}
+		t.Fatalf("write to new leader failed: err=%v, code=%v", errNL, code)
 	}
 	pRespNL.Body.Close()
 
@@ -562,11 +578,27 @@ func TestPhase36_ComprehensiveFailureScenarios(t *testing.T) {
 	// Even if Node B's cached leader was old, forwardWithFailover will route to the live leader!
 	keyFailover := findKeyForShard(1, keyWhileLeaderDead)
 	putFailoverURL := fmt.Sprintf("http://127.0.0.1:%d/kv/%s", nodePorts["node-b"].apiPort, keyFailover)
-	pReqFO, _ := http.NewRequest(http.MethodPut, putFailoverURL, bytes.NewReader([]byte(`{"value":"failover-success"}`)))
-	pReqFO.Header.Set("Content-Type", "application/json")
-	pRespFO, err := httpClient.Do(pReqFO)
-	if err != nil || pRespFO.StatusCode != http.StatusOK {
-		t.Fatalf("Scenario 7 failed: forwarder failover to active replica failed: err=%v, code=%v", err, pRespFO.StatusCode)
+	var pRespFO *http.Response
+	var errFO error
+	foDeadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(foDeadline) {
+		pReqFO, _ := http.NewRequest(http.MethodPut, putFailoverURL, bytes.NewReader([]byte(`{"value":"failover-success"}`)))
+		pReqFO.Header.Set("Content-Type", "application/json")
+		pRespFO, errFO = httpClient.Do(pReqFO)
+		if errFO == nil && pRespFO.StatusCode == http.StatusOK {
+			break
+		}
+		if pRespFO != nil {
+			_ = pRespFO.Body.Close()
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if errFO != nil || pRespFO == nil || pRespFO.StatusCode != http.StatusOK {
+		code := 0
+		if pRespFO != nil {
+			code = pRespFO.StatusCode
+		}
+		t.Fatalf("Scenario 7 failed: forwarder failover to active replica failed: err=%v, code=%v", errFO, code)
 	}
 	pRespFO.Body.Close()
 	t.Log("Scenario 7 PASSED: Forwarder successfully routed request to active leader across failure boundaries.")

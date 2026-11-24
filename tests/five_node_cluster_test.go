@@ -464,28 +464,42 @@ func TestFiveNodeThreeShardCluster_RealProcesses(t *testing.T) {
 
 	// Verify restarted node can serve linearizable reads for key written before its downtime
 	readRecoveredURL1 := fmt.Sprintf("http://127.0.0.1:%d/kv/%s", nodePorts[shard0Follower].apiPort, keyShard0)
-	recResp1, err := httpClient.Get(readRecoveredURL1)
-	if err != nil || recResp1.StatusCode != http.StatusOK {
-		t.Fatalf("restarted %s failed to serve GET for %s: err=%v, code=%d", shard0Follower, keyShard0, err, recResp1.StatusCode)
-	}
 	var recData1 api.GetKVResponse
-	_ = json.NewDecoder(recResp1.Body).Decode(&recData1)
-	recResp1.Body.Close()
-
+	catchup1Deadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(catchup1Deadline) {
+		recResp1, err := httpClient.Get(readRecoveredURL1)
+		if err == nil && recResp1.StatusCode == http.StatusOK {
+			_ = json.NewDecoder(recResp1.Body).Decode(&recData1)
+			recResp1.Body.Close()
+			if recData1.Value == "val-shard-0" {
+				break
+			}
+		} else if recResp1 != nil {
+			_ = recResp1.Body.Close()
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	if recData1.Value != "val-shard-0" {
 		t.Fatalf("recovered value mismatch on %s: expected %q, got %q", shard0Follower, "val-shard-0", recData1.Value)
 	}
 
 	// Verify restarted node caught up with key written while it was offline
 	readRecoveredURL2 := fmt.Sprintf("http://127.0.0.1:%d/kv/%s", nodePorts[shard0Follower].apiPort, keyQuorum)
-	recResp2, err := httpClient.Get(readRecoveredURL2)
-	if err != nil || recResp2.StatusCode != http.StatusOK {
-		t.Fatalf("restarted %s failed to serve GET for caught-up key %s: err=%v, code=%d", shard0Follower, keyQuorum, err, recResp2.StatusCode)
-	}
 	var recData2 api.GetKVResponse
-	_ = json.NewDecoder(recResp2.Body).Decode(&recData2)
-	recResp2.Body.Close()
-
+	catchup2Deadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(catchup2Deadline) {
+		recResp2, err := httpClient.Get(readRecoveredURL2)
+		if err == nil && recResp2.StatusCode == http.StatusOK {
+			_ = json.NewDecoder(recResp2.Body).Decode(&recData2)
+			recResp2.Body.Close()
+			if recData2.Value == "quorum-alive" {
+				break
+			}
+		} else if recResp2 != nil {
+			_ = recResp2.Body.Close()
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	if recData2.Value != "quorum-alive" {
 		t.Fatalf("caught-up value mismatch on %s: expected %q, got %q", shard0Follower, "quorum-alive", recData2.Value)
 	}

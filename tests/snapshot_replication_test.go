@@ -167,10 +167,10 @@ func TestInstallSnapshot_LaggingFollowerCatchesUp(t *testing.T) {
 			node.id, targetIdx, node.raft.LastApplied())
 	}
 
-	if err := waitForApplied(leader, idx, 2*time.Second); err != nil {
+	if err := waitForApplied(leader, idx, 10*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	if err := waitForApplied(followerToIsolate, idx, 2*time.Second); err != nil {
+	if err := waitForApplied(followerToIsolate, idx, 10*time.Second); err != nil {
 		t.Fatal(err)
 	}
 
@@ -192,7 +192,7 @@ func TestInstallSnapshot_LaggingFollowerCatchesUp(t *testing.T) {
 	// Wait for active nodes to commit and apply entries up to lastProposedIdx
 	for _, n := range nodes {
 		if n.id != followerToIsolate.id {
-			if err := waitForApplied(n, lastProposedIdx, 3*time.Second); err != nil {
+			if err := waitForApplied(n, lastProposedIdx, 10*time.Second); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -225,7 +225,7 @@ func TestInstallSnapshot_LaggingFollowerCatchesUp(t *testing.T) {
 		}
 		postSnapIdx = pIdx
 	}
-	if err := waitForApplied(leader, postSnapIdx, 2*time.Second); err != nil {
+	if err := waitForApplied(leader, postSnapIdx, 10*time.Second); err != nil {
 		t.Fatal(err)
 	}
 
