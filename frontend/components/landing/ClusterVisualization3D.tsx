@@ -2,7 +2,9 @@
 
 import React, { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
-import { ShieldCheck, Activity, Layers, Radio, Sparkles, Server, Crown } from "lucide-react";
+import { ShieldCheck, Activity, Layers, Radio, Sparkles, Server, Crown, AlertTriangle } from "lucide-react";
+import { fetchClusterHealth } from "@/lib/api/client";
+import { ClusterHealthResponse } from "@/lib/api/types";
 
 interface NodeData {
   id: string;
@@ -14,32 +16,32 @@ interface NodeData {
   apiPort: number;
   raftPort: number;
   term: number;
-  status: "Healthy" | "Replicating" | "Elected";
+  status: "Healthy" | "Replicating" | "Elected" | "Offline";
 }
 
 const NODES: NodeData[] = [
   {
     id: "node-a",
     name: "Node A",
-    role: "Leader",
+    role: "Follower",
     pos: [0, 2.1, 0.2],
     color: "#0891D5", // Primary Cyan
     shards: [0, 1],
     apiPort: 2525,
     raftPort: 7000,
-    term: 4,
+    term: 0,
     status: "Healthy",
   },
   {
     id: "node-b",
     name: "Node B",
-    role: "Leader",
+    role: "Follower",
     pos: [-2.5, 0.7, 0.4],
     color: "#7965E8", // Secondary Purple
     shards: [0, 2],
     apiPort: 2526,
     raftPort: 7001,
-    term: 4,
+    term: 0,
     status: "Healthy",
   },
   {
@@ -51,19 +53,19 @@ const NODES: NodeData[] = [
     shards: [0, 2],
     apiPort: 2527,
     raftPort: 7002,
-    term: 4,
+    term: 0,
     status: "Healthy",
   },
   {
     id: "node-d",
     name: "Node D",
-    role: "Leader",
+    role: "Follower",
     pos: [-1.7, -1.9, -0.3],
     color: "#10B981", // Emerald
     shards: [1, 2],
     apiPort: 2528,
     raftPort: 7003,
-    term: 4,
+    term: 0,
     status: "Healthy",
   },
   {
@@ -75,7 +77,7 @@ const NODES: NodeData[] = [
     shards: [1],
     apiPort: 2529,
     raftPort: 7004,
-    term: 4,
+    term: 0,
     status: "Healthy",
   },
 ];
@@ -90,8 +92,67 @@ const SHARD_CONFIGS = [
 export default function ClusterVisualization3D() {
   const mountRef = useRef<HTMLDivElement>(null);
   const [activeShard, setActiveShard] = useState<number | null>(null);
+  const [nodes, setNodes] = useState<NodeData[]>(NODES);
   const [selectedNode, setSelectedNode] = useState<NodeData>(NODES[0]);
   const [hoveredNode, setHoveredNode] = useState<NodeData | null>(null);
+  const [isLive, setIsLive] = useState<boolean>(false);
+  const [liveEndpoint, setLiveEndpoint] = useState<string | null>(null);
+  const [liveHealth, setLiveHealth] = useState<ClusterHealthResponse | null>(null);
+
+  // Probe live backend on mount to discover actual cluster topology
+  useEffect(() => {
+    let mounted = true;
+    const probeCluster = async () => {
+      try {
+        const res = await fetchClusterHealth({ timeoutMs: 1200 });
+        if (!mounted) return;
+        if (res.isLive && res.data) {
+          setIsLive(true);
+          setLiveEndpoint(res.endpoint);
+          setLiveHealth(res.data);
+
+          // Update nodes with actual roles and terms
+          setNodes((prevNodes) =>
+            prevNodes.map((n) => {
+              const nodeStatus = res.data?.nodes?.[n.id];
+              const isOnline = nodeStatus?.online ?? false;
+              // Check if node is a leader in any shard
+              let isLeader = false;
+              let highestTerm = 0;
+              if (res.data?.shards) {
+                Object.values(res.data.shards).forEach((s) => {
+                  if (s.current_leader === n.id) {
+                    isLeader = true;
+                  }
+                  if (s.replica_node_ids?.includes(n.id) && s.current_term > highestTerm) {
+                    highestTerm = s.current_term;
+                  }
+                });
+              }
+
+              return {
+                ...n,
+                role: isLeader ? "Leader" : "Follower",
+                term: highestTerm,
+                status: !isOnline ? "Offline" : isLeader ? "Elected" : "Healthy",
+              };
+            })
+          );
+        } else {
+          setIsLive(false);
+        }
+      } catch {
+        if (mounted) setIsLive(false);
+      }
+    };
+
+    probeCluster();
+    const interval = setInterval(probeCluster, 5000);
+    return () => {
+      mounted = false;
+      clearInterval(interval);
+    };
+  }, []);
 
   useEffect(() => {
     const container = mountRef.current;
@@ -175,7 +236,7 @@ export default function ClusterVisualization3D() {
         emissiveIntensity: 0.25,
       });
       const mesh = new THREE.Mesh(sphereGeo, sphereMat);
-      mesh.position.set(...node.pos);
+      mesh.position.set(node.pos[0], node.pos[1], node.pos[2]);
       nodeGroup.add(mesh);
       nodeMeshes[node.id] = mesh;
 
@@ -202,7 +263,7 @@ export default function ClusterVisualization3D() {
           opacity: 0.6,
         });
         const ring = new THREE.Mesh(ringGeo, ringMat);
-        ring.position.set(...node.pos);
+        ring.position.set(node.pos[0], node.pos[1], node.pos[2]);
         nodeGroup.add(ring);
         ringMeshes[node.id] = ring;
       }
@@ -226,8 +287,8 @@ export default function ClusterVisualization3D() {
           const n1 = NODES.find((n) => n.id === reps[i])!;
           const n2 = NODES.find((n) => n.id === reps[j])!;
 
-          const p1 = new THREE.Vector3(...n1.pos);
-          const p2 = new THREE.Vector3(...n2.pos);
+          const p1 = new THREE.Vector3(n1.pos[0], n1.pos[1], n1.pos[2]);
+          const p2 = new THREE.Vector3(n2.pos[0], n2.pos[1], n2.pos[2]);
           const curve = new THREE.LineCurve3(p1, p2);
 
           const geo = new THREE.BufferGeometry().setFromPoints(curve.getPoints(24));
@@ -321,6 +382,13 @@ export default function ClusterVisualization3D() {
     let targetRotX = 0;
     let targetRotY = 0;
 
+    // Raycast lookup helper using current dynamic node data
+    const findNodeData = (meshObj: THREE.Object3D) => {
+      const entry = Object.entries(nodeMeshes).find(([, mesh]) => mesh === meshObj);
+      if (!entry) return null;
+      return nodes.find((n) => n.id === entry[0]) || null;
+    };
+
     const handleMouseMove = (e: MouseEvent) => {
       const rect = container.getBoundingClientRect();
       mouseX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
@@ -333,8 +401,7 @@ export default function ClusterVisualization3D() {
       raycaster.setFromCamera(new THREE.Vector2(mouseX, mouseY), camera);
       const intersects = raycaster.intersectObjects(Object.values(nodeMeshes));
       if (intersects.length > 0) {
-        const hit = intersects[0].object;
-        const found = NODES.find((n) => nodeMeshes[n.id] === hit);
+        const found = findNodeData(intersects[0].object);
         if (found) {
           setHoveredNode(found);
           document.body.style.cursor = "pointer";
@@ -353,8 +420,7 @@ export default function ClusterVisualization3D() {
       raycaster.setFromCamera(new THREE.Vector2(mx, my), camera);
       const intersects = raycaster.intersectObjects(Object.values(nodeMeshes));
       if (intersects.length > 0) {
-        const hit = intersects[0].object;
-        const found = NODES.find((n) => nodeMeshes[n.id] === hit);
+        const found = findNodeData(intersects[0].object);
         if (found) {
           setSelectedNode(found);
         }
@@ -473,10 +539,17 @@ export default function ClusterVisualization3D() {
         </div>
 
         {/* Live Indicator */}
-        <div className="hidden sm:flex items-center gap-2 px-3 py-1.5 bg-white/90 backdrop-blur-md rounded-xl border border-[#DCE5F0] text-xs font-mono text-[#17243A] shadow-sm">
-          <Radio className="w-3.5 h-3.5 text-[#10B981] animate-pulse" />
-          <span>Interactive 3D Topology</span>
-        </div>
+        {isLive ? (
+          <div className="hidden sm:flex items-center gap-2 px-3 py-1.5 bg-emerald-50/95 backdrop-blur-md rounded-xl border border-emerald-200 text-xs font-mono text-emerald-800 shadow-sm">
+            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+            <span>Live Cluster Connected ({liveEndpoint || ":2525"})</span>
+          </div>
+        ) : (
+          <div className="hidden sm:flex items-center gap-2 px-3 py-1.5 bg-white/90 backdrop-blur-md rounded-xl border border-[#DCE5F0] text-xs font-mono text-[#64748B] shadow-sm">
+            <Radio className="w-3.5 h-3.5 text-slate-400" />
+            <span>Architectural Simulation (Cluster Offline)</span>
+          </div>
+        )}
       </div>
 
       {/* Node Inspector Overlay Card (Bottom Left Overlay) */}
@@ -496,13 +569,15 @@ export default function ClusterVisualization3D() {
           </div>
           <span
             className={`text-[10px] font-mono px-2 py-0.5 rounded-full font-semibold uppercase tracking-wider ${
-              activeDisplayNode.role === "Leader"
+              activeDisplayNode.status === "Offline"
+                ? "bg-slate-100 text-slate-600 border border-slate-200"
+                : activeDisplayNode.role === "Leader"
                 ? "bg-amber-50 text-amber-700 border border-amber-200 flex items-center gap-1"
                 : "bg-sky-50 text-[#0891D5] border border-sky-200"
             }`}
           >
-            {activeDisplayNode.role === "Leader" && <Crown className="w-2.5 h-2.5" />}
-            {activeDisplayNode.role}
+            {activeDisplayNode.role === "Leader" && activeDisplayNode.status !== "Offline" && <Crown className="w-2.5 h-2.5" />}
+            {activeDisplayNode.status === "Offline" ? "OFFLINE" : activeDisplayNode.role}
           </span>
         </div>
 
@@ -546,21 +621,28 @@ export default function ClusterVisualization3D() {
       {/* Shard Placement Reference Matrix (Bottom Right Overlay) */}
       <div className="hidden lg:block absolute bottom-4 right-4 p-3 bg-white/95 backdrop-blur-md rounded-xl border border-[#DCE5F0] text-xs font-mono text-[#17243A] shadow-md pointer-events-auto z-10">
         <span className="text-[10px] uppercase tracking-wider text-[#64748B] font-bold block mb-1.5">
-          Replica Placement Matrix
+          Replica Placement Matrix {isLive ? "(Live)" : "(Configured)"}
         </span>
         <div className="space-y-1 text-[11px]">
-          <div className="flex items-center justify-between gap-4">
-            <span className="text-[#0891D5] font-semibold">Shard 0:</span>
-            <span className="text-[#17243A]">Node A (L), Node B, Node C</span>
-          </div>
-          <div className="flex items-center justify-between gap-4">
-            <span className="text-[#7965E8] font-semibold">Shard 1:</span>
-            <span className="text-[#17243A]">Node D (L), Node E, Node A</span>
-          </div>
-          <div className="flex items-center justify-between gap-4">
-            <span className="text-[#10B981] font-semibold">Shard 2:</span>
-            <span className="text-[#17243A]">Node B (L), Node C, Node D</span>
-          </div>
+          {SHARD_CONFIGS.map((s) => {
+            const liveLeader = liveHealth?.shards?.[s.id]?.current_leader;
+            return (
+              <div key={s.id} className="flex items-center justify-between gap-4">
+                <span style={{ color: s.color }} className="font-semibold">
+                  Shard {s.id}:
+                </span>
+                <span className="text-[#17243A]">
+                  {s.replicas
+                    .map((r) => {
+                      const nodeName = r.replace("node-", "Node ").toUpperCase();
+                      const isLeaderNode = liveLeader ? r === liveLeader : r === s.replicas[0];
+                      return isLeaderNode ? `${nodeName} (L)` : nodeName;
+                    })
+                    .join(", ")}
+                </span>
+              </div>
+            );
+          })}
         </div>
       </div>
     </div>

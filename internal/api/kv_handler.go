@@ -1582,9 +1582,9 @@ func (h *KVHandler) queryShardScan(ctx context.Context, sid sharding.ShardID, st
 				}
 			}
 
-			path := fmt.Sprintf("/kv/scan?start=%s&end=%s&limit=%d", url.QueryEscape(start), url.QueryEscape(end), limit)
+			path := fmt.Sprintf("/kv/scan?start=%s&end=%s&limit=%d&shard_id=%d", url.QueryEscape(start), url.QueryEscape(end), limit, sid)
 			if prefix != "" {
-				path = fmt.Sprintf("/kv/prefix?prefix=%s&limit=%d", url.QueryEscape(prefix), limit)
+				path = fmt.Sprintf("/kv/prefix?prefix=%s&limit=%d&shard_id=%d", url.QueryEscape(prefix), limit, sid)
 			}
 
 			for _, target := range candidates {
@@ -1626,6 +1626,26 @@ func (h *KVHandler) handleScan(w http.ResponseWriter, r *http.Request, reqID str
 	}
 	if limit > 1000 {
 		limit = 1000
+	}
+
+	// Direct single-shard targeted query to prevent distributed forward loops
+	if shardParam := r.URL.Query().Get("shard_id"); shardParam != "" {
+		if sidInt, err := strconv.Atoi(shardParam); err == nil {
+			sid := sharding.ShardID(sidInt)
+			if h.provider != nil {
+				localInstances := h.provider.ShardInstances()
+				if inst, ok := localInstances[sid]; ok && inst.DB() != nil {
+					pairs, _ := inst.DB().Scan(start, end, limit)
+					writeJSON(w, http.StatusOK, ScanResponse{
+						Items:      pairs,
+						HasMore:    false,
+						NextCursor: "",
+						RequestID:  reqID,
+					})
+					return
+				}
+			}
+		}
 	}
 
 	allPairs := make(map[string]string)
@@ -1691,6 +1711,26 @@ func (h *KVHandler) handlePrefixScan(w http.ResponseWriter, r *http.Request, req
 	}
 	if limit > 1000 {
 		limit = 1000
+	}
+
+	// Direct single-shard targeted query to prevent distributed forward loops
+	if shardParam := r.URL.Query().Get("shard_id"); shardParam != "" {
+		if sidInt, err := strconv.Atoi(shardParam); err == nil {
+			sid := sharding.ShardID(sidInt)
+			if h.provider != nil {
+				localInstances := h.provider.ShardInstances()
+				if inst, ok := localInstances[sid]; ok && inst.DB() != nil {
+					pairs, _ := inst.DB().PrefixScan(prefix, limit)
+					writeJSON(w, http.StatusOK, ScanResponse{
+						Items:      pairs,
+						HasMore:    false,
+						NextCursor: "",
+						RequestID:  reqID,
+					})
+					return
+				}
+			}
+		}
 	}
 
 	allPairs := make(map[string]string)

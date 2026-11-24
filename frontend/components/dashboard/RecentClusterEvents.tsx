@@ -19,82 +19,29 @@ export default function RecentClusterEvents() {
   const [filter, setFilter] = useState<EventCategory>('ALL');
   const { events: liveEvents, isConnected } = useEventStream();
 
-  const defaultEvents: ClusterEventItem[] = [
-    {
-      id: 'evt-1',
-      category: 'RAFT',
-      timestamp: '14s ago',
-      node: 'Node A',
-      level: 'success',
-      message: 'Shard 0 heartbeat confirmed across majority quorum (3/3 nodes acked)',
-    },
-    {
-      id: 'evt-2',
-      category: 'REPLICATION',
-      timestamp: '28s ago',
-      node: 'Node D',
-      level: 'info',
-      message: 'Log index 12450 committed & applied to LSM state machine on Shard 1',
-    },
-    {
-      id: 'evt-3',
-      category: 'STORAGE',
-      timestamp: '45s ago',
-      node: 'Node C',
-      level: 'info',
-      message: 'Memtable rotation triggered: frozen 4MB flushed to L0 SSTable L0-00042',
-    },
-    {
-      id: 'evt-4',
-      category: 'CLUSTER',
-      timestamp: '1m ago',
-      node: 'Node B',
-      level: 'success',
-      message: 'Consistent hash ring membership verified: 3 shards mapped with RF=3',
-    },
-    {
-      id: 'evt-5',
-      category: 'RECOVERY',
-      timestamp: '2m ago',
-      node: 'Node E',
-      level: 'success',
-      message: 'WAL replay completed: 184 uncommitted records recovered to memtable',
-    },
-    {
-      id: 'evt-6',
-      category: 'STORAGE',
-      timestamp: '3m ago',
-      node: 'Node A',
-      level: 'warn',
-      message: 'Level 0 compaction initiated: merging 4 SSTables into L1',
-    },
-  ];
+  const events: ClusterEventItem[] = liveEvents.map((e) => {
+    let cat: Exclude<EventCategory, 'ALL'> = 'CLUSTER';
+    const c = (e.category || '').toUpperCase();
+    if (c.includes('RAFT')) cat = 'RAFT';
+    else if (c.includes('REPLICATION')) cat = 'REPLICATION';
+    else if (c.includes('STORAGE')) cat = 'STORAGE';
+    else if (c.includes('CHAOS')) cat = 'CHAOS';
+    else if (c.includes('RECOVERY')) cat = 'RECOVERY';
 
-  const events: ClusterEventItem[] = liveEvents.length > 0
-    ? liveEvents.map((e) => {
-        let cat: Exclude<EventCategory, 'ALL'> = 'CLUSTER';
-        const c = (e.category || '').toUpperCase();
-        if (c.includes('RAFT')) cat = 'RAFT';
-        else if (c.includes('REPLICATION')) cat = 'REPLICATION';
-        else if (c.includes('STORAGE')) cat = 'STORAGE';
-        else if (c.includes('CHAOS')) cat = 'CHAOS';
-        else if (c.includes('RECOVERY')) cat = 'RECOVERY';
+    let lvl: 'info' | 'success' | 'warn' | 'error' = 'info';
+    if (e.severity === 'ERROR') lvl = 'error';
+    else if (e.severity === 'WARN') lvl = 'warn';
+    else lvl = 'info';
 
-        let lvl: 'info' | 'success' | 'warn' | 'error' = 'info';
-        if (e.severity === 'ERROR') lvl = 'error';
-        else if (e.severity === 'WARN') lvl = 'warn';
-        else lvl = 'info';
-
-        return {
-          id: e.id,
-          category: cat,
-          timestamp: e.timestamp,
-          node: e.nodeId ? e.nodeId.toUpperCase() : 'Cluster',
-          level: lvl,
-          message: e.description,
-        };
-      })
-    : defaultEvents;
+    return {
+      id: e.id,
+      category: cat,
+      timestamp: e.timestamp,
+      node: e.nodeId ? e.nodeId.toUpperCase() : 'Cluster',
+      level: lvl,
+      message: e.description,
+    };
+  });
 
   const filteredEvents =
     filter === 'ALL' ? events : events.filter((e) => e.category === filter);
@@ -175,33 +122,41 @@ export default function RecentClusterEvents() {
 
         {/* Events Table / Stream */}
         <div className="space-y-2 max-h-[300px] overflow-y-auto pr-1 font-mono text-xs">
-          {filteredEvents.map((evt) => (
-            <div
-              key={evt.id}
-              className="flex items-center justify-between p-2.5 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0] hover:border-[#CBD5E1] transition-colors"
-            >
-              <div className="flex items-center gap-3">
-                <span className={`w-2 h-2 rounded-full ${getLevelDot(evt.level)} shrink-0`} />
-                <span
-                  className={`text-[9px] px-2 py-0.5 rounded-full border uppercase tracking-wider shrink-0 font-semibold ${getCategoryBadge(
-                    evt.category
-                  )}`}
-                >
-                  {evt.category}
-                </span>
-                <span className="text-[#64748B] text-[11px] shrink-0 font-semibold">
-                  [{evt.node}]
-                </span>
-                <span className="text-[#17243A] text-xs line-clamp-1 font-medium">
-                  {evt.message}
+          {filteredEvents.length === 0 ? (
+            <div className="py-8 text-center text-[#64748B] text-xs">
+              <Clock className="w-5 h-5 mx-auto mb-1.5 opacity-40 text-[#64748B]" />
+              <p className="font-semibold text-[#17243A]">No events in this category</p>
+              <p className="text-[11px] mt-0.5">Listening on WebSocket (/ws/events)...</p>
+            </div>
+          ) : (
+            filteredEvents.map((evt) => (
+              <div
+                key={evt.id}
+                className="flex items-center justify-between p-2.5 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0] hover:border-[#CBD5E1] transition-colors"
+              >
+                <div className="flex items-center gap-3">
+                  <span className={`w-2 h-2 rounded-full ${getLevelDot(evt.level)} shrink-0`} />
+                  <span
+                    className={`text-[9px] px-2 py-0.5 rounded-full border uppercase tracking-wider shrink-0 font-semibold ${getCategoryBadge(
+                      evt.category
+                    )}`}
+                  >
+                    {evt.category}
+                  </span>
+                  <span className="text-[#64748B] text-[11px] shrink-0 font-semibold">
+                    [{evt.node}]
+                  </span>
+                  <span className="text-[#17243A] text-xs line-clamp-1 font-medium">
+                    {evt.message}
+                  </span>
+                </div>
+
+                <span className="text-[11px] text-[#64748B] shrink-0 ml-3">
+                  {evt.timestamp}
                 </span>
               </div>
-
-              <span className="text-[11px] text-[#64748B] shrink-0 ml-3">
-                {evt.timestamp}
-              </span>
-            </div>
-          ))}
+            ))
+          )}
         </div>
       </div>
     </div>

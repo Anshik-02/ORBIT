@@ -49,10 +49,17 @@ export default function ShardsPage() {
               <h1 className="text-xl sm:text-2xl font-bold text-[#17243A] tracking-tight font-mono">
                 Shards & Replication
               </h1>
-              <span className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-50 border border-emerald-200 text-[#10B981] font-mono text-xs font-semibold">
-                <CheckCircle2 className="w-3.5 h-3.5" />
-                ALL QUORUMS SATISFIED
-              </span>
+              {isLive && shards.every((s) => s.quorumStatus.includes('HEALTHY')) ? (
+                <span className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-50 border border-emerald-200 text-[#10B981] font-mono text-xs font-semibold">
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                  ALL QUORUMS SATISFIED
+                </span>
+              ) : (
+                <span className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-50 border border-amber-200 text-amber-700 font-mono text-xs font-semibold">
+                  <Activity className="w-3.5 h-3.5" />
+                  {isLive ? 'QUORUM DEGRADED' : 'CLUSTER OFFLINE'}
+                </span>
+              )}
               <LiveIndicator isLive={isLive} lastUpdated={lastUpdated} />
             </div>
             <p className="text-xs sm:text-sm text-[#64748B] mt-1 font-normal font-mono">
@@ -77,7 +84,7 @@ export default function ShardsPage() {
         {/* 02. BOX 1: HIGH-LEVEL SHARD SUMMARY CARDS */}
         <ShardSummaryCards
           totalShards={shards.length}
-          healthyQuorums={shards.filter((s) => s.quorumStatus.includes('HEALTHY') || s.quorumStatus.includes('3/3')).length || 3}
+          healthyQuorums={isLive ? shards.filter((s) => s.quorumStatus.includes('HEALTHY')).length : 0}
           replicationFactor={3}
           activeMigrations={0}
         />

@@ -15,18 +15,18 @@ export interface MatrixNodeRow {
   };
 }
 
-const DEFAULT_SHARDS: ShardDetail[] = [
+const OFFLINE_SHARDS: ShardDetail[] = [
   {
     shardId: 0,
     name: 'Shard 0',
     color: '#0891D5',
     hashRange: '0x00000000..0x55555555',
-    leader: 'node-a',
+    leader: 'None (Offline)',
     replicas: ['node-a', 'node-b', 'node-c'],
-    term: 3,
-    commitIndex: 14820,
-    appliedIndex: 14820,
-    quorumStatus: 'HEALTHY (3/3)',
+    term: 0,
+    commitIndex: 0,
+    appliedIndex: 0,
+    quorumStatus: 'OFFLINE (0/3)',
     keyPercentage: '33.3%',
   },
   {
@@ -34,12 +34,12 @@ const DEFAULT_SHARDS: ShardDetail[] = [
     name: 'Shard 1',
     color: '#7965E8',
     hashRange: '0x55555556..0xAAAAAAAA',
-    leader: 'node-d',
+    leader: 'None (Offline)',
     replicas: ['node-d', 'node-e', 'node-a'],
-    term: 2,
-    commitIndex: 14818,
-    appliedIndex: 14818,
-    quorumStatus: 'HEALTHY (3/3)',
+    term: 0,
+    commitIndex: 0,
+    appliedIndex: 0,
+    quorumStatus: 'OFFLINE (0/3)',
     keyPercentage: '33.3%',
   },
   {
@@ -47,26 +47,26 @@ const DEFAULT_SHARDS: ShardDetail[] = [
     name: 'Shard 2',
     color: '#10B981',
     hashRange: '0xAAAAAAAB..0xFFFFFFFF',
-    leader: 'node-b',
+    leader: 'None (Offline)',
     replicas: ['node-b', 'node-c', 'node-d'],
-    term: 4,
-    commitIndex: 14822,
-    appliedIndex: 14822,
-    quorumStatus: 'HEALTHY (3/3)',
+    term: 0,
+    commitIndex: 0,
+    appliedIndex: 0,
+    quorumStatus: 'OFFLINE (0/3)',
     keyPercentage: '33.4%',
   },
 ];
 
 const DEFAULT_MATRIX: MatrixNodeRow[] = [
-  { id: 'node-a', name: 'Node A', httpPort: ':2525', roles: { 0: 'Leader', 1: 'Follower', 2: null } },
-  { id: 'node-b', name: 'Node B', httpPort: ':2526', roles: { 0: 'Follower', 1: null, 2: 'Leader' } },
-  { id: 'node-c', name: 'Node C', httpPort: ':2527', roles: { 0: 'Follower', 1: null, 2: 'Follower' } },
-  { id: 'node-d', name: 'Node D', httpPort: ':2528', roles: { 0: null, 1: 'Leader', 2: 'Follower' } },
-  { id: 'node-e', name: 'Node E', httpPort: ':2529', roles: { 0: null, 1: 'Follower', 2: null } },
+  { id: 'node-a', name: 'Node A', httpPort: ':2525', roles: { 0: null, 1: null, 2: null } },
+  { id: 'node-b', name: 'Node B', httpPort: ':2526', roles: { 0: null, 1: null, 2: null } },
+  { id: 'node-c', name: 'Node C', httpPort: ':2527', roles: { 0: null, 1: null, 2: null } },
+  { id: 'node-d', name: 'Node D', httpPort: ':2528', roles: { 0: null, 1: null, 2: null } },
+  { id: 'node-e', name: 'Node E', httpPort: ':2529', roles: { 0: null, 1: null, 2: null } },
 ];
 
 export function useShardsData() {
-  const [shards, setShards] = useState<ShardDetail[]>(DEFAULT_SHARDS);
+  const [shards, setShards] = useState<ShardDetail[]>(OFFLINE_SHARDS);
   const [matrixNodes, setMatrixNodes] = useState<MatrixNodeRow[]>(DEFAULT_MATRIX);
   const [isLive, setIsLive] = useState<boolean>(false);
   const [isLoading, setIsLoading] = useState<boolean>(true);

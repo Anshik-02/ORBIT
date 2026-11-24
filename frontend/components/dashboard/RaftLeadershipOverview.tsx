@@ -1,7 +1,7 @@
 'use client';
 
 import React from 'react';
-import { ShieldCheck, Crown, CheckCircle2 } from 'lucide-react';
+import { ShieldCheck, Crown, CheckCircle2, AlertTriangle, RefreshCw } from 'lucide-react';
 import { useClusterHealth } from '@/hooks/useClusterHealth';
 
 interface ShardReplica {
@@ -9,7 +9,7 @@ interface ShardReplica {
   nodeName: string;
   role: 'Leader' | 'Follower';
   matchIndex: number;
-  syncPercent: number;
+  isOnline: boolean;
   isLeader: boolean;
 }
 
@@ -28,95 +28,98 @@ interface ShardOverview {
   color: string;
 }
 
+const SHARD_RANGES: Record<number, string> = {
+  0: '0x00000000 — 0x55555554',
+  1: '0x55555555 — 0xAAAAAAA9',
+  2: '0xAAAAAAAA — 0xFFFFFFFF',
+};
+
+const SHARD_COLORS = ['#0891D5', '#7965E8', '#10B981'];
+
 export default function RaftLeadershipOverview() {
-  const { health, isLive } = useClusterHealth();
+  const { health, isLive, refresh } = useClusterHealth();
 
-  const defaultShards: ShardOverview[] = [
-    {
-      shardId: 0,
-      name: 'Shard 0',
-      keyRange: '0x00000000 — 0x55555554',
-      leaderName: 'Node A',
-      leaderNodeId: 'node-a',
-      term: 4,
-      commitIndex: 14892,
-      appliedIndex: 14892,
-      lag: '0 entries (In sync)',
-      status: 'STABLE',
-      color: '#0891D5',
-      replicas: [
-        { nodeId: 'node-a', nodeName: 'Node A', role: 'Leader', matchIndex: 14892, syncPercent: 100, isLeader: true },
-        { nodeId: 'node-b', nodeName: 'Node B', role: 'Follower', matchIndex: 14892, syncPercent: 100, isLeader: false },
-        { nodeId: 'node-c', nodeName: 'Node C', role: 'Follower', matchIndex: 14892, syncPercent: 100, isLeader: false },
-      ],
-    },
-    {
-      shardId: 1,
-      name: 'Shard 1',
-      keyRange: '0x55555555 — 0xAAAAAAA9',
-      leaderName: 'Node D',
-      leaderNodeId: 'node-d',
-      term: 6,
-      commitIndex: 12450,
-      appliedIndex: 12450,
-      lag: '0 entries (In sync)',
-      status: 'STABLE',
-      color: '#7965E8',
-      replicas: [
-        { nodeId: 'node-d', nodeName: 'Node D', role: 'Leader', matchIndex: 12450, syncPercent: 100, isLeader: true },
-        { nodeId: 'node-e', nodeName: 'Node E', role: 'Follower', matchIndex: 12450, syncPercent: 100, isLeader: false },
-        { nodeId: 'node-a', nodeName: 'Node A', role: 'Follower', matchIndex: 12450, syncPercent: 100, isLeader: false },
-      ],
-    },
-    {
-      shardId: 2,
-      name: 'Shard 2',
-      keyRange: '0xAAAAAAAA — 0xFFFFFFFF',
-      leaderName: 'Node B',
-      leaderNodeId: 'node-b',
-      term: 5,
-      commitIndex: 13910,
-      appliedIndex: 13910,
-      lag: '0 entries (In sync)',
-      status: 'STABLE',
-      color: '#10B981',
-      replicas: [
-        { nodeId: 'node-b', nodeName: 'Node B', role: 'Leader', matchIndex: 13910, syncPercent: 100, isLeader: true },
-        { nodeId: 'node-c', nodeName: 'Node C', role: 'Follower', matchIndex: 13910, syncPercent: 100, isLeader: false },
-        { nodeId: 'node-d', nodeName: 'Node D', role: 'Follower', matchIndex: 13910, syncPercent: 100, isLeader: false },
-      ],
-    },
-  ];
+  if (!isLive || !health?.shards || Object.keys(health.shards).length === 0) {
+    return (
+      <div className="bg-white border border-[#DCE5F0] rounded-2xl p-6 shadow-xs overflow-hidden">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 mb-4 border-b border-[#DCE5F0]">
+          <div className="flex items-center gap-2">
+            <div className="w-8 h-8 rounded-lg bg-amber-50 flex items-center justify-center">
+              <ShieldCheck className="w-4 h-4 text-amber-600" />
+            </div>
+            <div>
+              <h2 className="text-base font-semibold text-[#17243A] tracking-tight">
+                Raft Consensus & Leadership Overview
+              </h2>
+              <p className="text-xs text-[#64748B] mt-0.5">
+                Distributed log state machines, term stability & commit synchronization
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={() => refresh()}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-[#F4F7FC] hover:bg-[#EAF1FA] text-[#17243A] border border-[#DCE5F0] text-xs font-mono font-semibold transition-colors cursor-pointer self-start sm:self-auto"
+          >
+            <RefreshCw className="w-3.5 h-3.5 text-[#0891D5]" />
+            <span>Retry Connection</span>
+          </button>
+        </div>
 
-  const shards: ShardOverview[] = isLive && health?.shards && Object.keys(health.shards).length > 0
-    ? Object.values(health.shards).map((s, idx) => {
-        const defaultRef = defaultShards.find((ds) => ds.shardId === s.shard_id) || defaultShards[idx % defaultShards.length];
-        const colors = ['#0891D5', '#7965E8', '#10B981'];
-        return {
-          shardId: s.shard_id,
-          name: `Shard ${s.shard_id}`,
-          keyRange: defaultRef.keyRange,
-          leaderName: s.current_leader ? s.current_leader.toUpperCase() : 'None',
-          leaderNodeId: s.current_leader || '',
-          term: s.current_term,
-          commitIndex: s.commit_index ?? defaultRef.commitIndex,
-          appliedIndex: s.last_applied_index ?? defaultRef.appliedIndex,
-          lag: '0 entries (In sync)',
-          status: (s.healthy ? 'STABLE' : 'DEGRADED') as 'STABLE' | 'DEGRADED',
-          color: colors[s.shard_id % colors.length],
-          replicas: s.replica_node_ids && s.replica_node_ids.length > 0
-            ? s.replica_node_ids.map((nodeId) => ({
-                nodeId,
-                nodeName: nodeId.toUpperCase(),
-                role: (nodeId === s.current_leader ? 'Leader' : 'Follower') as 'Leader' | 'Follower',
-                matchIndex: s.commit_index ?? 14892,
-                syncPercent: 100,
-                isLeader: nodeId === s.current_leader,
-              }))
-            : defaultRef.replicas,
-        };
-      })
-    : defaultShards;
+        <div className="p-8 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0] text-center font-mono">
+          <AlertTriangle className="w-8 h-8 text-amber-500 mx-auto mb-2" />
+          <h4 className="text-sm font-bold text-[#17243A]">Consensus Telemetry Unavailable</h4>
+          <p className="text-xs text-[#64748B] mt-1 max-w-md mx-auto">
+            Unable to poll Raft consensus groups from the cluster. Start the cluster nodes using <code>python scripts/run_cluster.py start</code>.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  const shards: ShardOverview[] = Object.values(health.shards).map((s) => {
+    const leaderId = s.current_leader || '';
+    const color = SHARD_COLORS[s.shard_id % SHARD_COLORS.length];
+    const keyRange = SHARD_RANGES[s.shard_id] || `Shard partition #${s.shard_id}`;
+    const status: 'STABLE' | 'RE-ELECTING' | 'DEGRADED' = !leaderId
+      ? 'RE-ELECTING'
+      : s.healthy
+      ? 'STABLE'
+      : 'DEGRADED';
+
+    const replicas: ShardReplica[] = (s.replica_node_ids || []).map((nodeId) => {
+      const isLeader = nodeId === leaderId;
+      const isOnline = health.nodes?.[nodeId]?.online ?? s.available_replicas?.includes(nodeId) ?? false;
+      return {
+        nodeId,
+        nodeName: nodeId.toUpperCase(),
+        role: isLeader ? 'Leader' : 'Follower',
+        matchIndex: s.commit_index ?? 0,
+        isOnline,
+        isLeader,
+      };
+    });
+
+    return {
+      shardId: s.shard_id,
+      name: `Shard ${s.shard_id}`,
+      keyRange,
+      leaderName: leaderId ? leaderId.toUpperCase() : 'None (Electing)',
+      leaderNodeId: leaderId,
+      term: s.current_term ?? 0,
+      commitIndex: s.commit_index ?? 0,
+      appliedIndex: s.last_applied_index ?? 0,
+      lag: s.commit_index !== undefined && s.last_applied_index !== undefined
+        ? `${Math.max(0, s.commit_index - s.last_applied_index)} entries lag`
+        : '0 entries (In sync)',
+      status,
+      replicas,
+      color,
+    };
+  });
+
+  const totalShards = shards.length;
+  const electedCount = shards.filter((s) => s.leaderNodeId !== '').length;
+  const allElected = totalShards > 0 && electedCount === totalShards;
 
   return (
     <div className="bg-white border border-[#DCE5F0] rounded-2xl p-6 shadow-xs hover:shadow-md transition-shadow overflow-hidden">
@@ -136,10 +139,17 @@ export default function RaftLeadershipOverview() {
           </p>
         </div>
         <div className="flex items-center gap-2 self-start sm:self-auto font-mono text-xs">
-          <span className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-[#10B981]/10 border border-[#10B981]/30 text-[#10B981] font-semibold">
-            <CheckCircle2 className="w-3.5 h-3.5" />
-            ALL LEADERS ELECTED
-          </span>
+          {allElected ? (
+            <span className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-[#10B981]/10 border border-[#10B981]/30 text-[#10B981] font-semibold">
+              <CheckCircle2 className="w-3.5 h-3.5" />
+              ALL LEADERS ELECTED ({electedCount}/{totalShards})
+            </span>
+          ) : (
+            <span className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-50 border border-amber-300 text-amber-700 font-semibold">
+              <AlertTriangle className="w-3.5 h-3.5 text-amber-600" />
+              ELECTING ({electedCount}/{totalShards} QUORUM)
+            </span>
+          )}
         </div>
       </div>
 
@@ -162,7 +172,13 @@ export default function RaftLeadershipOverview() {
                     {shard.name}
                   </span>
                 </div>
-                <span className="text-[10px] font-mono font-semibold px-2 py-0.5 rounded-full bg-[#10B981]/10 border border-[#10B981]/30 text-[#10B981]">
+                <span
+                  className={`text-[10px] font-mono font-semibold px-2 py-0.5 rounded-full border ${
+                    shard.status === 'STABLE'
+                      ? 'bg-[#10B981]/10 border-[#10B981]/30 text-[#10B981]'
+                      : 'bg-amber-50 border-amber-200 text-amber-700'
+                  }`}
+                >
                   {shard.status}
                 </span>
               </div>
@@ -216,7 +232,11 @@ export default function RaftLeadershipOverview() {
                     <div className="flex items-center gap-2">
                       <span
                         className={`w-2 h-2 rounded-full ${
-                          rep.isLeader ? 'bg-[#F59E0B]' : 'bg-[#94A3B8]'
+                          rep.isLeader
+                            ? 'bg-[#F59E0B]'
+                            : rep.isOnline
+                            ? 'bg-[#10B981]'
+                            : 'bg-slate-300'
                         }`}
                       />
                       <span className="font-semibold text-[#17243A] text-xs">

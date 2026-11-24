@@ -2,7 +2,8 @@
 
 import React, { useState } from 'react';
 import Link from 'next/link';
-import { Crown, Server, Layers, Zap, Info, ShieldCheck, ArrowRight } from 'lucide-react';
+import { Crown, Server, Layers, Zap, Info, ShieldCheck, ArrowRight, AlertTriangle } from 'lucide-react';
+import { useClusterHealth } from '@/hooks/useClusterHealth';
 
 interface NodeData {
   id: string;
@@ -15,129 +16,82 @@ interface NodeData {
     shardId: number;
     role: 'Leader' | 'Follower';
   }[];
-  cpu: string;
-  ram: string;
   status: 'online' | 'degraded' | 'offline';
-  uptime: string;
+  lastActivity?: string;
 }
+
+const NODE_POSITIONS: Record<string, { x: number; y: number; name: string; port: number }> = {
+  'node-a': { x: 300, y: 90, name: 'Node A', port: 2525 },
+  'node-b': { x: 480, y: 200, name: 'Node B', port: 2526 },
+  'node-c': { x: 410, y: 380, name: 'Node C', port: 2527 },
+  'node-d': { x: 190, y: 380, name: 'Node D', port: 2528 },
+  'node-e': { x: 120, y: 200, name: 'Node E', port: 2529 },
+};
+
+const SHARD_COLORS = ['#0891D5', '#7965E8', '#10B981'];
 
 export default function ClusterTopologyPreview() {
   const [selectedShard, setSelectedShard] = useState<number | 'all'>('all');
   const [hoveredNode, setHoveredNode] = useState<NodeData | null>(null);
+  const { health, isLive, endpoint } = useClusterHealth(3000);
 
-  const nodes: NodeData[] = [
-    {
-      id: 'node-a',
-      name: 'Node A',
-      port: 2525,
-      ip: '127.0.0.1:2525',
-      x: 300,
-      y: 90,
-      shards: [
-        { shardId: 0, role: 'Leader' },
-        { shardId: 1, role: 'Follower' },
-      ],
-      cpu: '1.2%',
-      ram: '48.2 MB',
-      status: 'online',
-      uptime: '4d 18h',
-    },
-    {
-      id: 'node-b',
-      name: 'Node B',
-      port: 2526,
-      ip: '127.0.0.1:2526',
-      x: 480,
-      y: 200,
-      shards: [
-        { shardId: 0, role: 'Follower' },
-        { shardId: 2, role: 'Leader' },
-      ],
-      cpu: '1.5%',
-      ram: '52.1 MB',
-      status: 'online',
-      uptime: '4d 18h',
-    },
-    {
-      id: 'node-c',
-      name: 'Node C',
-      port: 2527,
-      ip: '127.0.0.1:2527',
-      x: 410,
-      y: 380,
-      shards: [
-        { shardId: 0, role: 'Follower' },
-        { shardId: 2, role: 'Follower' },
-      ],
-      cpu: '0.9%',
-      ram: '44.8 MB',
-      status: 'online',
-      uptime: '4d 18h',
-    },
-    {
-      id: 'node-d',
-      name: 'Node D',
-      port: 2528,
-      ip: '127.0.0.1:2528',
-      x: 190,
-      y: 380,
-      shards: [
-        { shardId: 1, role: 'Leader' },
-        { shardId: 2, role: 'Follower' },
-      ],
-      cpu: '1.4%',
-      ram: '51.3 MB',
-      status: 'online',
-      uptime: '4d 18h',
-    },
-    {
-      id: 'node-e',
-      name: 'Node E',
-      port: 2529,
-      ip: '127.0.0.1:2529',
-      x: 120,
-      y: 200,
-      shards: [
-        { shardId: 1, role: 'Follower' },
-      ],
-      cpu: '0.7%',
-      ram: '38.4 MB',
-      status: 'online',
-      uptime: '4d 18h',
-    },
-  ];
+  // Dynamically derive shard configurations from live health telemetry
+  const shardConfigs = Object.values(health?.shards || {}).map((s) => ({
+    id: s.shard_id,
+    name: `Shard ${s.shard_id}`,
+    leader: s.current_leader || 'None',
+    nodes: s.replica_node_ids || [],
+    color: SHARD_COLORS[s.shard_id % SHARD_COLORS.length],
+    healthy: s.healthy,
+    quorumAvailable: s.quorum_available,
+  }));
 
-  const shardConfigs = [
-    {
-      id: 0,
-      name: 'Shard 0',
-      leader: 'Node A',
-      nodes: ['node-a', 'node-b', 'node-c'],
-      color: '#0891D5', // Cyan
-    },
-    {
-      id: 1,
-      name: 'Shard 1',
-      leader: 'Node D',
-      nodes: ['node-d', 'node-e', 'node-a'],
-      color: '#7965E8', // Purple
-    },
-    {
-      id: 2,
-      name: 'Shard 2',
-      leader: 'Node B',
-      nodes: ['node-b', 'node-c', 'node-d'],
-      color: '#10B981', // Emerald
-    },
-  ];
+  // Dynamically build nodes from live cluster health
+  const nodeIds = Object.keys(NODE_POSITIONS);
+  const nodes: NodeData[] = nodeIds.map((id) => {
+    const pos = NODE_POSITIONS[id];
+    const nodeStatus = health?.nodes?.[id];
+    const isOnline = isLive && (nodeStatus?.online ?? false);
+
+    // Find shards hosted by this node
+    const hostedShards: { shardId: number; role: 'Leader' | 'Follower' }[] = [];
+    if (health?.shards) {
+      Object.values(health.shards).forEach((shard) => {
+        if (shard.replica_node_ids?.includes(id)) {
+          hostedShards.push({
+            shardId: shard.shard_id,
+            role: shard.current_leader === id ? 'Leader' : 'Follower',
+          });
+        }
+      });
+    }
+
+    return {
+      id,
+      name: pos.name,
+      port: pos.port,
+      ip: `127.0.0.1:${pos.port}`,
+      x: pos.x,
+      y: pos.y,
+      shards: hostedShards,
+      status: isOnline ? 'online' : isLive ? 'offline' : 'offline',
+      lastActivity: nodeStatus?.last_observed_activity,
+    };
+  });
 
   const isEdgeActive = (node1Id: string, node2Id: string, shardId: number) => {
     if (selectedShard !== 'all' && selectedShard !== shardId) return false;
     const cfg = shardConfigs.find((s) => s.id === shardId);
-    return cfg?.nodes.includes(node1Id) && cfg?.nodes.includes(node2Id);
+    if (!cfg) return false;
+    // Edge is active only if both nodes are assigned to the shard and at least one is online
+    const node1Online = nodes.find((n) => n.id === node1Id)?.status === 'online';
+    const node2Online = nodes.find((n) => n.id === node2Id)?.status === 'online';
+    return isLive && cfg.nodes.includes(node1Id) && cfg.nodes.includes(node2Id) && (node1Online || node2Online);
   };
 
   const getNodeById = (id: string) => nodes.find((n) => n.id === id);
+
+  const totalOnlineNodes = nodes.filter((n) => n.status === 'online').length;
 
   return (
     <div className="relative bg-white border border-[#DCE5F0] rounded-2xl p-6 flex flex-col justify-between overflow-hidden shadow-sm">
@@ -148,12 +102,22 @@ export default function ClusterTopologyPreview() {
             <h2 className="text-base font-bold text-[#17243A] tracking-wide">
               Cluster Topology Preview
             </h2>
-            <span className="text-[11px] font-mono px-2.5 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-semibold">
-              5 Replicas Quorum
-            </span>
+            {isLive ? (
+              <span className="text-[11px] font-mono px-2.5 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-semibold flex items-center gap-1.5">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                {totalOnlineNodes}/5 Nodes Online
+              </span>
+            ) : (
+              <span className="text-[11px] font-mono px-2.5 py-0.5 rounded-full bg-rose-50 border border-rose-200 text-rose-700 font-semibold flex items-center gap-1.5">
+                <AlertTriangle className="w-3 h-3 text-rose-500" />
+                Cluster Offline
+              </span>
+            )}
           </div>
           <p className="text-xs text-[#64748B] mt-0.5">
-            Real-time consensus mesh across 5 nodes & 3 multi-raft partitions
+            {isLive
+              ? `Connected to ${endpoint || 'local cluster'} · 3 multi-raft partitions with quorum`
+              : 'Backend disconnected · Showing discovery slots (nodes a–e)'}
           </p>
         </div>
 
@@ -213,13 +177,20 @@ export default function ClusterTopologyPreview() {
           }}
         />
 
+        {!isLive && (
+          <div className="absolute top-4 left-4 z-10 px-3 py-1.5 rounded-lg bg-amber-50/90 border border-amber-200 text-amber-800 text-[11px] font-mono flex items-center gap-2 backdrop-blur-xs">
+            <AlertTriangle className="w-3.5 h-3.5 text-amber-600" />
+            <span>Telemetry unavailable. Start cluster via <code>python scripts/run_cluster.py</code></span>
+          </div>
+        )}
+
         <svg viewBox="0 0 600 460" className="w-full h-full max-h-[420px] select-none">
           {/* Shard Replication Links */}
           {shardConfigs.map((shard) => {
+            if (shard.nodes.length < 2) return null;
             const pairs: [string, string][] = [
               [shard.nodes[0], shard.nodes[1]],
-              [shard.nodes[1], shard.nodes[2]],
-              [shard.nodes[2], shard.nodes[0]],
+              ...(shard.nodes.length > 2 ? [[shard.nodes[1], shard.nodes[2]] as [string, string], [shard.nodes[2], shard.nodes[0]] as [string, string]] : []),
             ];
 
             return pairs.map(([n1, n2], idx) => {
@@ -266,6 +237,7 @@ export default function ClusterTopologyPreview() {
                 ? node.shards
                 : node.shards.filter((s) => s.shardId === selectedShard);
             const isRelevant = relevantShards.length > 0;
+            const isOnline = node.status === 'online';
 
             return (
               <g
@@ -276,7 +248,7 @@ export default function ClusterTopologyPreview() {
                 onMouseLeave={() => setHoveredNode(null)}
               >
                 {/* Leader Outer Pulse Ring */}
-                {hasLeader && (
+                {isOnline && hasLeader && (
                   <circle
                     r="34"
                     fill="none"
@@ -293,7 +265,9 @@ export default function ClusterTopologyPreview() {
                   r={isHovered ? 28 : 24}
                   fill="#FFFFFF"
                   stroke={
-                    isHovered
+                    !isOnline
+                      ? '#CBD5E1'
+                      : isHovered
                       ? '#0891D5'
                       : hasLeader
                       ? '#F59E0B'
@@ -302,7 +276,7 @@ export default function ClusterTopologyPreview() {
                       : '#E2E8F0'
                   }
                   strokeWidth={isHovered ? 3 : 2}
-                  strokeOpacity={isRelevant ? 1 : 0.4}
+                  strokeOpacity={isOnline ? (isRelevant ? 1 : 0.4) : 0.3}
                   filter="drop-shadow(0px 4px 8px rgba(0,0,0,0.06))"
                   className="transition-all duration-200"
                 />
@@ -310,11 +284,11 @@ export default function ClusterTopologyPreview() {
                 {/* Node Inner Fill */}
                 <circle
                   r={isHovered ? 24 : 20}
-                  fill={isHovered ? '#F0F9FF' : '#F8FAFC'}
+                  fill={!isOnline ? '#F1F5F9' : isHovered ? '#F0F9FF' : '#F8FAFC'}
                 />
 
                 {/* Leader Crown Badge or Node Name */}
-                {hasLeader ? (
+                {isOnline && hasLeader ? (
                   <g transform="translate(-7, -8)">
                     <path
                       d="M2 11h10M2 11l1.5-6L6 8l1.5-5 1.5 5 2.5-3 1.5 6H2z"
@@ -327,7 +301,9 @@ export default function ClusterTopologyPreview() {
                   <text
                     textAnchor="middle"
                     dy="4"
-                    className="text-[12px] font-mono font-bold fill-[#17243A] pointer-events-none"
+                    className={`text-[12px] font-mono font-bold pointer-events-none ${
+                      isOnline ? 'fill-[#17243A]' : 'fill-[#94A3B8]'
+                    }`}
                   >
                     {node.name.replace('Node ', '')}
                   </text>
@@ -338,7 +314,9 @@ export default function ClusterTopologyPreview() {
                   textAnchor="middle"
                   dy="42"
                   className={`text-xs font-mono font-bold transition-colors pointer-events-none ${
-                    isHovered
+                    !isOnline
+                      ? 'fill-[#94A3B8]'
+                      : isHovered
                       ? 'fill-[#0891D5]'
                       : isRelevant
                       ? 'fill-[#17243A]'
@@ -360,9 +338,9 @@ export default function ClusterTopologyPreview() {
                         cx={offset}
                         cy={0}
                         r="4"
-                        fill={cfg?.color}
-                        fillOpacity={isSelected ? 1 : 0.3}
-                        stroke={s.role === 'Leader' ? '#F59E0B' : '#FFFFFF'}
+                        fill={cfg?.color || '#94A3B8'}
+                        fillOpacity={isOnline ? (isSelected ? 1 : 0.3) : 0.2}
+                        stroke={isOnline && s.role === 'Leader' ? '#F59E0B' : '#FFFFFF'}
                         strokeWidth="1.5"
                       />
                     );
@@ -387,7 +365,13 @@ export default function ClusterTopologyPreview() {
                 <Server className="w-4 h-4 text-[#0891D5]" />
                 <span className="font-bold text-[#17243A] font-mono">{hoveredNode.name}</span>
               </div>
-              <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 font-semibold">
+              <span
+                className={`text-[10px] font-mono px-2 py-0.5 rounded-full font-semibold ${
+                  hoveredNode.status === 'online'
+                    ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                    : 'bg-slate-100 text-slate-600 border border-slate-200'
+                }`}
+              >
                 {hoveredNode.status.toUpperCase()}
               </span>
             </div>
@@ -398,46 +382,52 @@ export default function ClusterTopologyPreview() {
                 <span className="font-medium">{hoveredNode.ip}</span>
               </div>
               <div className="flex justify-between">
-                <span className="text-[#64748B]">CPU / RAM:</span>
-                <span className="font-medium">{hoveredNode.cpu} · {hoveredNode.ram}</span>
+                <span className="text-[#64748B]">Port:</span>
+                <span className="font-medium">:{hoveredNode.port}</span>
               </div>
-              <div className="flex justify-between">
-                <span className="text-[#64748B]">Uptime:</span>
-                <span className="font-medium">{hoveredNode.uptime}</span>
-              </div>
+              {hoveredNode.lastActivity && (
+                <div className="flex justify-between">
+                  <span className="text-[#64748B]">Last Observed:</span>
+                  <span className="font-medium">{new Date(hoveredNode.lastActivity).toLocaleTimeString()}</span>
+                </div>
+              )}
             </div>
 
             <div className="mt-3 pt-2 border-t border-[#DCE5F0]">
               <span className="text-[10px] text-[#64748B] uppercase font-mono block mb-1 font-semibold">
                 Hosted Shard Replicas:
               </span>
-              <div className="space-y-1">
-                {hoveredNode.shards.map((s) => {
-                  const cfg = shardConfigs.find((c) => c.id === s.shardId);
-                  return (
-                    <div
-                      key={s.shardId}
-                      className="flex items-center justify-between text-[11px] font-mono px-2 py-1 rounded bg-[#F8FAFC] border border-[#DCE5F0]"
-                    >
-                      <div className="flex items-center gap-1.5">
-                        <span
-                          className="w-2 h-2 rounded-full"
-                          style={{ backgroundColor: cfg?.color }}
-                        />
-                        <span className="font-semibold text-[#17243A]">Shard {s.shardId}</span>
-                      </div>
-                      <span
-                        className={`text-[10px] font-bold ${
-                          s.role === 'Leader' ? 'text-amber-600 flex items-center gap-1' : 'text-[#64748B]'
-                        }`}
+              {hoveredNode.shards.length === 0 ? (
+                <span className="text-[11px] font-mono text-[#64748B] italic">No shards assigned</span>
+              ) : (
+                <div className="space-y-1">
+                  {hoveredNode.shards.map((s) => {
+                    const cfg = shardConfigs.find((c) => c.id === s.shardId);
+                    return (
+                      <div
+                        key={s.shardId}
+                        className="flex items-center justify-between text-[11px] font-mono px-2 py-1 rounded bg-[#F8FAFC] border border-[#DCE5F0]"
                       >
-                        {s.role === 'Leader' && <Crown className="w-2.5 h-2.5" />}
-                        {s.role}
-                      </span>
-                    </div>
-                  );
-                })}
-              </div>
+                        <div className="flex items-center gap-1.5">
+                          <span
+                            className="w-2 h-2 rounded-full"
+                            style={{ backgroundColor: cfg?.color || '#94A3B8' }}
+                          />
+                          <span className="font-semibold text-[#17243A]">Shard {s.shardId}</span>
+                        </div>
+                        <span
+                          className={`text-[10px] font-bold ${
+                            s.role === 'Leader' ? 'text-amber-600 flex items-center gap-1' : 'text-[#64748B]'
+                          }`}
+                        >
+                          {s.role === 'Leader' && <Crown className="w-2.5 h-2.5" />}
+                          {s.role}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -460,7 +450,7 @@ export default function ClusterTopologyPreview() {
           </div>
         </div>
         <span className="text-[11px]">
-          Hover any node for detailed health & replica telemetry
+          Hover any node for live address & replica assignments
         </span>
       </div>
     </div>

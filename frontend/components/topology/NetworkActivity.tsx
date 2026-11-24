@@ -62,33 +62,41 @@ export default function NetworkActivity({ events }: NetworkActivityProps) {
 
       {/* Events Stream */}
       <div className="space-y-2 max-h-64 overflow-y-auto pr-1 font-mono text-xs">
-        {events.map((evt) => (
-          <div
-            key={evt.id}
-            className="flex items-center justify-between p-3 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0] hover:border-[#CBD5E1] transition-all"
-          >
-            <div className="flex items-center gap-3">
-              <span className={`w-2 h-2 rounded-full ${getLevelDot(evt.level)} shrink-0`} />
-              <span
-                className={`text-[9px] px-2 py-0.5 rounded-full border uppercase tracking-wider shrink-0 font-semibold ${getCategoryBadge(
-                  evt.category
-                )}`}
-              >
-                {evt.category}
-              </span>
-              <span className="text-[#64748B] text-[11px] shrink-0 font-semibold">
-                [{evt.nodeId}]
-              </span>
-              <span className="text-[#17243A] text-xs line-clamp-1 font-medium">
-                {evt.description}
+        {events.length === 0 ? (
+          <div className="py-8 text-center text-[#64748B] text-xs">
+            <Radio className="w-5 h-5 mx-auto mb-1.5 opacity-40 text-[#64748B]" />
+            <p className="font-semibold text-[#17243A]">No recent topology transitions</p>
+            <p className="text-[11px] mt-0.5">Subscribed to WebSocket event stream (/ws/events)...</p>
+          </div>
+        ) : (
+          events.map((evt) => (
+            <div
+              key={evt.id}
+              className="flex items-center justify-between p-3 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0] hover:border-[#CBD5E1] transition-all"
+            >
+              <div className="flex items-center gap-3">
+                <span className={`w-2 h-2 rounded-full ${getLevelDot(evt.level)} shrink-0`} />
+                <span
+                  className={`text-[9px] px-2 py-0.5 rounded-full border uppercase tracking-wider shrink-0 font-semibold ${getCategoryBadge(
+                    evt.category
+                  )}`}
+                >
+                  {evt.category}
+                </span>
+                <span className="text-[#64748B] text-[11px] shrink-0 font-semibold">
+                  [{evt.nodeId}]
+                </span>
+                <span className="text-[#17243A] text-xs line-clamp-1 font-medium">
+                  {evt.description}
+                </span>
+              </div>
+
+              <span className="text-[11px] text-[#64748B] shrink-0 ml-3">
+                {evt.timestamp}
               </span>
             </div>
-
-            <span className="text-[11px] text-[#64748B] shrink-0 ml-3">
-              {evt.timestamp}
-            </span>
-          </div>
-        ))}
+          ))
+        )}
       </div>
     </div>
   );
