@@ -1,101 +1,220 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import DashboardLayout from '@/components/dashboard/DashboardLayout';
-import { Flame, Play, ShieldAlert, AlertTriangle, CheckCircle2 } from 'lucide-react';
+import { Flame, ShieldCheck, CheckCircle2, RefreshCw } from 'lucide-react';
+import ChaosExperimentLibrary, {
+  CHAOS_EXPERIMENTS,
+  ChaosExperimentDef,
+} from '@/components/chaos/ChaosExperimentLibrary';
+import ChaosConfigurator from '@/components/chaos/ChaosConfigurator';
+import ChaosExecutionTimeline, {
+  ChaosTimelineStep,
+} from '@/components/chaos/ChaosExecutionTimeline';
+import ChaosImpactAnalysis, {
+  ChaosImpactReport,
+} from '@/components/chaos/ChaosImpactAnalysis';
+import ChaosHistory, { ChaosRunRecord } from '@/components/chaos/ChaosHistory';
+
+const INITIAL_STEPS: ChaosTimelineStep[] = [
+  {
+    id: 'step-1',
+    title: 'Started',
+    desc: 'Harness initialized & baseline quorum verified.',
+    status: 'DONE',
+    timestamp: '14:30:10',
+  },
+  {
+    id: 'step-2',
+    title: 'Fault Injected',
+    desc: 'SIGKILL sent to target leader process.',
+    status: 'DONE',
+    timestamp: '14:30:11',
+  },
+  {
+    id: 'step-3',
+    title: 'Failure Detected',
+    desc: 'Election timeout elapsed (210ms) without heartbeat.',
+    status: 'DONE',
+    timestamp: '14:30:11.2',
+  },
+  {
+    id: 'step-4',
+    title: 'Leader Election',
+    desc: 'Candidate broadcast RequestVote; won 2/3 votes.',
+    status: 'DONE',
+    timestamp: '14:30:11.4',
+  },
+  {
+    id: 'step-5',
+    title: 'Recovery',
+    desc: 'New leader established lease & resumed writes.',
+    status: 'DONE',
+    timestamp: '14:30:11.5',
+  },
+  {
+    id: 'step-6',
+    title: 'Consistency Check',
+    desc: 'Linearizable ReadIndex barrier verified 0 stale keys.',
+    status: 'DONE',
+    timestamp: '14:30:12',
+  },
+  {
+    id: 'step-7',
+    title: 'Completed',
+    desc: 'All 3 shards healthy with full write availability.',
+    status: 'DONE',
+    timestamp: '14:30:15',
+  },
+];
+
+const INITIAL_IMPACT: ChaosImpactReport = {
+  downtimeMs: 184,
+  electionDurationMs: 210,
+  failedRequests: 0,
+  dataConsistencyPct: 100,
+  recoveryDurationMs: 3800,
+  quorumAvailability: '2/3 Replicas (Majority)',
+};
+
+const INITIAL_RECORDS: ChaosRunRecord[] = [
+  {
+    id: 'c-1',
+    timestamp: 'Today, 14:30:10',
+    experimentName: 'Leader Kill & Re-Election',
+    targetNode: 'node-a',
+    targetShard: 0,
+    durationSec: 8,
+    impact: INITIAL_IMPACT,
+    outcome: 'PASSED',
+  },
+  {
+    id: 'c-2',
+    timestamp: 'Today, 13:40:00',
+    experimentName: 'Follower Crash Simulation',
+    targetNode: 'node-b',
+    targetShard: 0,
+    durationSec: 5,
+    impact: {
+      downtimeMs: 0,
+      electionDurationMs: 0,
+      failedRequests: 0,
+      dataConsistencyPct: 100,
+      recoveryDurationMs: 1200,
+      quorumAvailability: '2/3 Replicas (Majority)',
+    },
+    outcome: 'PASSED',
+  },
+];
 
 export default function ChaosLabPage() {
-  const [activeChaos, setActiveChaos] = useState<string | null>(null);
+  const [selectedExpId, setSelectedExpId] = useState<string>('leader-kill');
+  const [isRunning, setIsRunning] = useState(false);
+  const [currentStepIndex, setCurrentStepIndex] = useState(7);
+  const [timelineSteps, setTimelineSteps] = useState<ChaosTimelineStep[]>(INITIAL_STEPS);
+  const [impact, setImpact] = useState<ChaosImpactReport>(INITIAL_IMPACT);
+  const [history, setHistory] = useState<ChaosRunRecord[]>(INITIAL_RECORDS);
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
 
-  const experiments = [
-    {
-      id: 'follower-crash',
-      name: 'Follower Crash Simulation',
-      desc: 'Abruptly terminates a non-leader follower to verify write quorum durability (RF=3).',
-      duration: '5 seconds',
-      impact: 'Zero data loss, 2/3 nodes satisfy quorum',
-    },
-    {
-      id: 'leader-election',
-      name: 'Leader Kill & Re-Election',
-      desc: 'Sends SIGKILL to active shard leader to trigger election timeout and term increment.',
-      duration: '8 seconds',
-      impact: 'Transient 503 during election, new leader elected in < 300ms',
-    },
-    {
-      id: 'network-partition',
-      name: 'Split-Brain Network Partition',
-      desc: 'Isolates 2 nodes from 3 nodes. Tests minority isolation safety.',
-      duration: '10 seconds',
-      impact: 'Majority partition commits; minority rejects writes',
-    },
-    {
-      id: 'wal-corruption-recovery',
-      name: 'WAL Corruption Recovery',
-      desc: 'Injects truncated CRC into final WAL record to verify crash-recovery boundary check.',
-      duration: '3 seconds',
-      impact: 'Engine skips partial record and recovers all valid committed writes',
-    },
-  ];
+  const selectedExperiment =
+    CHAOS_EXPERIMENTS.find((e) => e.id === selectedExpId) || CHAOS_EXPERIMENTS[0];
+
+  const handleExecute = (targetNode: string, targetShard: number) => {
+    setIsRunning(true);
+    setCurrentStepIndex(0);
+
+    const stepIntervals = [0, 800, 1600, 2400, 3200, 4000, 4800];
+    stepIntervals.forEach((delay, idx) => {
+      setTimeout(() => {
+        setCurrentStepIndex(idx + 1);
+        if (idx === stepIntervals.length - 1) {
+          setIsRunning(false);
+
+          // Save to history
+          const newRec: ChaosRunRecord = {
+            id: `c-${Date.now()}`,
+            timestamp: 'Just now',
+            experimentName: selectedExperiment.name,
+            targetNode,
+            targetShard,
+            durationSec: selectedExperiment.durationSec,
+            impact: {
+              ...impact,
+              downtimeMs: Math.round(150 + Math.random() * 80),
+              electionDurationMs: Math.round(190 + Math.random() * 60),
+            },
+            outcome: 'PASSED',
+          };
+          setHistory((prev) => [newRec, ...prev]);
+        }
+      }, delay);
+    });
+  };
+
+  const handleAbort = () => {
+    setIsRunning(false);
+    setCurrentStepIndex(7);
+  };
 
   return (
     <DashboardLayout activeNav="chaos">
       <div className="space-y-6">
-        <div className="bg-white border border-[#DCE5F0] rounded-2xl p-6 shadow-xs">
-          <div className="flex items-center gap-2 mb-1">
-            <div className="w-8 h-8 rounded-lg bg-rose-50 flex items-center justify-center text-rose-600">
-              <Flame className="w-4 h-4" />
+        {/* 01. PAGE HEADER */}
+        <div className="bg-white border border-[#DCE5F0] rounded-2xl p-5 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-4 font-mono">
+          <div>
+            <div className="flex items-center gap-3">
+              <h1 className="text-xl sm:text-2xl font-bold text-[#17243A] tracking-tight">
+                Chaos Engineering & Resiliency Lab
+              </h1>
+              <span className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-50 border border-emerald-200 text-[#10B981] text-xs font-semibold">
+                <CheckCircle2 className="w-3.5 h-3.5" />
+                QUORUM SAFEGUARDS ACTIVE
+              </span>
             </div>
-            <h1 className="text-xl font-bold text-[#17243A]">Chaos Engineering & Fault Injection</h1>
+            <p className="text-xs sm:text-sm text-[#64748B] mt-1 font-normal">
+              Inject hardware failures, network partitions, and process crashes to verify multi-raft recovery.
+            </p>
           </div>
-          <p className="text-xs text-[#64748B]">
-            Execute deterministic fault-injection experiments to prove distributed safety and zero data loss
-          </p>
 
-          <div className="mt-6 grid grid-cols-1 md:grid-cols-2 gap-4">
-            {experiments.map((exp) => (
-              <div
-                key={exp.id}
-                className="p-5 rounded-2xl bg-[#F8FAFC] border border-[#E2E8F0] hover:border-[#CBD5E1] transition-all flex flex-col justify-between"
-              >
-                <div>
-                  <div className="flex items-center justify-between mb-2">
-                    <h2 className="font-bold text-[#17243A] text-sm font-mono">
-                      {exp.name}
-                    </h2>
-                    <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-slate-100 text-[#64748B]">
-                      {exp.duration}
-                    </span>
-                  </div>
-                  <p className="text-xs text-[#64748B] mb-3 leading-relaxed">
-                    {exp.desc}
-                  </p>
-                  <div className="text-[11px] font-mono text-[#10B981] flex items-center gap-1.5 mb-4">
-                    <CheckCircle2 className="w-3.5 h-3.5" />
-                    <span>Safety: {exp.impact}</span>
-                  </div>
-                </div>
-
-                <button
-                  onClick={() => {
-                    setActiveChaos(exp.id);
-                    setTimeout(() => setActiveChaos(null), 3000);
-                  }}
-                  className={`w-full py-2 px-3 rounded-xl font-mono text-xs font-bold flex items-center justify-center gap-2 transition-all ${
-                    activeChaos === exp.id
-                      ? 'bg-rose-600 text-white animate-pulse'
-                      : 'bg-white hover:bg-slate-100 border border-[#DCE5F0] text-[#17243A]'
-                  }`}
-                >
-                  <Play className="w-3.5 h-3.5" />
-                  <span>
-                    {activeChaos === exp.id ? 'Injecting Fault...' : 'Run Experiment'}
-                  </span>
-                </button>
-              </div>
-            ))}
+          <div className="flex items-center gap-2 text-xs">
+            <span className="px-3 py-1.5 rounded-xl bg-[#F4F7FC] border border-[#DCE5F0] text-[#17243A] font-semibold">
+              Harness: Go orbit-chaos Runner
+            </span>
           </div>
         </div>
+
+        {/* 02. SECTION A: CHAOS EXPERIMENT CATALOG */}
+        <ChaosExperimentLibrary
+          selectedExpId={selectedExpId}
+          onSelect={setSelectedExpId}
+          isRunning={isRunning}
+        />
+
+        {/* 03. SECTION B & C: CONFIGURATOR & SAFETY CHECKS */}
+        <ChaosConfigurator
+          experiment={selectedExperiment}
+          onExecute={handleExecute}
+          onAbort={handleAbort}
+          isRunning={isRunning}
+        />
+
+        {/* 04. SECTION D: EXECUTION TIMELINE */}
+        <ChaosExecutionTimeline
+          steps={timelineSteps}
+          currentStepIndex={currentStepIndex}
+        />
+
+        {/* 05. SECTION E: IMPACT ANALYSIS */}
+        <ChaosImpactAnalysis impact={impact} />
+
+        {/* 06. SECTION F: CHAOS EXPERIMENT HISTORY */}
+        <ChaosHistory
+          records={history}
+          onRerun={(rec) => {
+            const exp = CHAOS_EXPERIMENTS.find((e) => e.name === rec.experimentName);
+            if (exp) setSelectedExpId(exp.id);
+          }}
+        />
       </div>
     </DashboardLayout>
   );
