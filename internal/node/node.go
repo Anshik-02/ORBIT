@@ -326,7 +326,7 @@ func (n *Node) Start() error {
 		n.config.Address = ln.Addr().String()
 
 		n.httpServer = &http.Server{
-			Handler:      mux,
+			Handler:      api.WithCORS(mux),
 			ReadTimeout:  10 * time.Second,
 			WriteTimeout: 10 * time.Second,
 			IdleTimeout:  60 * time.Second,
