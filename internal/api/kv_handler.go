@@ -269,7 +269,7 @@ func NewKVHandler(
 	eventHub := observability.NewEventHub()
 	wsHub := observability.NewWebSocketHub(eventHub)
 
-	return &KVHandler{
+	h := &KVHandler{
 		provider:    provider,
 		metadata:    metadata,
 		forwarder:   forwarder,
@@ -281,6 +281,42 @@ func NewKVHandler(
 		idempotency: NewIdempotencyCache(),
 		metrics:     observability.NewMetricsCollector(),
 	}
+
+	if eventHub != nil && tracker != nil {
+		ch := eventHub.Subscribe()
+		go func() {
+			for evt := range ch {
+				if evt.Type == observability.EventLeaderElected || evt.Type == observability.EventLeaderChanged {
+					if evt.Data != nil {
+						if gidStr, ok := evt.Data["group_id"].(string); ok && gidStr != "" {
+							if ldrStr, ok := evt.Data["leader_id"].(string); ok && ldrStr != "" {
+								term := uint64(0)
+								if tStr, ok := evt.Data["term"].(string); ok {
+									term, _ = strconv.ParseUint(tStr, 10, 64)
+								} else if tNum, ok := evt.Data["term"].(float64); ok {
+									term = uint64(tNum)
+								}
+								tracker.SetLeaderWithTerm(raft.GroupID(gidStr), ldrStr, term)
+							}
+						}
+					}
+				}
+			}
+		}()
+	}
+
+	if forwarder != nil && metadata != nil {
+		go func() {
+			time.Sleep(500 * time.Millisecond)
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				h.syncRemoteLeaders()
+			}
+		}()
+	}
+
+	return h
 }
 
 // Metrics returns the MetricsCollector instance.
@@ -999,12 +1035,100 @@ func (h *KVHandler) handleClusterStatus(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+func (h *KVHandler) syncRemoteLeaders() {
+	if h.metadata == nil || h.forwarder == nil || h.forwarder.Resolver() == nil {
+		return
+	}
+	tracker := h.forwarder.Resolver().Tracker()
+	if tracker == nil {
+		return
+	}
+	localShards := h.provider.ShardInstances()
+
+	for sid := sharding.ShardID(0); sid < sharding.ShardID(h.metadata.ShardCount); sid++ {
+		gid := raft.GroupID(sid.GroupID())
+
+		// 1. Authoritative local state check
+		if inst, ok := localShards[sid]; ok && inst != nil && inst.Raft() != nil {
+			if inst.Raft().Role() == raft.Leader {
+				tracker.SetLeaderWithTerm(gid, h.localNodeID, inst.Raft().CurrentTerm())
+			} else if ldr := inst.Raft().LeaderID(); ldr != "" {
+				tracker.SetLeaderWithTerm(gid, ldr, inst.Raft().CurrentTerm())
+			}
+			continue
+		}
+
+		// 2. If remote leader is already known, skip
+		if cached, ok := tracker.GetLeader(gid); ok && cached != "" {
+			continue
+		}
+
+		// 3. Shard leader is unknown! Query configured replica nodes for this shard
+		info, err := h.metadata.GetShard(sid)
+		if err != nil || info == nil {
+			continue
+		}
+
+		for _, repID := range info.Replicas {
+			if repID == h.localNodeID {
+				continue
+			}
+			addr, ok := h.forwarder.PeerAddress(repID)
+			if !ok || addr == "" {
+				continue
+			}
+			targetURL := addr
+			if !strings.HasPrefix(targetURL, "http://") && !strings.HasPrefix(targetURL, "https://") {
+				targetURL = "http://" + targetURL
+			}
+			targetURL += "/cluster/shards"
+
+			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+			if err != nil {
+				cancel()
+				continue
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				cancel()
+				continue
+			}
+
+			if resp.StatusCode == http.StatusOK {
+				var data struct {
+					Shards []struct {
+						ID     int    `json:"id"`
+						Leader string `json:"leader"`
+					} `json:"shards"`
+				}
+				if err := json.NewDecoder(resp.Body).Decode(&data); err == nil {
+					for _, s := range data.Shards {
+						if sharding.ShardID(s.ID) == sid && s.Leader != "" {
+							tracker.SetLeader(gid, s.Leader)
+							break
+						}
+					}
+				}
+			}
+			_ = resp.Body.Close()
+			cancel()
+
+			if ldr, ok := tracker.GetLeader(gid); ok && ldr != "" {
+				break
+			}
+		}
+	}
+}
+
 func (h *KVHandler) handleClusterHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", "GET")
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+
+	h.syncRemoteLeaders()
 
 	if h.monitor == nil {
 		h.monitor = observability.NewClusterMonitor(h.metadata, h.forwarder.Resolver().Tracker())
@@ -1020,6 +1144,8 @@ func (h *KVHandler) handleClusterShards(w http.ResponseWriter, r *http.Request) 
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+
+	h.syncRemoteLeaders()
 
 	var shards []ShardDetail
 	localShards := h.provider.ShardInstances()

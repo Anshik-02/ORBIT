@@ -71,6 +71,11 @@ func BuildShardStatus(
 			st.State = ShardHealthy
 			st.QuorumAvailable = true
 			st.AvailableReplicas = []string{knownLeader}
+			for _, rNode := range replicas {
+				if rNode != knownLeader {
+					st.AvailableReplicas = append(st.AvailableReplicas, rNode)
+				}
+			}
 		} else {
 			st.State = ShardUnavailable
 			st.Healthy = false

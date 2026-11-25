@@ -148,6 +148,21 @@ func (f *RequestForwarder) SetTimeout(d time.Duration) {
 	f.httpClient.Timeout = d
 }
 
+// PeerAddress returns the HTTP address for the target node ID.
+func (f *RequestForwarder) PeerAddress(nodeID string) (string, bool) {
+	addr, ok := f.peerAddrs[nodeID]
+	return addr, ok
+}
+
+// PeerAddresses returns a copy of configured peer HTTP addresses.
+func (f *RequestForwarder) PeerAddresses() map[string]string {
+	res := make(map[string]string, len(f.peerAddrs))
+	for k, v := range f.peerAddrs {
+		res[k] = v
+	}
+	return res
+}
+
 // Route computes the target shard for a key and determines whether the current node
 // can serve the request locally or needs to forward to a remote leader.
 func (f *RequestForwarder) Route(key string, localShards map[sharding.ShardID]ShardInstance) (*RouteResult, error) {
